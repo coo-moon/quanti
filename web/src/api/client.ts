@@ -44,6 +44,7 @@ export interface BacktestResult {
   metrics: Record<string, number>;
   trades: TradeRecord[];
   equity_curve: Record<string, number>;
+  warning: string;
 }
 
 export const fetchStocks = () => api.get<StockInfo[]>("/stocks");
@@ -53,6 +54,7 @@ export const fetchQuotes = (code: string, start: string, end: string) =>
 
 export interface SyncResult {
   synced: Record<string, number>;
+  errors: Record<string, string>;
 }
 
 export const syncQuotes = (codes: string[]) =>
