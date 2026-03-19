@@ -30,7 +30,14 @@
       </button>
     </div>
 
-    <div v-if="error" class="error-msg">{{ error }}</div>
+    <div v-if="error" class="error-msg">
+      {{ error }}
+      <button v-if="showSync" class="sync-btn" @click="syncData" :disabled="syncing">
+        {{ syncing ? "同步中..." : "一键同步数据" }}
+      </button>
+    </div>
+
+    <div v-if="syncMsg" class="success-msg">{{ syncMsg }}</div>
 
     <div v-if="result && Object.keys(result.metrics).length > 0" class="results">
       <h2>回测结果</h2>
@@ -88,7 +95,7 @@ import {
   TooltipComponent,
   LegendComponent,
 } from "echarts/components";
-import { runBacktest, type BacktestResult } from "../api/client";
+import { runBacktest, syncQuotes, type BacktestResult } from "../api/client";
 
 use([CanvasRenderer, LineChart, GridComponent, TooltipComponent, LegendComponent]);
 
@@ -103,6 +110,9 @@ const form = ref({
 const loading = ref(false);
 const result = ref<BacktestResult | null>(null);
 const error = ref("");
+const showSync = ref(false);
+const syncing = ref(false);
+const syncMsg = ref("");
 
 const chartOption = computed(() => {
   if (!result.value) return {};
@@ -172,7 +182,8 @@ async function runTest() {
     });
     const data = res.data;
     if (!data.metrics || Object.keys(data.metrics).length === 0) {
-      error.value = "该股票暂无行情数据，请先通过 CLI 同步数据：quanti sync --quotes --codes " + form.value.codes;
+      error.value = "该股票暂无行情数据";
+      showSync.value = true;
     } else {
       result.value = data;
     }
@@ -181,6 +192,32 @@ async function runTest() {
     console.error("Backtest failed:", e);
   } finally {
     loading.value = false;
+  }
+}
+
+async function syncData() {
+  syncing.value = true;
+  syncMsg.value = "";
+  try {
+    const codes = form.value.codes.split(",").map((s) => s.trim());
+    const res = await syncQuotes(codes);
+    const total = Object.values(res.data.synced).reduce((a, b) => a + b, 0);
+    if (total > 0) {
+      syncMsg.value = `同步完成，共获取 ${total} 条行情数据。正在自动运行回测...`;
+      error.value = "";
+      showSync.value = false;
+      setTimeout(() => {
+        syncMsg.value = "";
+        runTest();
+      }, 500);
+    } else {
+      error.value = "未获取到数据，请确认股票代码是否正确";
+    }
+  } catch (e) {
+    error.value = "数据同步失败，请检查网络连接";
+    console.error("Sync failed:", e);
+  } finally {
+    syncing.value = false;
   }
 }
 </script>
@@ -270,6 +307,24 @@ th {
   background: #fff2f0;
   border: 1px solid #ffccc7;
   color: #cf1322;
+  padding: 12px 16px;
+  border-radius: 6px;
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.sync-btn {
+  background: #fa541c;
+  white-space: nowrap;
+}
+.sync-btn:disabled {
+  background: #ccc;
+}
+.success-msg {
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+  color: #389e0d;
   padding: 12px 16px;
   border-radius: 6px;
   margin-bottom: 20px;

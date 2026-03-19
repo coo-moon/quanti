@@ -51,6 +51,13 @@ export const fetchStocks = () => api.get<StockInfo[]>("/stocks");
 export const fetchQuotes = (code: string, start: string, end: string) =>
   api.get<QuoteData[]>(`/stocks/${code}/quotes`, { params: { start, end } });
 
+export interface SyncResult {
+  synced: Record<string, number>;
+}
+
+export const syncQuotes = (codes: string[]) =>
+  api.post<SyncResult>("/sync/quotes", { codes });
+
 export const runBacktest = (req: BacktestRequest) =>
   api.post<BacktestResult>("/backtest/run", req);
 

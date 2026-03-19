@@ -41,7 +41,34 @@ class BacktestResponse(BaseModel):
     equity_curve: dict[str, float]
 
 
+class SyncRequest(BaseModel):
+    codes: list[str]
+
+
+class SyncResult(BaseModel):
+    synced: dict[str, int]  # code -> bar count
+
+
 # --- Endpoints ---
+
+
+@router.post("/sync/quotes")
+async def sync_quotes(body: SyncRequest, request: Request):
+    """Sync daily quotes for given stock codes from AkShare."""
+    from quanti.data.akshare_adapter import AkShareAdapter
+
+    db = request.app.state.db
+    adapter = AkShareAdapter(db)
+    results = {}
+    for code in body.codes:
+        # Auto-register stock if not in db
+        stock = db.get_stock(code)
+        if stock is None:
+            exchange = "SH" if code.startswith("6") else "SZ"
+            db.upsert_stock(code, code, exchange, date(2000, 1, 1))
+        count = adapter.sync_daily_quotes(code)
+        results[code] = count
+    return SyncResult(synced=results)
 
 
 @router.get("/health")
