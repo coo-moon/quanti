@@ -30,7 +30,9 @@
       </button>
     </div>
 
-    <div v-if="result" class="results">
+    <div v-if="error" class="error-msg">{{ error }}</div>
+
+    <div v-if="result && Object.keys(result.metrics).length > 0" class="results">
       <h2>回测结果</h2>
 
       <div class="metrics-grid">
@@ -100,6 +102,7 @@ const form = ref({
 
 const loading = ref(false);
 const result = ref<BacktestResult | null>(null);
+const error = ref("");
 
 const chartOption = computed(() => {
   if (!result.value) return {};
@@ -156,6 +159,8 @@ function metricClass(key: string, value: number): string {
 
 async function runTest() {
   loading.value = true;
+  error.value = "";
+  result.value = null;
   try {
     const res = await runBacktest({
       strategy_name: form.value.strategy,
@@ -165,8 +170,14 @@ async function runTest() {
       initial_cash: form.value.cash,
       params: {},
     });
-    result.value = res.data;
+    const data = res.data;
+    if (!data.metrics || Object.keys(data.metrics).length === 0) {
+      error.value = "该股票暂无行情数据，请先通过 CLI 同步数据：quanti sync --quotes --codes " + form.value.codes;
+    } else {
+      result.value = data;
+    }
   } catch (e) {
+    error.value = "回测请求失败，请检查服务是否正常运行";
     console.error("Backtest failed:", e);
   } finally {
     loading.value = false;
@@ -254,5 +265,13 @@ td {
 }
 th {
   background: #f5f5f5;
+}
+.error-msg {
+  background: #fff2f0;
+  border: 1px solid #ffccc7;
+  color: #cf1322;
+  padding: 12px 16px;
+  border-radius: 6px;
+  margin-bottom: 20px;
 }
 </style>
