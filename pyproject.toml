@@ -22,9 +22,15 @@ dev = [
     "ruff>=0.2",
 ]
 
+[project.scripts]
+quanti = "quanti.cli:main"
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["quanti*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
