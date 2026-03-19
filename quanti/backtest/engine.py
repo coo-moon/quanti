@@ -97,8 +97,12 @@ class BacktestEngine:
             for code, bar in today_bars.items():
                 signals = strategy.on_bar(bar)
                 for signal in signals:
+                    # Use the bar matching the signal's stock_code, not the triggering bar
+                    signal_bar = today_bars.get(signal.stock_code, bar)
+                    if signal_bar.code != signal.stock_code:
+                        continue  # Skip if we don't have price data for the target stock
                     self._process_signal(
-                        signal, bar, portfolio, trades, current_date, bought_today, strategy.name
+                        signal, signal_bar, portfolio, trades, current_date, bought_today, strategy.name
                     )
 
             # Record equity
