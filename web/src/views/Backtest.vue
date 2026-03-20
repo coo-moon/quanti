@@ -16,6 +16,11 @@
           <div class="select-wrap">
             <select v-model="form.strategy">
               <option value="ma_cross">均线交叉</option>
+              <option value="macd_cross">MACD交叉</option>
+              <option value="rsi_ob_os">RSI超买超卖</option>
+              <option value="bollinger_band">布林带突破</option>
+              <option value="ma_volume">均线+放量</option>
+              <option value="turtle_breakout">海龟突破</option>
             </select>
           </div>
         </div>

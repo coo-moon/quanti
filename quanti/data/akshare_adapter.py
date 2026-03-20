@@ -78,6 +78,39 @@ class AkShareAdapter:
     def __init__(self, db: Database):
         self._db = db
 
+    def ensure_stock_info(self, code: str) -> None:
+        """Register stock with real name/industry if not already in DB."""
+        stock = self._db.get_stock(code)
+        if stock is not None and stock.name != stock.code:
+            return  # Already has real info
+
+        exchange = "SH" if code.startswith("6") else "SZ"
+        name = code
+        industry = ""
+        list_date = date(2000, 1, 1)
+
+        try:
+            info = ak.stock_individual_info_em(symbol=code)
+            info_dict = dict(zip(info["item"], info["value"]))
+            name = info_dict.get("股票简称", code)
+            industry = info_dict.get("行业", "")
+            list_date_str = info_dict.get("上市时间", "")
+            if list_date_str:
+                list_date = datetime.strptime(str(list_date_str), "%Y%m%d").date()
+        except Exception as e:
+            # Fallback: try the name list
+            try:
+                all_stocks = ak.stock_info_a_code_name()
+                match = all_stocks[all_stocks["code"] == code]
+                if not match.empty:
+                    name = match.iloc[0]["name"]
+            except Exception:
+                pass
+            if name == code:
+                logger.warning(f"Could not fetch info for {code}: {e}")
+
+        self._db.upsert_stock(code, name, exchange, list_date, industry)
+
     def sync_stock_list(self) -> int:
         """Fetch and save A-share stock list. Returns count."""
         df = ak.stock_info_a_code_name()
@@ -273,6 +306,9 @@ class AkShareAdapter:
         if start is None:
             latest = self._db.get_latest_quote_date(code)
             start = latest if latest else date(2020, 1, 1)
+
+        # Ensure stock has real name/info
+        self.ensure_stock_info(code)
 
         # Fetch data
         df, source = self._fetch_with_fallback(code, start, end)

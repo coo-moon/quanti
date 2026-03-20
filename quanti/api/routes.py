@@ -64,11 +64,6 @@ async def sync_quotes(body: SyncRequest, request: Request):
     results = {}
     errors = {}
     for code in body.codes:
-        # Auto-register stock if not in db
-        stock = db.get_stock(code)
-        if stock is None:
-            exchange = "SH" if code.startswith("6") else "SZ"
-            db.upsert_stock(code, code, exchange, date(2000, 1, 1))
         try:
             count = adapter.sync_daily_quotes(code)
             results[code] = count
@@ -138,10 +133,6 @@ async def run_backtest(body: BacktestRequest, request: Request):
         bars = provider.get_daily_bars(code, start_d, end_d)
         if len(bars) == 0:
             logger.info(f"No data for {code}, auto-syncing...")
-            stock = db.get_stock(code)
-            if stock is None:
-                exchange = "SH" if code.startswith("6") else "SZ"
-                db.upsert_stock(code, code, exchange, date(2000, 1, 1))
             try:
                 adapter = AkShareAdapter(db)
                 adapter.sync_daily_quotes(code, start=start_d, end=end_d)
@@ -160,11 +151,25 @@ async def run_backtest(body: BacktestRequest, request: Request):
                 break
 
     if strategy is None:
-        # Fallback: try to import from built-in strategies
+        # Fallback: import built-in strategies
+        from strategies.bollinger_band import BollingerBandStrategy
         from strategies.ma_cross import MACrossStrategy
+        from strategies.ma_volume import MAVolumeStrategy
+        from strategies.macd_cross import MACDCrossStrategy
+        from strategies.rsi_ob_os import RSIOverboughtOversoldStrategy
+        from strategies.turtle_breakout import TurtleBreakoutStrategy
 
-        if body.strategy_name == "ma_cross":
-            strategy = MACrossStrategy()
+        builtin = {
+            "ma_cross": MACrossStrategy,
+            "macd_cross": MACDCrossStrategy,
+            "rsi_ob_os": RSIOverboughtOversoldStrategy,
+            "bollinger_band": BollingerBandStrategy,
+            "ma_volume": MAVolumeStrategy,
+            "turtle_breakout": TurtleBreakoutStrategy,
+        }
+        cls = builtin.get(body.strategy_name)
+        if cls:
+            strategy = cls()
 
     if strategy is None:
         return {"error": f"Strategy '{body.strategy_name}' not found"}
