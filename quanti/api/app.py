@@ -21,6 +21,7 @@ def create_app(
     db: Database | None = None,
     provider: DataProvider | None = None,
     strategies_dir: str | None = "strategies",
+    screeners_dir: str | None = "screeners",
 ) -> FastAPI:
     app = FastAPI(title="Quanti", version="0.1.0")
 
@@ -38,6 +39,7 @@ def create_app(
     app.state.db = db
     app.state.provider = provider or DataProvider(db)
     app.state.strategies_dir = strategies_dir
+    app.state.screeners_dir = screeners_dir
 
     from quanti.api.routes import router
 

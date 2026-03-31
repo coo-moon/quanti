@@ -151,7 +151,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, onMounted } from "vue";
+import { useRoute } from "vue-router";
 import VChart from "vue-echarts";
 import { use } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
@@ -165,8 +166,10 @@ import { runBacktest, syncQuotes, type BacktestResult } from "../api/client";
 
 use([CanvasRenderer, LineChart, GridComponent, TooltipComponent, LegendComponent]);
 
+const route = useRoute();
+
 const form = ref({
-  codes: "000001",
+  codes: (route.query.code as string) || "000001",
   strategy: "ma_cross",
   start: "2024-01-01",
   end: "2024-12-31",
@@ -184,6 +187,11 @@ const chartOption = computed(() => {
   if (!result.value) return {};
   const dates = Object.keys(result.value.equity_curve);
   const values = Object.values(result.value.equity_curve);
+  const minVal = Math.min(...values);
+  const maxVal = Math.max(...values);
+  const padding = Math.max((maxVal - minVal) * 0.15, maxVal * 0.02);
+  const yMin = Math.floor((minVal - padding) / 1000) * 1000;
+  const yMax = Math.ceil((maxVal + padding) / 1000) * 1000;
   return {
     tooltip: {
       trigger: "axis",
@@ -193,6 +201,18 @@ const chartOption = computed(() => {
       textStyle: { color: "#1d1d1f", fontSize: 13 },
       shadowBlur: 12,
       shadowColor: "rgba(0,0,0,0.08)",
+      formatter: (params: unknown) => {
+        const arr = params as { axisValue: string; value: number }[];
+        if (!arr || !arr[0]) return "";
+        const p = arr[0];
+        const val = Number(p.value);
+        const base = values[0] ?? val;
+        const ret = ((val - base) / base * 100).toFixed(2);
+        const color = val >= base ? "#ff3b30" : "#34c759";
+        return `<div style="font-size:12px;color:#86868b">${p.axisValue}</div>
+          <div style="font-size:15px;font-weight:600;margin-top:4px">${val.toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</div>
+          <div style="font-size:13px;color:${color};margin-top:2px">${val >= base ? "+" : ""}${ret}%</div>`;
+      },
     },
     grid: { left: 60, right: 24, top: 16, bottom: 32 },
     xAxis: {
@@ -204,6 +224,8 @@ const chartOption = computed(() => {
     },
     yAxis: {
       type: "value",
+      min: yMin,
+      max: yMax,
       splitLine: { lineStyle: { color: "rgba(0,0,0,0.04)" } },
       axisLine: { show: false },
       axisTick: { show: false },

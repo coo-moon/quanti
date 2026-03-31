@@ -63,4 +63,40 @@ export const syncQuotes = (codes: string[]) =>
 export const runBacktest = (req: BacktestRequest) =>
   api.post<BacktestResult>("/backtest/run", req);
 
+// --- Screener ---
+
+export interface ScreenerInfo {
+  name: string;
+  description: string;
+}
+
+export interface ScreenRequest {
+  screener_name: string;
+  codes?: string[];
+  end?: string;
+  lookback_days?: number;
+  top_n?: number;
+  params?: Record<string, unknown>;
+}
+
+export interface ScreenResultItem {
+  code: string;
+  name: string;
+  score: number;
+  close: number;
+  change_pct: number;
+}
+
+export interface ScreenResponse {
+  screener: string;
+  description: string;
+  results: ScreenResultItem[];
+  total_scanned: number;
+}
+
+export const fetchScreeners = () => api.get<ScreenerInfo[]>("/screeners");
+
+export const runScreen = (req: ScreenRequest) =>
+  api.post<ScreenResponse>("/screen/run", req);
+
 export default api;

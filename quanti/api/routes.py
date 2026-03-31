@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from quanti.backtest.engine import BacktestEngine
 from quanti.models import Direction
+from quanti.screener.loader import ScreenerLoader
 from quanti.strategy.loader import StrategyLoader
 
 router = APIRouter()
@@ -49,6 +50,30 @@ class SyncRequest(BaseModel):
 class SyncResult(BaseModel):
     synced: dict[str, int]  # code -> bar count
     errors: dict[str, str] = {}  # code -> error message
+
+
+class ScreenRequest(BaseModel):
+    screener_name: str
+    codes: list[str] = []  # empty = all stocks in DB
+    end: str = ""  # YYYY-MM-DD, default today
+    lookback_days: int = 120
+    top_n: int = 20
+    params: dict = {}
+
+
+class ScreenResultItem(BaseModel):
+    code: str
+    name: str
+    score: float
+    close: float
+    change_pct: float  # latest day change %
+
+
+class ScreenResponse(BaseModel):
+    screener: str
+    description: str
+    results: list[ScreenResultItem]
+    total_scanned: int
 
 
 # --- Endpoints ---
@@ -114,6 +139,111 @@ async def get_quotes(code: str, start: str, end: str, request: Request):
             }
         )
     return records
+
+
+@router.get("/screeners")
+async def list_screeners(request: Request):
+    """List all available screener plugins."""
+    screeners_dir = request.app.state.screeners_dir
+    all_screeners = []
+
+    if screeners_dir:
+        loader = ScreenerLoader()
+        all_screeners = loader.load_directory(screeners_dir)
+
+    return [{"name": s.name, "description": s.description} for s in all_screeners]
+
+
+@router.post("/screen/run")
+async def run_screen(body: ScreenRequest, request: Request):
+    """Run a screener against stocks."""
+    import logging
+    from datetime import timedelta
+
+    logger = logging.getLogger(__name__)
+    db = request.app.state.db
+    provider = request.app.state.provider
+
+    # Find screener
+    screener = None
+    screeners_dir = request.app.state.screeners_dir
+    if screeners_dir:
+        loader = ScreenerLoader()
+        for s in loader.load_directory(screeners_dir):
+            if s.name == body.screener_name:
+                screener = s
+                break
+
+    if screener is None:
+        return {"error": f"Screener '{body.screener_name}' not found"}
+
+    screener.init(body.params)
+
+    # Determine stock pool
+    codes = body.codes
+    if not codes:
+        codes = provider.get_all_codes()
+
+    if not codes:
+        return ScreenResponse(
+            screener=screener.name,
+            description=screener.description,
+            results=[],
+            total_scanned=0,
+        )
+
+    end_d = date.fromisoformat(body.end) if body.end else date.today()
+    start_d = end_d - timedelta(days=int(body.lookback_days * 1.5))  # extra margin
+
+    # Auto-sync: fetch data for stocks with insufficient bars
+    from quanti.data.akshare_adapter import AkShareAdapter
+
+    adapter = AkShareAdapter(db)
+    for code in codes:
+        bars = provider.get_daily_bars(code, start_d, end_d)
+        if len(bars) < 10:
+            logger.info(f"Screener auto-sync: {code} has {len(bars)} bars, syncing...")
+            try:
+                adapter.sync_daily_quotes(code, start=start_d, end=end_d)
+            except Exception as e:
+                logger.warning(f"Auto-sync failed for {code}: {e}")
+
+    # Score each stock
+    scored: list[ScreenResultItem] = []
+    for code in codes:
+        try:
+            bars = provider.get_daily_bars(code, start_d, end_d)
+            if len(bars) < 10:
+                continue
+            score = screener.screen(code, bars)
+            if score > 0:
+                latest = bars[-1]
+                prev_close = bars[-2].close if len(bars) >= 2 else latest.close
+                change_pct = round((latest.close - prev_close) / prev_close * 100, 2)
+                stock = db.get_stock(code)
+                name = stock.name if stock else code
+                scored.append(
+                    ScreenResultItem(
+                        code=code,
+                        name=name,
+                        score=round(score, 3),
+                        close=round(latest.close, 2),
+                        change_pct=change_pct,
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"Screen failed for {code}: {e}")
+
+    # Sort by score descending, take top N
+    scored.sort(key=lambda x: x.score, reverse=True)
+    top = scored[: body.top_n]
+
+    return ScreenResponse(
+        screener=screener.name,
+        description=screener.description,
+        results=top,
+        total_scanned=len(codes),
+    )
 
 
 @router.post("/backtest/run")

@@ -33,13 +33,47 @@
       </div>
     </div>
 
+    <!-- Add Stock -->
+    <div class="card add-card">
+      <div class="add-row">
+        <div class="add-input-wrap">
+          <svg class="add-icon" width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <circle cx="8" cy="8" r="7" stroke="currentColor" stroke-width="1.5" />
+            <path d="M8 5v6M5 8h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+          </svg>
+          <input
+            v-model="addInput"
+            placeholder="输入股票代码，多个用逗号分隔，如 600519,000858,300750"
+            @keyup.enter="addStocks"
+          />
+        </div>
+        <button class="btn-primary" @click="addStocks" :disabled="syncing || !addInput.trim()">
+          <span v-if="syncing" class="spinner" />
+          {{ syncing ? "同步中..." : "添加并同步" }}
+        </button>
+        <button
+          v-if="stocks.length > 0"
+          class="btn-secondary"
+          @click="syncAll"
+          :disabled="syncing"
+        >
+          <span v-if="syncingAll" class="spinner dark" />
+          {{ syncingAll ? "同步中..." : "全部同步" }}
+        </button>
+      </div>
+      <div v-if="syncMsg" class="sync-msg" :class="syncError ? 'error' : 'success'">
+        {{ syncMsg }}
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-header">
         <h2>股票列表</h2>
+        <span class="card-header-hint" v-if="stocks.length">共 {{ stocks.length }} 只</span>
       </div>
       <div v-if="stocks.length === 0" class="empty-state">
         <p>暂无股票数据</p>
-        <p class="empty-hint">在回测中心同步股票数据后会自动添加</p>
+        <p class="empty-hint">在上方输入股票代码添加</p>
       </div>
       <div v-else class="table-wrap">
         <table>
@@ -50,6 +84,7 @@
               <th>交易所</th>
               <th>行业</th>
               <th>上市日期</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -59,6 +94,15 @@
               <td><span class="exchange-tag" :class="stock.exchange.toLowerCase()">{{ stock.exchange }}</span></td>
               <td>{{ stock.industry || '-' }}</td>
               <td class="td-muted">{{ stock.list_date }}</td>
+              <td>
+                <button
+                  class="btn-small"
+                  @click="syncOne(stock.code)"
+                  :disabled="syncingCodes.has(stock.code)"
+                >
+                  {{ syncingCodes.has(stock.code) ? "同步中" : "同步" }}
+                </button>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -68,23 +112,106 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
-import { fetchStocks, type StockInfo } from "../api/client";
+import { ref, reactive, computed, onMounted } from "vue";
+import { fetchStocks, syncQuotes, type StockInfo } from "../api/client";
 
 const stocks = ref<StockInfo[]>([]);
+const addInput = ref("");
+const syncing = ref(false);
+const syncingAll = ref(false);
+const syncMsg = ref("");
+const syncError = ref(false);
+const syncingCodes = reactive(new Set<string>());
 
 const lastUpdate = computed(() => {
   return new Date().toLocaleDateString("zh-CN");
 });
 
 onMounted(async () => {
+  await loadStocks();
+});
+
+async function loadStocks() {
   try {
     const res = await fetchStocks();
     stocks.value = res.data;
   } catch (e) {
     console.error("Failed to fetch stocks:", e);
   }
-});
+}
+
+function parseCodes(input: string): string[] {
+  return input
+    .replace(/\s+/g, ",")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => /^\d{6}$/.test(s));
+}
+
+async function addStocks() {
+  const codes = parseCodes(addInput.value);
+  if (codes.length === 0) {
+    syncMsg.value = "请输入有效的6位股票代码";
+    syncError.value = true;
+    return;
+  }
+  syncing.value = true;
+  syncMsg.value = "";
+  syncError.value = false;
+  try {
+    const res = await syncQuotes(codes);
+    const data = res.data;
+    const okCount = Object.values(data.synced).filter((n) => n > 0).length;
+    const errCount = Object.keys(data.errors).length;
+    if (errCount > 0) {
+      const errCodes = Object.keys(data.errors).join(", ");
+      syncMsg.value = `成功同步 ${okCount} 只，${errCount} 只失败（${errCodes}）`;
+      syncError.value = errCount > okCount;
+    } else {
+      syncMsg.value = `成功同步 ${okCount} 只股票`;
+      syncError.value = false;
+    }
+    addInput.value = "";
+    await loadStocks();
+  } catch (e) {
+    syncMsg.value = "同步请求失败，请检查服务是否正常运行";
+    syncError.value = true;
+  } finally {
+    syncing.value = false;
+  }
+}
+
+async function syncOne(code: string) {
+  syncingCodes.add(code);
+  try {
+    await syncQuotes([code]);
+  } catch (e) {
+    console.error(`Sync failed for ${code}:`, e);
+  } finally {
+    syncingCodes.delete(code);
+  }
+}
+
+async function syncAll() {
+  const codes = stocks.value.map((s) => s.code);
+  if (codes.length === 0) return;
+  syncingAll.value = true;
+  syncing.value = true;
+  syncMsg.value = "";
+  try {
+    const res = await syncQuotes(codes);
+    const data = res.data;
+    const okCount = Object.values(data.synced).filter((n) => n > 0).length;
+    syncMsg.value = `全部同步完成，${okCount} 只有更新`;
+    syncError.value = false;
+  } catch (e) {
+    syncMsg.value = "批量同步失败";
+    syncError.value = true;
+  } finally {
+    syncingAll.value = false;
+    syncing.value = false;
+  }
+}
 </script>
 
 <style scoped>
@@ -174,14 +301,177 @@ onMounted(async () => {
   overflow: hidden;
 }
 
+.add-card {
+  padding: 20px 24px;
+}
+
+.add-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.add-input-wrap {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.add-icon {
+  position: absolute;
+  left: 12px;
+  color: var(--color-text-tertiary);
+  pointer-events: none;
+}
+
+.add-input-wrap input {
+  width: 100%;
+  height: 40px;
+  padding: 0 12px 0 36px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+  background: var(--color-surface);
+  outline: none;
+  transition: all var(--transition);
+}
+
+.add-input-wrap input:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.15);
+}
+
+.btn-primary {
+  height: 40px;
+  padding: 0 20px;
+  background: var(--color-accent);
+  color: white;
+  border: none;
+  border-radius: 20px;
+  font-size: 14px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: all var(--transition);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+  transform: scale(1.02);
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  height: 40px;
+  padding: 0 20px;
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 20px;
+  font-size: 14px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: all var(--transition);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.btn-secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+.spinner.dark {
+  border-color: rgba(0, 0, 0, 0.15);
+  border-top-color: var(--color-text-primary);
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.sync-msg {
+  margin-top: 12px;
+  font-size: 13px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+}
+
+.sync-msg.success {
+  background: rgba(52, 199, 89, 0.08);
+  color: #34c759;
+}
+
+.sync-msg.error {
+  background: rgba(255, 59, 48, 0.08);
+  color: var(--color-red);
+}
+
 .card-header {
   padding: 20px 24px 16px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
 }
 
 .card-header h2 {
   font-size: 20px;
   font-weight: 600;
   letter-spacing: -0.3px;
+}
+
+.card-header-hint {
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+}
+
+.btn-small {
+  padding: 4px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  color: var(--color-accent);
+  background: var(--color-blue-bg);
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.btn-small:hover {
+  background: rgba(0, 113, 227, 0.15);
+}
+
+.btn-small:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .empty-state {

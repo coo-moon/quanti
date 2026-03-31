@@ -16,6 +16,13 @@
             </svg>
             仪表盘
           </router-link>
+          <router-link to="/screener" class="nav-link">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.5" />
+              <path d="M11 11l3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+            </svg>
+            选股中心
+          </router-link>
           <router-link to="/backtest" class="nav-link">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <polyline points="1,12 5,6 9,9 15,3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
