@@ -52,6 +52,13 @@ class SyncResult(BaseModel):
     errors: dict[str, str] = {}  # code -> error message
 
 
+class StockPoolStats(BaseModel):
+    total: int
+    with_quotes: int  # stocks that have quote data
+    exchange_sh: int
+    exchange_sz: int
+
+
 class ScreenRequest(BaseModel):
     screener_name: str
     codes: list[str] = []  # empty = all stocks in DB
@@ -103,6 +110,31 @@ async def sync_quotes(body: SyncRequest, request: Request):
 @router.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@router.post("/sync/stocks")
+async def sync_stock_list(request: Request):
+    """Sync the full A-share stock list (name, industry, exchange, list_date)."""
+    from quanti.data.akshare_adapter import AkShareAdapter
+
+    db = request.app.state.db
+    adapter = AkShareAdapter(db)
+    count = adapter.sync_stock_list()
+    return {"synced": count, "message": f"成功同步 {count} 只股票到股票池"}
+
+
+@router.get("/stocks/stats")
+async def stock_pool_stats(request: Request):
+    """Get stock pool statistics."""
+    db = request.app.state.db
+    all_stocks = db.list_stocks()
+    with_quotes = request.app.state.provider.get_all_codes()
+    return StockPoolStats(
+        total=len(all_stocks),
+        with_quotes=len(with_quotes),
+        exchange_sh=sum(1 for s in all_stocks if s.exchange.upper() in ("SH", "SHANGHAI")),
+        exchange_sz=sum(1 for s in all_stocks if s.exchange.upper() in ("SZ", "SHENZHEN")),
+    )
 
 
 @router.get("/stocks")
@@ -182,7 +214,9 @@ async def run_screen(body: ScreenRequest, request: Request):
     # Determine stock pool
     codes = body.codes
     if not codes:
-        codes = provider.get_all_codes()
+        # Use all stocks in DB (populated via sync_stock_list)
+        all_stocks = db.list_stocks()
+        codes = [s.code for s in all_stocks]
 
     if not codes:
         return ScreenResponse(

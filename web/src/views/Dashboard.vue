@@ -15,8 +15,19 @@
           </svg>
         </div>
         <div class="stat-info">
-          <span class="stat-label">股票数量</span>
-          <span class="stat-value">{{ stocks.length }}</span>
+          <span class="stat-label">已同步股票</span>
+          <span class="stat-value">{{ poolStats?.with_quotes ?? stocks.length }}</span>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon purple">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+            <path d="M10 2v16M2 10h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </div>
+        <div class="stat-info">
+          <span class="stat-label">股票池总数</span>
+          <span class="stat-value">{{ poolStats?.total ?? '-' }}</span>
         </div>
       </div>
       <div class="stat-card">
@@ -59,6 +70,10 @@
         >
           <span v-if="syncingAll" class="spinner dark" />
           {{ syncingAll ? "同步中..." : "全部同步" }}
+        </button>
+        <button class="btn-pool" @click="syncFullPool" :disabled="syncingPool">
+          <span v-if="syncingPool" class="spinner dark" />
+          {{ syncingPool ? "同步中..." : "同步全A股池" }}
         </button>
       </div>
       <div v-if="syncMsg" class="sync-msg" :class="syncError ? 'error' : 'success'">
@@ -113,12 +128,14 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from "vue";
-import { fetchStocks, syncQuotes, type StockInfo } from "../api/client";
+import { fetchStocks, fetchStockStats, syncQuotes, syncStockList, type StockInfo, type StockPoolStats } from "../api/client";
 
 const stocks = ref<StockInfo[]>([]);
+const poolStats = ref<StockPoolStats | null>(null);
 const addInput = ref("");
 const syncing = ref(false);
 const syncingAll = ref(false);
+const syncingPool = ref(false);
 const syncMsg = ref("");
 const syncError = ref(false);
 const syncingCodes = reactive(new Set<string>());
@@ -133,10 +150,28 @@ onMounted(async () => {
 
 async function loadStocks() {
   try {
-    const res = await fetchStocks();
-    stocks.value = res.data;
+    const [stocksRes, statsRes] = await Promise.all([fetchStocks(), fetchStockStats()]);
+    stocks.value = stocksRes.data;
+    poolStats.value = statsRes.data;
   } catch (e) {
     console.error("Failed to fetch stocks:", e);
+  }
+}
+
+async function syncFullPool() {
+  syncingPool.value = true;
+  syncMsg.value = "";
+  syncError.value = false;
+  try {
+    const res = await syncStockList();
+    syncMsg.value = res.data.message;
+    syncError.value = false;
+    await loadStocks();
+  } catch (e) {
+    syncMsg.value = "同步全A股池失败，请检查网络";
+    syncError.value = true;
+  } finally {
+    syncingPool.value = false;
   }
 }
 
@@ -275,6 +310,11 @@ async function syncAll() {
   color: #34c759;
 }
 
+.stat-icon.purple {
+  background: rgba(175, 82, 222, 0.1);
+  color: #af52de;
+}
+
 .stat-label {
   display: block;
   font-size: 13px;
@@ -395,6 +435,33 @@ async function syncAll() {
 }
 
 .btn-secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-pool {
+  height: 40px;
+  padding: 0 16px;
+  background: rgba(175, 82, 222, 0.1);
+  color: #af52de;
+  border: 1px solid rgba(175, 82, 222, 0.3);
+  border-radius: 20px;
+  font-size: 14px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: all var(--transition);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.btn-pool:hover:not(:disabled) {
+  background: rgba(175, 82, 222, 0.18);
+}
+
+.btn-pool:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }

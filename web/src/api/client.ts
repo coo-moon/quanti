@@ -49,6 +49,15 @@ export interface BacktestResult {
 
 export const fetchStocks = () => api.get<StockInfo[]>("/stocks");
 
+export interface StockPoolStats {
+  total: number;
+  with_quotes: number;
+  exchange_sh: number;
+  exchange_sz: number;
+}
+
+export const fetchStockStats = () => api.get<StockPoolStats>("/stocks/stats");
+
 export const fetchQuotes = (code: string, start: string, end: string) =>
   api.get<QuoteData[]>(`/stocks/${code}/quotes`, { params: { start, end } });
 
@@ -59,6 +68,9 @@ export interface SyncResult {
 
 export const syncQuotes = (codes: string[]) =>
   api.post<SyncResult>("/sync/quotes", { codes });
+
+export const syncStockList = () =>
+  api.post<{ synced: number; message: string }>("/sync/stocks");
 
 export const runBacktest = (req: BacktestRequest) =>
   api.post<BacktestResult>("/backtest/run", req);
