@@ -30,6 +30,14 @@
             </svg>
             回测中心
           </router-link>
+          <router-link to="/pool" class="nav-link">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <rect x="1" y="3" width="14" height="10" rx="2" stroke="currentColor" stroke-width="1.5" />
+              <path d="M4 3V2a1 1 0 011-1h6a1 1 0 011 1v1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+              <path d="M1 7h14" stroke="currentColor" stroke-width="1.5" />
+            </svg>
+            股票池
+          </router-link>
         </div>
       </div>
     </nav>

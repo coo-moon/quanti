@@ -64,6 +64,19 @@ class Database:
                 date TEXT PRIMARY KEY
             );
 
+            CREATE TABLE IF NOT EXISTS stock_pools (
+                name TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                description TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS pool_stocks (
+                pool_name TEXT NOT NULL,
+                code TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (pool_name, code)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_daily_quotes_code
                 ON daily_quotes(code);
             CREATE INDEX IF NOT EXISTS idx_daily_quotes_date
@@ -204,3 +217,82 @@ class Database:
             "SELECT 1 FROM trade_calendar WHERE date=?", (d.isoformat(),)
         ).fetchone()
         return row is not None
+
+    # --- Stock pool operations ---
+
+    def create_pool(self, name: str, description: str = "") -> None:
+        from datetime import datetime
+        self.conn.execute(
+            "INSERT INTO stock_pools (name, created_at, description) VALUES (?, ?, ?)",
+            (name, datetime.now().isoformat(), description),
+        )
+        self.conn.commit()
+
+    def delete_pool(self, name: str) -> bool:
+        cursor = self.conn.execute("DELETE FROM stock_pools WHERE name=?", (name,))
+        self.conn.execute("DELETE FROM pool_stocks WHERE pool_name=?", (name,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def list_pools(self) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT p.name, p.created_at, p.description,
+                   COUNT(ps.code) as stock_count
+            FROM stock_pools p
+            LEFT JOIN pool_stocks ps ON p.name = ps.pool_name
+            GROUP BY p.name
+            ORDER BY p.created_at DESC
+            """
+        ).fetchall()
+        return [
+            {"name": r[0], "created_at": r[1], "description": r[2], "stock_count": r[3]}
+            for r in rows
+        ]
+
+    def pool_exists(self, name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM stock_pools WHERE name=?", (name,)
+        ).fetchone()
+        return row is not None
+
+    def add_stocks_to_pool(self, pool_name: str, codes: list[str]) -> int:
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO pool_stocks (pool_name, code, added_at) VALUES (?, ?, ?)",
+            [(pool_name, code, now) for code in codes],
+        )
+        self.conn.commit()
+        return len(codes)
+
+    def remove_stocks_from_pool(self, pool_name: str, codes: list[str]) -> int:
+        self.conn.executemany(
+            "DELETE FROM pool_stocks WHERE pool_name=? AND code=?",
+            [(pool_name, code) for code in codes],
+        )
+        self.conn.commit()
+        return len(codes)
+
+    def get_pool_stocks(self, pool_name: str) -> list[StockInfo]:
+        rows = self.conn.execute(
+            """
+            SELECT s.code, s.name, s.exchange, s.list_date, s.industry
+            FROM pool_stocks ps
+            JOIN stocks s ON ps.code = s.code
+            WHERE ps.pool_name = ?
+            ORDER BY ps.added_at DESC
+            """,
+            (pool_name,),
+        ).fetchall()
+        return [
+            StockInfo(code=r[0], name=r[1], exchange=r[2], list_date=date.fromisoformat(r[3]), industry=r[4])
+            for r in rows
+        ]
+
+    def get_pool_codes(self, pool_name: str) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT code FROM pool_stocks WHERE pool_name=?",
+            (pool_name,),
+        ).fetchall()
+        return [r[0] for r in rows]

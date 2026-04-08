@@ -137,6 +137,115 @@ async def stock_pool_stats(request: Request):
     )
 
 
+# --- Stock Pool Management ---
+
+class PoolCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+class PoolAddStocksRequest(BaseModel):
+    codes: list[str]
+
+
+@router.get("/pools")
+async def list_pools(request: Request):
+    """List all stock pools."""
+    pools = request.app.state.db.list_pools()
+    return pools
+
+
+@router.post("/pools")
+async def create_pool(body: PoolCreateRequest, request: Request):
+    """Create a new stock pool."""
+    db = request.app.state.db
+    if db.pool_exists(body.name):
+        return {"error": f"股票池 '{body.name}' 已存在"}
+    db.create_pool(body.name, body.description)
+    return {"name": body.name, "message": f"股票池 '{body.name}' 创建成功"}
+
+
+@router.delete("/pools/{name}")
+async def delete_pool(name: str, request: Request):
+    """Delete a stock pool."""
+    db = request.app.state.db
+    if not db.pool_exists(name):
+        return {"error": f"股票池 '{name}' 不存在"}
+    db.delete_pool(name)
+    return {"name": name, "message": f"股票池 '{name}' 已删除"}
+
+
+@router.get("/pools/{name}/stocks")
+async def get_pool_stocks(name: str, request: Request):
+    """Get all stocks in a pool."""
+    db = request.app.state.db
+    if not db.pool_exists(name):
+        return {"error": f"股票池 '{name}' 不存在"}
+    stocks = db.get_pool_stocks(name)
+    return [
+        {
+            "code": s.code,
+            "name": s.name,
+            "exchange": s.exchange,
+            "list_date": s.list_date.isoformat(),
+            "industry": s.industry,
+        }
+        for s in stocks
+    ]
+
+
+@router.post("/pools/{name}/stocks")
+async def add_pool_stocks(name: str, body: PoolAddStocksRequest, request: Request):
+    """Add stocks to a pool."""
+    db = request.app.state.db
+    if not db.pool_exists(name):
+        return {"error": f"股票池 '{name}' 不存在"}
+    count = db.add_stocks_to_pool(name, body.codes)
+    return {"added": count, "message": f"成功添加 {count} 只股票到 '{name}'"}
+
+
+@router.delete("/pools/{name}/stocks")
+async def remove_pool_stocks(name: str, body: PoolAddStocksRequest, request: Request):
+    """Remove stocks from a pool."""
+    db = request.app.state.db
+    if not db.pool_exists(name):
+        return {"error": f"股票池 '{name}' 不存在"}
+    count = db.remove_stocks_from_pool(name, body.codes)
+    return {"removed": count, "message": f"已从 '{name}' 移除 {count} 只股票"}
+
+
+@router.post("/pools/{name}/sync")
+async def sync_pool_stocks(name: str, request: Request):
+    """Sync all stocks in a pool to latest quotes."""
+    from datetime import date, timedelta
+    from quanti.data.akshare_adapter import AkShareAdapter
+
+    db = request.app.state.db
+    provider = request.app.state.provider
+    if not db.pool_exists(name):
+        return {"error": f"股票池 '{name}' 不存在"}
+
+    codes = db.get_pool_codes(name)
+    if not codes:
+        return {"synced": 0, "errors": {}, "message": "股票池为空"}
+
+    end_d = date.today()
+    start_d = end_d - timedelta(days=365)  # sync 1 year of data
+    adapter = AkShareAdapter(db)
+    results = {}
+    errors = {}
+    for code in codes:
+        try:
+            count = adapter.sync_daily_quotes(code, start=start_d, end=end_d)
+            results[code] = count
+            if count == 0:
+                errors[code] = "未获取到数据"
+        except Exception as e:
+            results[code] = 0
+            errors[code] = str(e)
+    return SyncResult(synced=results, errors=errors)
+
+
 @router.get("/stocks")
 async def list_stocks(request: Request):
     stocks = request.app.state.db.list_stocks()

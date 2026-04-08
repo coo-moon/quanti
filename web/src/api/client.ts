@@ -111,4 +111,33 @@ export const fetchScreeners = () => api.get<ScreenerInfo[]>("/screeners");
 export const runScreen = (req: ScreenRequest) =>
   api.post<ScreenResponse>("/screen/run", req);
 
+// --- Stock Pools ---
+
+export interface PoolInfo {
+  name: string;
+  created_at: string;
+  description: string;
+  stock_count: number;
+}
+
+export const fetchPools = () => api.get<PoolInfo[]>("/pools");
+
+export const createPool = (data: { name: string; description: string }) =>
+  api.post("/pools", data);
+
+export const deletePool = (name: string) =>
+  api.delete<{ name: string; message: string }>(`/pools/${encodeURIComponent(name)}`);
+
+export const fetchPoolStocks = (name: string) =>
+  api.get<StockInfo[]>(`/pools/${encodeURIComponent(name)}/stocks`);
+
+export const addPoolStocks = (poolName: string, codes: string[]) =>
+  api.post(`/pools/${encodeURIComponent(poolName)}/stocks`, { codes });
+
+export const removePoolStocks = (poolName: string, codes: string[]) =>
+  api.delete(`/pools/${encodeURIComponent(poolName)}/stocks`, { data: { codes } });
+
+export const syncPoolStocks = (poolName: string) =>
+  api.post<SyncResult>(`/pools/${encodeURIComponent(poolName)}/sync`);
+
 export default api;
