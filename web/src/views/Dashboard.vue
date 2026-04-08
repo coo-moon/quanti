@@ -99,6 +99,7 @@
               <th>交易所</th>
               <th>行业</th>
               <th>上市日期</th>
+              <th>最新数据</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -109,6 +110,7 @@
               <td><span class="exchange-tag" :class="stock.exchange.toLowerCase()">{{ stock.exchange }}</span></td>
               <td>{{ stock.industry || '-' }}</td>
               <td class="td-muted">{{ stock.list_date }}</td>
+              <td :class="stock.latest_date ? 'td-date' : 'td-muted'">{{ stock.latest_date || '-' }}</td>
               <td>
                 <button
                   class="btn-small"
@@ -609,6 +611,12 @@ tbody tr:last-child td {
 .td-muted {
   color: var(--color-text-secondary);
   font-size: 13px;
+}
+
+.td-date {
+  color: #34c759;
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .exchange-tag {

@@ -10,6 +10,7 @@ export interface StockInfo {
   exchange: string;
   list_date: string;
   industry: string;
+  latest_date: string | null;
 }
 
 export interface QuoteData {

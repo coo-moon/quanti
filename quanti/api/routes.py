@@ -189,6 +189,7 @@ async def get_pool_stocks(name: str, request: Request):
             "exchange": s.exchange,
             "list_date": s.list_date.isoformat(),
             "industry": s.industry,
+            "latest_date": (d.isoformat() if (d := db.get_latest_quote_date(s.code)) else None),
         }
         for s in stocks
     ]
@@ -248,7 +249,8 @@ async def sync_pool_stocks(name: str, request: Request):
 
 @router.get("/stocks")
 async def list_stocks(request: Request):
-    stocks = request.app.state.db.list_stocks()
+    db = request.app.state.db
+    stocks = db.list_stocks()
     return [
         {
             "code": s.code,
@@ -256,6 +258,7 @@ async def list_stocks(request: Request):
             "exchange": s.exchange,
             "list_date": s.list_date.isoformat(),
             "industry": s.industry,
+            "latest_date": (d.isoformat() if (d := db.get_latest_quote_date(s.code)) else None),
         }
         for s in stocks
     ]
@@ -338,18 +341,37 @@ async def run_screen(body: ScreenRequest, request: Request):
     end_d = date.fromisoformat(body.end) if body.end else date.today()
     start_d = end_d - timedelta(days=int(body.lookback_days * 1.5))  # extra margin
 
-    # Auto-sync: fetch data for stocks with insufficient bars
+    # Auto-sync: fetch data for stocks with NO bars only (skip if already has data)
     from quanti.data.akshare_adapter import AkShareAdapter
+    import asyncio
 
     adapter = AkShareAdapter(db)
+    # Only sync stocks that have NO data at all (len == 0), skip stocks with partial data
+    codes_to_sync = []
     for code in codes:
         bars = provider.get_daily_bars(code, start_d, end_d)
-        if len(bars) < 10:
-            logger.info(f"Screener auto-sync: {code} has {len(bars)} bars, syncing...")
-            try:
-                adapter.sync_daily_quotes(code, start=start_d, end=end_d)
-            except Exception as e:
-                logger.warning(f"Auto-sync failed for {code}: {e}")
+        if len(bars) == 0:
+            codes_to_sync.append(code)
+
+    if codes_to_sync:
+        # Limit to first 50 to avoid overwhelming the network; rest will be synced on next run
+        codes_to_sync = codes_to_sync[:50]
+        logger.info(f"Screener auto-sync: syncing {len(codes_to_sync)} stocks (first 50 of total)")
+        # Sync with limited concurrency to avoid rate limiting
+        semaphore = asyncio.Semaphore(3)
+
+        async def sync_one(code: str) -> None:
+            async with semaphore:
+                try:
+                    loop = asyncio.get_event_loop()
+                    count = await loop.run_in_executor(
+                        None, lambda: adapter.sync_daily_quotes(code, start=start_d, end=end_d)
+                    )
+                    logger.info(f"Screener auto-sync: {code} synced {count} bars")
+                except Exception as e:
+                    logger.warning(f"Auto-sync failed for {code}: {e}")
+
+        await asyncio.gather(*[sync_one(c) for c in codes_to_sync])
 
     # Score each stock
     scored: list[ScreenResultItem] = []
