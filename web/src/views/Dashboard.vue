@@ -222,6 +222,7 @@ async function syncOne(code: string) {
   syncingCodes.add(code);
   try {
     await syncQuotes([code]);
+    await loadStocks();
   } catch (e) {
     console.error(`Sync failed for ${code}:`, e);
   } finally {
@@ -241,6 +242,7 @@ async function syncAll() {
     const okCount = Object.values(data.synced).filter((n) => n > 0).length;
     syncMsg.value = `全部同步完成，${okCount} 只有更新`;
     syncError.value = false;
+    await loadStocks();
   } catch (e) {
     syncMsg.value = "批量同步失败";
     syncError.value = true;

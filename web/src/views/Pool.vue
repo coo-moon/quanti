@@ -330,6 +330,7 @@ async function syncPool() {
     syncError.value = true;
   } finally {
     syncingPool.value = false;
+    await selectPool(selectedPool.value);
   }
 }
 
