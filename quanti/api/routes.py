@@ -237,7 +237,7 @@ async def sync_pool_stocks(name: str, request: Request):
     errors = {}
     for code in codes:
         try:
-            count = adapter.sync_daily_quotes(code, start=start_d, end=end_d)
+            count = adapter.sync_daily_quotes(code, start=start_d, end=end_d, repair_gaps=False)
             results[code] = count
             if count == 0:
                 errors[code] = "未获取到数据"
@@ -365,7 +365,7 @@ async def run_screen(body: ScreenRequest, request: Request):
                 try:
                     loop = asyncio.get_event_loop()
                     count = await loop.run_in_executor(
-                        None, lambda: adapter.sync_daily_quotes(code, start=start_d, end=end_d)
+                        None, lambda: adapter.sync_daily_quotes(code, start=start_d, end=end_d, repair_gaps=False)
                     )
                     logger.info(f"Screener auto-sync: {code} synced {count} bars")
                 except Exception as e:
@@ -430,7 +430,7 @@ async def run_backtest(body: BacktestRequest, request: Request):
             logger.info(f"No data for {code}, auto-syncing...")
             try:
                 adapter = AkShareAdapter(db)
-                adapter.sync_daily_quotes(code, start=start_d, end=end_d)
+                adapter.sync_daily_quotes(code, start=start_d, end=end_d, repair_gaps=False)
             except Exception as e:
                 logger.warning(f"Auto-sync failed for {code}: {e}")
 

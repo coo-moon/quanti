@@ -112,23 +112,21 @@ class AkShareAdapter:
         self._db.upsert_stock(code, name, exchange, list_date, industry)
 
     def sync_stock_list(self) -> int:
-        """Fetch and save A-share stock list. Returns count."""
+        """Fetch and save A-share stock list (code + name only). Returns count."""
         df = ak.stock_info_a_code_name()
         count = 0
         for _, row in df.iterrows():
-            code = row["code"]
-            name = row["name"]
+            code = str(row["code"])
+            name = str(row["name"])
+            exchange = "SH" if code.startswith("6") else "SZ"
+            # Use a default list_date; real date can be fetched later per-stock if needed
+            list_date = date(2000, 1, 1)
+            industry = ""
             try:
-                info = ak.stock_individual_info_em(symbol=code)
-                info_dict = dict(zip(info["item"], info["value"]))
-                list_date_str = info_dict.get("上市时间", "19700101")
-                list_date = datetime.strptime(str(list_date_str), "%Y%m%d").date()
-                industry = info_dict.get("行业", "")
-                exchange = "SH" if code.startswith("6") else "SZ"
                 self._db.upsert_stock(code, name, exchange, list_date, industry)
                 count += 1
             except Exception as e:
-                logger.warning(f"Failed to fetch info for {code}: {e}")
+                logger.warning(f"Failed to save {code}: {e}")
         return count
 
     # --- Data sources ---
@@ -299,6 +297,7 @@ class AkShareAdapter:
         code: str,
         start: date | None = None,
         end: date | None = None,
+        repair_gaps: bool = True,
     ) -> int:
         """Fetch, validate, and save daily quotes. Returns count of rows saved."""
         if end is None:
@@ -319,8 +318,8 @@ class AkShareAdapter:
         report = self._validate_and_report(df, code, start, end, source)
         saved = self._db.save_daily_quotes(df)
 
-        # Repair gaps with cross-source fill
-        if report.gaps:
+        # Repair gaps with cross-source fill (skip for bulk pool sync to avoid slowdowns)
+        if repair_gaps and report.gaps:
             repaired = self._repair_gaps(report, code, source)
             report.repaired = repaired
             saved += repaired
