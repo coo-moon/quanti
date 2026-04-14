@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import uuid
 from datetime import date
 
 from fastapi import APIRouter, Request
@@ -226,34 +228,48 @@ async def remove_pool_stocks(name: str, body: PoolAddStocksRequest, request: Req
 
 @router.post("/pools/{name}/sync")
 async def sync_pool_stocks(name: str, request: Request):
-    """Sync all stocks in a pool to latest quotes."""
-    from datetime import date, timedelta
+    """Start async sync for pool stocks. Returns job_id immediately."""
+    from datetime import timedelta
     from quanti.data.akshare_adapter import AkShareAdapter
 
     db = request.app.state.db
-    provider = request.app.state.provider
     if not db.pool_exists(name):
         return {"error": f"股票池 '{name}' 不存在"}
 
     codes = db.get_pool_codes(name)
     if not codes:
-        return {"synced": 0, "errors": {}, "message": "股票池为空"}
+        return {"error": "股票池为空"}
+
+    job_id = str(uuid.uuid4())[:8]
+    db.create_sync_job(job_id, name, len(codes))
+
+    # Start async task
+    asyncio.create_task(_run_pool_sync(job_id, name, codes, db))
+
+    return {"job_id": job_id}
+
+
+async def _run_pool_sync(job_id: str, pool_name: str, codes: list[str], db) -> None:
+    """Background task to sync pool stocks and update progress."""
+    from datetime import date, timedelta
+    from quanti.data.akshare_adapter import AkShareAdapter
 
     end_d = date.today()
-    start_d = end_d - timedelta(days=365)  # sync 1 year of data
+    start_d = end_d - timedelta(days=365)
     adapter = AkShareAdapter(db)
-    results = {}
-    errors = {}
-    for code in codes:
+    errors: dict[str, str] = {}
+
+    for i, code in enumerate(codes):
         try:
             count = adapter.sync_daily_quotes(code, start=start_d, end=end_d, repair_gaps=False)
-            results[code] = count
             if count == 0:
                 errors[code] = "未获取到数据"
         except Exception as e:
-            results[code] = 0
             errors[code] = str(e)
-    return SyncResult(synced=results, errors=errors)
+        db.update_sync_job(job_id, i + 1, "running", errors)
+
+    final_status = "error" if errors else "done"
+    db.update_sync_job(job_id, len(codes), final_status, errors)
 
 
 @router.get("/pools/{name}/sync/status")
