@@ -77,6 +77,16 @@ class Database:
                 PRIMARY KEY (pool_name, code)
             );
 
+            CREATE TABLE IF NOT EXISTS sync_jobs (
+                job_id TEXT PRIMARY KEY,
+                pool_name TEXT NOT NULL,
+                total INTEGER NOT NULL,
+                current INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'running',
+                errors_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_daily_quotes_code
                 ON daily_quotes(code);
             CREATE INDEX IF NOT EXISTS idx_daily_quotes_date
@@ -296,3 +306,35 @@ class Database:
             (pool_name,),
         ).fetchall()
         return [r[0] for r in rows]
+
+    # --- Sync job tracking ---
+
+    def create_sync_job(self, job_id: str, pool_name: str, total: int) -> None:
+        from datetime import datetime
+        self.conn.execute(
+            "INSERT INTO sync_jobs (job_id, pool_name, total, current, status, errors_json, created_at) VALUES (?, ?, ?, 0, 'running', '{}', ?)",
+            (job_id, pool_name, total, datetime.now().isoformat()),
+        )
+        self.conn.commit()
+
+    def update_sync_job(self, job_id: str, current: int, status: str, errors: dict) -> None:
+        import json
+        self.conn.execute(
+            "UPDATE sync_jobs SET current=?, status=?, errors_json=? WHERE job_id=?",
+            (current, status, json.dumps(errors), job_id),
+        )
+        self.conn.commit()
+
+    def get_sync_job(self, job_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT job_id, pool_name, total, current, status, errors_json, created_at FROM sync_jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        import json
+        return {
+            "job_id": row[0], "pool_name": row[1], "total": row[2],
+            "current": row[3], "status": row[4],
+            "errors": json.loads(row[5]), "created_at": row[6],
+        }
