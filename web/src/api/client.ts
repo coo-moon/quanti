@@ -154,6 +154,7 @@ export interface SyncStatus {
   status: string;
   errors: Record<string, string>;
   message: string;
+  eta_seconds: number | null;
 }
 
 export const fetchPoolSyncStatus = (poolName: string, jobId: string) =>

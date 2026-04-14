@@ -84,7 +84,7 @@
     <!-- Download Progress Bar -->
     <div v-if="syncJobId && syncProgress.total > 0" class="progress-bar-wrap">
       <div class="progress-info">
-        <span>已下载 {{ syncProgress.current }}/{{ syncProgress.total }}</span>
+        <span>已下载 {{ syncProgress.current }}/{{ syncProgress.total }}<span v-if="syncProgress.eta_seconds" class="progress-eta">，约剩 {{ Math.floor(syncProgress.eta_seconds / 60) }} 分钟</span></span>
         <span v-if="Object.keys(syncProgress.errors).length" class="progress-errors">
           {{ Object.keys(syncProgress.errors).length }} 只失败
         </span>
@@ -155,7 +155,7 @@ const syncMsg = ref("");
 const syncError = ref(false);
 const syncingCodes = reactive(new Set<string>());
 const syncJobId = ref<string | null>(null);
-const syncProgress = ref<SyncStatus>({ job_id: "", current: 0, total: 0, status: "", errors: {}, message: "" });
+const syncProgress = ref<SyncStatus>({ job_id: "", current: 0, total: 0, status: "", errors: {}, message: "", eta_seconds: null });
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 const lastUpdate = computed(() => {
@@ -278,7 +278,7 @@ async function syncAll() {
   syncing.value = true;
   syncMsg.value = "";
   syncError.value = false;
-  syncProgress.value = { job_id: "", current: 0, total: 0, status: "running", errors: {}, message: "启动中..." };
+  syncProgress.value = { job_id: "", current: 0, total: 0, status: "running", errors: {}, message: "启动中...", eta_seconds: null };
   try {
     const res = await syncQuotesAsync();
     if (res.data.job_id) {
@@ -527,6 +527,11 @@ async function syncAll() {
 
 .progress-errors {
   color: var(--color-red);
+}
+
+.progress-eta {
+  color: var(--color-muted);
+  font-size: 12px;
 }
 
 .progress-bar {

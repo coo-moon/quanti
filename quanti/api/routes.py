@@ -156,6 +156,22 @@ async def _run_quotes_sync(job_id: str, codes: list[str], db) -> None:
     db.update_sync_job(job_id, len(codes), final_status, errors)
 
 
+def _calc_eta_seconds(job: dict) -> int | None:
+    """Calculate estimated remaining seconds based on progress rate."""
+    if job["status"] != "running" or job["current"] == 0:
+        return None
+    from datetime import datetime
+    created = datetime.fromisoformat(job["created_at"])
+    elapsed = (datetime.now() - created).total_seconds()
+    if elapsed <= 0:
+        return None
+    rate = job["current"] / elapsed
+    if rate <= 0:
+        return None
+    remaining = job["total"] - job["current"]
+    return int(remaining / rate)
+
+
 @router.get("/sync/quotes/status")
 async def get_quotes_sync_status(job_id: str, request: Request):
     """Get async quotes sync progress."""
@@ -167,15 +183,19 @@ async def get_quotes_sync_status(job_id: str, request: Request):
     total = job["total"]
     status = job["status"]
     err_count = len(job["errors"])
+    eta = _calc_eta_seconds(job)
     if status == "running":
         message = f"已同步 {current}/{total}"
+        if eta is not None:
+            message += f"，约 {eta // 60} 分钟"
     elif status == "done":
         message = f"同步完成，共 {total} 只"
     else:
         message = f"同步结束，{err_count} 只失败"
     return SyncStatusResponse(
         job_id=job_id, current=current, total=total,
-        status=status, errors=job["errors"], message=message
+        status=status, errors=job["errors"], message=message,
+        eta_seconds=eta,
     )
 
 
@@ -227,6 +247,7 @@ class SyncStatusResponse(BaseModel):
     status: str  # running, done, error
     errors: dict
     message: str
+    eta_seconds: int | None = None
 
 
 @router.get("/pools")
@@ -359,15 +380,19 @@ async def get_sync_status(name: str, job_id: str, request: Request):
     total = job["total"]
     status = job["status"]
     err_count = len(job["errors"])
+    eta = _calc_eta_seconds(job)
     if status == "running":
         message = f"已同步 {current}/{total}"
+        if eta is not None:
+            message += f"，约 {eta // 60} 分钟"
     elif status == "done":
         message = f"同步完成，共 {total} 只"
     else:
         message = f"同步结束，{err_count} 只失败"
     return SyncStatusResponse(
         job_id=job_id, current=current, total=total,
-        status=status, errors=job["errors"], message=message
+        status=status, errors=job["errors"], message=message,
+        eta_seconds=eta,
     )
 
 

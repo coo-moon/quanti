@@ -224,7 +224,7 @@ const syncError = ref(false);
 const syncingPool = ref(false);
 const syncingAll = ref(false);
 const syncJobId = ref<string | null>(null);
-const syncProgress = ref<SyncStatus>({ job_id: "", current: 0, total: 0, status: "", errors: {}, message: "" });
+const syncProgress = ref<SyncStatus>({ job_id: "", current: 0, total: 0, status: "", errors: {}, message: "", eta_seconds: null });
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 // Modals
@@ -358,7 +358,7 @@ async function syncPool() {
   syncingPool.value = true;
   syncMsg.value = "";
   syncError.value = false;
-  syncProgress.value = { job_id: "", current: 0, total: 0, status: "running", errors: {}, message: "启动中..." };
+  syncProgress.value = { job_id: "", current: 0, total: 0, status: "running", errors: {}, message: "启动中...", eta_seconds: null };
   try {
     const res = await syncPoolStocks(selectedPool.value);
     if (res.data.job_id) {
