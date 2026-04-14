@@ -83,6 +83,19 @@
             </div>
           </div>
 
+          <!-- Progress Bar -->
+          <div v-if="syncJobId && syncProgress.status === 'running'" class="progress-bar-wrap">
+            <div class="progress-info">
+              <span>已同步 {{ syncProgress.current }}/{{ syncProgress.total }}</span>
+              <span v-if="Object.keys(syncProgress.errors).length" class="progress-errors">
+                {{ Object.keys(syncProgress.errors).length }} 只失败
+              </span>
+            </div>
+            <div class="progress-bar">
+              <div class="progress-fill" :style="{ width: (syncProgress.current / syncProgress.total * 100) + '%' }"></div>
+            </div>
+          </div>
+
           <!-- Add Stocks -->
           <div class="card add-card">
             <div class="add-row">
@@ -197,7 +210,9 @@ import {
   removePoolStocks,
   syncPoolStocks,
   syncStockList,
+  fetchPoolSyncStatus,
   type StockInfo,
+  type SyncStatus,
 } from "../api/client";
 
 const pools = ref<{ name: string; created_at: string; description: string; stock_count: number }[]>([]);
@@ -208,6 +223,9 @@ const syncMsg = ref("");
 const syncError = ref(false);
 const syncingPool = ref(false);
 const syncingAll = ref(false);
+const syncJobId = ref<string | null>(null);
+const syncProgress = ref<SyncStatus>({ job_id: "", current: 0, total: 0, status: "", errors: {}, message: "" });
+let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 // Modals
 const showCreateModal = ref(false);
@@ -309,28 +327,47 @@ async function removeStock(code: string) {
   }
 }
 
+function startPolling(jobId: string) {
+  syncJobId.value = jobId;
+  pollTimer = setInterval(async () => {
+    try {
+      const res = await fetchPoolSyncStatus(selectedPool.value, jobId);
+      syncProgress.value = res.data;
+      if (res.data.status !== "running") {
+        stopPolling();
+        await selectPool(selectedPool.value);
+        await loadPools();
+        syncMsg.value = res.data.message;
+        syncError.value = res.data.status === "error";
+      }
+    } catch (e) {
+      console.error("Poll error:", e);
+    }
+  }, 1000);
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
 async function syncPool() {
   if (!selectedPool.value || syncingPool.value) return;
   syncingPool.value = true;
   syncMsg.value = "";
   syncError.value = false;
+  syncProgress.value = { job_id: "", current: 0, total: 0, status: "running", errors: {}, message: "启动中..." };
   try {
     const res = await syncPoolStocks(selectedPool.value);
-    const ok = Object.values(res.data.synced).filter((n: number) => n > 0).length;
-    const err = Object.keys(res.data.errors || {}).length;
-    if (err > 0) {
-      syncMsg.value = `同步完成，${ok} 只成功，${err} 只失败`;
-      syncError.value = true;
-    } else {
-      syncMsg.value = `同步完成，${ok} 只股票已更新`;
-      syncError.value = false;
+    if (res.data.job_id) {
+      startPolling(res.data.job_id);
     }
   } catch (e) {
     syncMsg.value = "同步失败";
     syncError.value = true;
-  } finally {
     syncingPool.value = false;
-    await selectPool(selectedPool.value);
   }
 }
 
@@ -606,6 +643,39 @@ async function syncAllAStocks() {
 .btn-sync-pool:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Progress Bar */
+.progress-bar-wrap {
+  padding: 12px 16px;
+  background: rgba(0, 113, 227, 0.06);
+  border-radius: var(--radius-md);
+}
+
+.progress-info {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin-bottom: 6px;
+}
+
+.progress-errors {
+  color: var(--color-red);
+}
+
+.progress-bar {
+  height: 6px;
+  background: rgba(0, 113, 227, 0.15);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--color-accent);
+  border-radius: 3px;
+  transition: width 0.3s ease;
 }
 
 /* Add Card */
