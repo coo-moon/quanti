@@ -148,6 +148,15 @@ class PoolAddStocksRequest(BaseModel):
     codes: list[str]
 
 
+class SyncStatusResponse(BaseModel):
+    job_id: str
+    current: int
+    total: int
+    status: str  # running, done, error
+    errors: dict
+    message: str
+
+
 @router.get("/pools")
 async def list_pools(request: Request):
     """List all stock pools."""
@@ -245,6 +254,31 @@ async def sync_pool_stocks(name: str, request: Request):
             results[code] = 0
             errors[code] = str(e)
     return SyncResult(synced=results, errors=errors)
+
+
+@router.get("/pools/{name}/sync/status")
+async def get_sync_status(name: str, job_id: str, request: Request):
+    """Get sync job progress."""
+    db = request.app.state.db
+    job = db.get_sync_job(job_id)
+    if job is None:
+        return {"error": f"Job '{job_id}' not found"}
+    if job["pool_name"] != name:
+        return {"error": "Job does not belong to this pool"}
+    current = job["current"]
+    total = job["total"]
+    status = job["status"]
+    err_count = len(job["errors"])
+    if status == "running":
+        message = f"已同步 {current}/{total}"
+    elif status == "done":
+        message = f"同步完成，共 {total} 只"
+    else:
+        message = f"同步结束，{err_count} 只失败"
+    return SyncStatusResponse(
+        job_id=job_id, current=current, total=total,
+        status=status, errors=job["errors"], message=message
+    )
 
 
 @router.get("/stocks")
