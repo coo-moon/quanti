@@ -70,6 +70,12 @@ export interface SyncResult {
 export const syncQuotes = (codes: string[]) =>
   api.post<SyncResult>("/sync/quotes", { codes });
 
+export const syncQuotesAsync = () =>
+  api.post<{ job_id: string }>("/sync/quotes/async", { codes: [] });
+
+export const fetchQuotesSyncStatus = (jobId: string) =>
+  api.get<SyncStatus>(`/sync/quotes/status`, { params: { job_id: jobId } });
+
 export const syncStockList = () =>
   api.post<{ synced: number; message: string }>("/sync/stocks");
 

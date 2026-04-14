@@ -109,6 +109,72 @@ async def sync_quotes(body: SyncRequest, request: Request):
     return SyncResult(synced=results, errors=errors)
 
 
+@router.post("/sync/quotes/async")
+async def sync_quotes_async(body: SyncRequest, request: Request):
+    """Start async sync for given stock codes. Returns job_id immediately."""
+    from datetime import date, timedelta
+    from quanti.data.akshare_adapter import AkShareAdapter
+
+    db = request.app.state.db
+    codes = body.codes
+    if not codes:
+        all_stocks = db.list_stocks()
+        codes = [s.code for s in all_stocks]
+    if not codes:
+        return {"error": "没有可同步的股票"}
+
+    job_id = f"q_{str(uuid.uuid4())[:8]}"
+    db.create_sync_job(job_id, "_quotes_sync", len(codes))
+    asyncio.create_task(_run_quotes_sync(job_id, codes, db))
+
+    return {"job_id": job_id}
+
+
+async def _run_quotes_sync(job_id: str, codes: list[str], db) -> None:
+    from datetime import date, timedelta
+    from quanti.data.akshare_adapter import AkShareAdapter
+
+    end_d = date.today()
+    start_d = end_d - timedelta(days=365)
+    adapter = AkShareAdapter(db)
+    errors: dict[str, str] = {}
+
+    for i, code in enumerate(codes):
+        try:
+            count = adapter.sync_daily_quotes(code, start=start_d, end=end_d, repair_gaps=False)
+            if count == 0:
+                errors[code] = "未获取到数据"
+        except Exception as e:
+            errors[code] = str(e)
+        db.update_sync_job(job_id, i + 1, "running", errors)
+
+    final_status = "error" if errors else "done"
+    db.update_sync_job(job_id, len(codes), final_status, errors)
+
+
+@router.get("/sync/quotes/status")
+async def get_quotes_sync_status(job_id: str, request: Request):
+    """Get async quotes sync progress."""
+    db = request.app.state.db
+    job = db.get_sync_job(job_id)
+    if job is None:
+        return {"error": f"Job '{job_id}' not found"}
+    current = job["current"]
+    total = job["total"]
+    status = job["status"]
+    err_count = len(job["errors"])
+    if status == "running":
+        message = f"已同步 {current}/{total}"
+    elif status == "done":
+        message = f"同步完成，共 {total} 只"
+    else:
+        message = f"同步结束，{err_count} 只失败"
+    return SyncStatusResponse(
+        job_id=job_id, current=current, total=total,
+        status=status, errors=job["errors"], message=message
+    )
+
+
 @router.get("/health")
 async def health():
     return {"status": "ok"}

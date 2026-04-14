@@ -69,7 +69,7 @@
           :disabled="syncing"
         >
           <span v-if="syncingAll" class="spinner dark" />
-          {{ syncingAll ? "同步中..." : "全部同步" }}
+          {{ syncingAll ? "同步中..." : "下载K线" }}
         </button>
         <button class="btn-pool" @click="syncFullPool" :disabled="syncingPool">
           <span v-if="syncingPool" class="spinner dark" />
@@ -78,6 +78,19 @@
       </div>
       <div v-if="syncMsg" class="sync-msg" :class="syncError ? 'error' : 'success'">
         {{ syncMsg }}
+      </div>
+    </div>
+
+    <!-- Download Progress Bar -->
+    <div v-if="syncJobId && syncProgress.status === 'running'" class="progress-bar-wrap">
+      <div class="progress-info">
+        <span>已下载 {{ syncProgress.current }}/{{ syncProgress.total }}</span>
+        <span v-if="Object.keys(syncProgress.errors).length" class="progress-errors">
+          {{ Object.keys(syncProgress.errors).length }} 只失败
+        </span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" :style="{ width: (syncProgress.current / syncProgress.total * 100) + '%' }"></div>
       </div>
     </div>
 
@@ -130,7 +143,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from "vue";
-import { fetchStocks, fetchStockStats, syncQuotes, syncStockList, type StockInfo, type StockPoolStats } from "../api/client";
+import { fetchStocks, fetchStockStats, syncQuotes, syncStockList, syncQuotesAsync, fetchQuotesSyncStatus, type StockInfo, type StockPoolStats, type SyncStatus } from "../api/client";
 
 const stocks = ref<StockInfo[]>([]);
 const poolStats = ref<StockPoolStats | null>(null);
@@ -141,6 +154,9 @@ const syncingPool = ref(false);
 const syncMsg = ref("");
 const syncError = ref(false);
 const syncingCodes = reactive(new Set<string>());
+const syncJobId = ref<string | null>(null);
+const syncProgress = ref<SyncStatus>({ job_id: "", current: 0, total: 0, status: "", errors: {}, message: "" });
+let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 const lastUpdate = computed(() => {
   return new Date().toLocaleDateString("zh-CN");
@@ -230,23 +246,46 @@ async function syncOne(code: string) {
   }
 }
 
+function startPolling(jobId: string) {
+  syncJobId.value = jobId;
+  pollTimer = setInterval(async () => {
+    try {
+      const res = await fetchQuotesSyncStatus(jobId);
+      syncProgress.value = res.data;
+      if (res.data.status !== "running") {
+        stopPolling();
+        await loadStocks();
+        syncMsg.value = res.data.message;
+        syncError.value = res.data.status === "error";
+      }
+    } catch (e) {
+      console.error("Poll error:", e);
+    }
+  }, 1000);
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
 async function syncAll() {
-  const codes = stocks.value.map((s) => s.code);
-  if (codes.length === 0) return;
+  if (stocks.value.length === 0) return;
   syncingAll.value = true;
   syncing.value = true;
   syncMsg.value = "";
+  syncError.value = false;
+  syncProgress.value = { job_id: "", current: 0, total: 0, status: "running", errors: {}, message: "启动中..." };
   try {
-    const res = await syncQuotes(codes);
-    const data = res.data;
-    const okCount = Object.values(data.synced).filter((n) => n > 0).length;
-    syncMsg.value = `全部同步完成，${okCount} 只有更新`;
-    syncError.value = false;
-    await loadStocks();
+    const res = await syncQuotesAsync();
+    if (res.data.job_id) {
+      startPolling(res.data.job_id);
+    }
   } catch (e) {
-    syncMsg.value = "批量同步失败";
+    syncMsg.value = "同步启动失败";
     syncError.value = true;
-  } finally {
     syncingAll.value = false;
     syncing.value = false;
   }
@@ -468,6 +507,38 @@ async function syncAll() {
 .btn-pool:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.progress-bar-wrap {
+  padding: 12px 20px;
+  background: rgba(0, 113, 227, 0.06);
+  border-radius: var(--radius-md);
+}
+
+.progress-info {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin-bottom: 6px;
+}
+
+.progress-errors {
+  color: var(--color-red);
+}
+
+.progress-bar {
+  height: 6px;
+  background: rgba(0, 113, 227, 0.15);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--color-accent);
+  border-radius: 3px;
+  transition: width 0.3s ease;
 }
 
 .spinner {
