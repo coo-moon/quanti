@@ -139,6 +139,20 @@ export const removePoolStocks = (poolName: string, codes: string[]) =>
   api.delete(`/pools/${encodeURIComponent(poolName)}/stocks`, { data: { codes } });
 
 export const syncPoolStocks = (poolName: string) =>
-  api.post<SyncResult>(`/pools/${encodeURIComponent(poolName)}/sync`);
+  api.post<{ job_id: string }>(`/pools/${encodeURIComponent(poolName)}/sync`);
+
+export interface SyncStatus {
+  job_id: string;
+  current: number;
+  total: number;
+  status: string;
+  errors: Record<string, string>;
+  message: string;
+}
+
+export const fetchPoolSyncStatus = (poolName: string, jobId: string) =>
+  api.get<SyncStatus>(`/pools/${encodeURIComponent(poolName)}/sync/status`, {
+    params: { job_id: jobId },
+  });
 
 export default api;
