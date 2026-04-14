@@ -82,7 +82,7 @@
     </div>
 
     <!-- Download Progress Bar -->
-    <div v-if="syncJobId && syncProgress.status === 'running'" class="progress-bar-wrap">
+    <div v-if="syncJobId && syncProgress.total > 0" class="progress-bar-wrap">
       <div class="progress-info">
         <span>已下载 {{ syncProgress.current }}/{{ syncProgress.total }}</span>
         <span v-if="Object.keys(syncProgress.errors).length" class="progress-errors">
@@ -269,6 +269,7 @@ function stopPolling() {
     clearInterval(pollTimer);
     pollTimer = null;
   }
+  syncJobId.value = null;
 }
 
 async function syncAll() {
@@ -286,6 +287,7 @@ async function syncAll() {
   } catch (e) {
     syncMsg.value = "同步启动失败";
     syncError.value = true;
+    stopPolling();
     syncingAll.value = false;
     syncing.value = false;
   }
