@@ -1,74 +1,51 @@
 # Quanti - A股量化交易系统
 
-Quanti 是一个面向中国 A 股市场的开源量化交易系统，提供从数据获取、因子计算、策略编写、回测验证到 Web 可视化的完整工作流。
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+Quanti 是一个面向中国 A 股市场的开源量化交易系统，提供从**数据采集、因子计算、策略编写、回测验证**到 **Web 可视化**的完整工作流。
+
+![Dashboard](docs/screenshots/dashboard.png)
 
 ## 特性
 
-- **数据模块** - 基于 AkShare 的 A 股行情数据自动采集，SQLite 本地存储
-- **因子引擎** - 可扩展的因子注册表，内置 MA/EMA/RSI/MACD/布林带/ATR 等技术指标
-- **策略框架** - 面向对象的策略基类，支持从目录动态加载自定义策略
-- **回测引擎** - 事件驱动回测，模拟 A 股 T+1 规则、涨跌停、佣金印花税
-- **风控模块** - 独立风控层，支持个股仓位限制、止损、每日交易限额
-- **Web 仪表盘** - FastAPI 后端 + Vue 3 前端，ECharts 图表展示回测结果
-- **CLI 工具** - 命令行一键同步数据、运行回测、启动服务
-
-## 系统架构
-
-```
-quanti/
-├── models.py          # 核心领域模型 (BarData, Signal, Order, Portfolio)
-├── data/              # 数据层
-│   ├── database.py    #   SQLite 存储
-│   ├── provider.py    #   统一数据接口
-│   └── akshare_adapter.py  # AkShare 数据源适配器
-├── factors/           # 因子引擎
-│   ├── registry.py    #   因子注册表
-│   └── technical.py   #   技术指标因子
-├── strategy/          # 策略引擎
-│   ├── base.py        #   策略基类
-│   └── loader.py      #   动态策略加载器
-├── backtest/          # 回测引擎
-│   ├── engine.py      #   事件驱动回测核心
-│   ├── commission.py  #   A 股费用模型
-│   └── metrics.py     #   绩效指标 (夏普/最大回撤/年化)
-├── risk/              # 风控模块
-│   └── manager.py     #   风险管理器
-├── api/               # Web API
-│   ├── app.py         #   FastAPI 应用
-│   └── routes.py      #   路由定义
-└── cli.py             # 命令行入口
-```
+| 模块 | 功能 |
+|------|------|
+| **数据采集** | AkShare 数据源，自动同步全A股行情，SQLite 本地存储 |
+| **股票池管理** | 创建/删除股票池，批量添加/移除股票，一键同步K线数据 |
+| **技术因子** | 内置 MA/EMA/RSI/MACD/布林带/ATR 等技术指标，支持自定义因子 |
+| **策略框架** | 继承 `BaseStrategy` 即可编写策略，动态加载无需配置 |
+| **回测引擎** | 事件驱动，模拟A股T+1规则、涨跌停、佣金印花税 |
+| **Web 仪表盘** | FastAPI + Vue 3，K线图表、回测曲线、选股结果可视化 |
+| **选股器** | 可扩展的选股插件框架，支持自定义选股逻辑 |
+| **进度追踪** | 后台任务实时进度，同步/回测/选股均有 ETA 预估 |
 
 ## 快速开始
 
 ### 环境要求
 
 - Python 3.11+
-- Node.js 18+（前端开发可选）
+- Node.js 18+（开发前端可选）
 
 ### 安装
 
 ```bash
-git clone https://github.com/your-username/quanti.git
+git clone https://github.com/coo-moon/quanti.git
 cd quanti
-
-# 创建虚拟环境并安装
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-### 同步数据
+### 一键同步全A股数据
 
 ```bash
-# 同步交易日历
-quanti sync --calendar
-
-# 同步股票列表
+# 同步股票列表（含名称、交易所、所属行业）
 quanti sync --stocks
 
-# 同步指定股票行情
-quanti sync --quotes --codes 000001,600519
+# 启动服务，Web界面下载K线
+quanti serve
+# 访问 http://127.0.0.1:8000
 ```
 
 ### 运行回测
@@ -76,27 +53,72 @@ quanti sync --quotes --codes 000001,600519
 ```bash
 quanti backtest \
   --strategy ma_cross \
-  --codes 000001 \
+  --codes 000001,600519 \
   --start 2024-01-01 \
   --end 2024-12-31 \
-  --cash 100000
+  --cash 1000000
 ```
 
-### 启动 Web 服务
+## Web 界面
 
-```bash
-# 启动后端 API
-quanti serve
+启动 `quanti serve` 后访问 http://127.0.0.1:8000：
 
-# 前端开发模式（可选）
-cd web && npm install && npm run dev
+| 页面 | 功能 |
+|------|------|
+| **Dashboard** | 全局股票池统计、一键下载K线（含进度条+ETA） |
+| **股票池** | 创建/管理股票池，池内股票同步K线，实时进度 |
+| **选股器** | 选择选股策略，设定参数，运行选股得到评分排名 |
+| **回测** | 选择策略与股票，设置参数，一键回测并查看绩效曲线 |
+| **关于** | 项目介绍与依赖版本 |
+
+## 系统架构
+
 ```
+quanti/
+├── models.py                 # 核心模型 (BarData, Signal, Order, Portfolio)
+│
+├── data/                     # 数据层
+│   ├── database.py           #   SQLite 存储 + sync_jobs 任务追踪
+│   ├── provider.py           #   统一数据接口
+│   └── akshare_adapter.py    #   AkShare 适配器（含回退逻辑）
+│
+├── factors/                  # 因子引擎
+│   ├── registry.py           #   因子注册表
+│   └── technical.py          #   技术指标实现
+│
+├── strategy/                 # 策略框架
+│   ├── base.py               #   策略基类
+│   └── loader.py             #   动态策略加载器
+│
+├── backtest/                 # 回测引擎
+│   ├── engine.py             #   事件驱动核心
+│   ├── commission.py         #   A股费用模型
+│   └── metrics.py            #   夏普/最大回撤/年化收益
+│
+├── screener/                 # 选股器框架
+│   ├── base.py               #   选股器基类
+│   └── loader.py             #   动态加载器
+│
+├── risk/                     # 风控模块
+│   └── manager.py            #   风险管理器
+│
+├── api/                      # Web API
+│   ├── app.py                #   FastAPI 应用
+│   └── routes.py             #   路由定义
+│
+└── cli.py                    # 命令行入口
 
-访问 http://127.0.0.1:8000 查看仪表盘。
+web/src/views/                 # Vue 3 前端
+├── Dashboard.vue             #   主页仪表盘
+├── Pool.vue                  #   股票池管理
+├── Screener.vue              #   选股器
+├── Backtest.vue              #   回测页面
+└── AboutView.vue             #   关于页面
+```
 
 ## 编写自定义策略
 
-在 `strategies/` 目录下创建 Python 文件，继承 `BaseStrategy`：
+在 `strategies/` 目录下创建文件，继承 `BaseStrategy`：
 
 ```python
 from quanti.strategy.base import BaseStrategy
@@ -105,33 +127,73 @@ from quanti.models import BarData, Direction, Signal
 
 class MyStrategy(BaseStrategy):
     name = "my_strategy"
+    params = {"fast_period": 5, "slow_period": 20}
 
-    def init(self, config: dict) -> None:
-        self.threshold = config.get("threshold", 10.0)
+    def init(self, params: dict) -> None:
+        self.fast = params["fast_period"]
+        self.slow = params["slow_period"]
+        self.position = None
 
     def on_bar(self, bar: BarData) -> list[Signal]:
-        if bar.close > self.threshold:
-            return [Signal(
-                stock_code=bar.code,
-                direction=Direction.BUY,
-                strength=0.8,
-                reason="price above threshold",
-            )]
+        # 示例：简单均线交叉策略
+        if self.position is None and bar.close > bar.ma(self.fast):
+            return [Signal(stock_code=bar.code, direction=Direction.BUY, strength=0.8)]
+        elif self.position == Direction.BUY and bar.close < bar.ma(self.slow):
+            return [Signal(stock_code=bar.code, direction=Direction.SELL, strength=1.0)]
         return []
 ```
 
-策略文件会被自动发现和加载，无需修改任何配置。
+策略文件自动被发现，无需任何配置。
 
-## 注册自定义因子
+## 编写自定义选股器
+
+在 `screeners/` 目录下创建文件：
 
 ```python
-from quanti.factors.registry import register_factor
+from quanti.screener.base import BaseScreener
 import pandas as pd
 
-@register_factor("my_momentum")
-def my_momentum(df: pd.DataFrame) -> pd.Series:
-    return df["close"].pct_change(20)
+
+class MyScreener(BaseScreener):
+    name = "my_screener"
+    description = "我的选股器"
+
+    def screen(self, code: str, bars: list) -> float:
+        """返回评分（越高越好），返回 0 表示不入选"""
+        if len(bars) < 20:
+            return 0
+        recent = pd.DataFrame([{"close": b.close, "volume": b.volume} for b in bars[-20:]])
+        # 示例：成交量放大且股价上涨
+        vol_ratio = recent["volume"].iloc[-1] / recent["volume"].mean()
+        price_change = (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0]
+        if vol_ratio > 1.5 and price_change > 0.05:
+            return vol_ratio * price_change * 100
+        return 0
 ```
+
+## 数据同步命令
+
+| 命令 | 说明 |
+|------|------|
+| `quanti sync --stocks` | 同步全A股列表（名称/行业/交易所） |
+| `quanti sync --calendar` | 同步交易日历 |
+| `quanti sync --quotes --codes 000001,600519` | 同步指定股票K线 |
+| `quanti serve` | 启动 API 服务（端口 8000） |
+
+## 配置
+
+数据存储路径可在 `quanti/cli.py` 中配置，默认 `data/quanti.db`。
+
+## 技术栈
+
+| 组件 | 技术 |
+|------|------|
+| 数据源 | [AkShare](https://github.com/akfamily/akshare) |
+| 存储 | SQLite + WAL 模式 |
+| 后端 | FastAPI + Uvicorn + Pydantic |
+| 前端 | Vue 3 + TypeScript + ECharts + Axios |
+| 策略/因子 | Python 3.11+ |
+| 测试 | pytest + pytest-asyncio |
 
 ## 运行测试
 
@@ -139,35 +201,20 @@ def my_momentum(df: pd.DataFrame) -> pd.Series:
 pytest tests/ -v
 ```
 
-## 技术栈
-
-| 组件 | 技术 |
-|------|------|
-| 语言 | Python 3.11+ |
-| 数据源 | AkShare |
-| 存储 | SQLite (可升级 PostgreSQL) |
-| 后端 | FastAPI + Uvicorn |
-| 前端 | Vue 3 + TypeScript + ECharts |
-| 测试 | pytest |
-
 ## 项目状态
-
-当前为 v0.1.0，核心功能已实现：
 
 - [x] 数据采集与存储
 - [x] 技术因子计算
 - [x] 策略框架与动态加载
 - [x] 事件驱动回测引擎
-- [x] A 股费用与 T+1 规则
-- [x] 风险管理
+- [x] A股费用与 T+1 规则
+- [x] 风控模块
 - [x] REST API
 - [x] Web 可视化仪表盘
-- [x] CLI 工具
-
-后续计划：
-
+- [x] 股票池管理
+- [x] 选股器框架
+- [x] 后台任务进度追踪
 - [ ] 实盘模拟交易对接
-- [ ] 更多内置策略（动量、均值回归、多因子选股）
 - [ ] PostgreSQL 支持
 - [ ] 策略参数优化
 - [ ] 实时行情推送
@@ -175,7 +222,3 @@ pytest tests/ -v
 ## 许可证
 
 [MIT License](LICENSE)
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request。
