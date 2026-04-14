@@ -211,13 +211,13 @@ class AkShareAdapter:
 
     def _fetch_with_fallback(self, code: str, start: date, end: date) -> tuple[pd.DataFrame | None, str]:
         """Try East Money, fallback to Sina. Returns (df, source_name)."""
-        df = self._fetch_eastmoney(code, start, end)
-        if df is not None and not df.empty:
-            return df, "eastmoney"
-        logger.info(f"East Money unavailable for {code}, trying Sina...")
         df = self._fetch_sina(code, start, end)
         if df is not None and not df.empty:
             return df, "sina"
+        logger.info(f"Sina unavailable for {code}, trying East Money...")
+        df = self._fetch_eastmoney(code, start, end)
+        if df is not None and not df.empty:
+            return df, "eastmoney"
         return None, ""
 
     # --- Integrity validation ---
