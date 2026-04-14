@@ -133,15 +133,19 @@ async def sync_quotes_async(body: SyncRequest, request: Request):
 async def _run_quotes_sync(job_id: str, codes: list[str], db) -> None:
     from datetime import date, timedelta
     from quanti.data.akshare_adapter import AkShareAdapter
+    import asyncio
+    from functools import partial
 
     end_d = date.today()
     start_d = end_d - timedelta(days=365)
     adapter = AkShareAdapter(db)
     errors: dict[str, str] = {}
+    loop = asyncio.get_event_loop()
 
     for i, code in enumerate(codes):
         try:
-            count = adapter.sync_daily_quotes(code, start=start_d, end=end_d, repair_gaps=False)
+            fn = partial(adapter.sync_daily_quotes, code, start=start_d, end=end_d, repair_gaps=False)
+            count = await loop.run_in_executor(None, fn)
             if count == 0:
                 errors[code] = "未获取到数据"
         except Exception as e:
@@ -319,15 +323,19 @@ async def _run_pool_sync(job_id: str, pool_name: str, codes: list[str], db) -> N
     """Background task to sync pool stocks and update progress."""
     from datetime import date, timedelta
     from quanti.data.akshare_adapter import AkShareAdapter
+    import asyncio
+    from functools import partial
 
     end_d = date.today()
     start_d = end_d - timedelta(days=365)
     adapter = AkShareAdapter(db)
     errors: dict[str, str] = {}
+    loop = asyncio.get_event_loop()
 
     for i, code in enumerate(codes):
         try:
-            count = adapter.sync_daily_quotes(code, start=start_d, end=end_d, repair_gaps=False)
+            fn = partial(adapter.sync_daily_quotes, code, start=start_d, end=end_d, repair_gaps=False)
+            count = await loop.run_in_executor(None, fn)
             if count == 0:
                 errors[code] = "未获取到数据"
         except Exception as e:
