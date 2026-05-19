@@ -6,11 +6,12 @@ import asyncio
 import uuid
 from datetime import date
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from quanti.agent.goal import Goal, RiskTolerance, load_goal, save_goal
 from quanti.backtest.engine import BacktestEngine
-from quanti.models import Direction
+from quanti.models import Direction, Signal
 from quanti.screener.loader import ScreenerLoader
 from quanti.strategy.loader import StrategyLoader
 
@@ -558,6 +559,160 @@ async def run_screen(body: ScreenRequest, request: Request):
         results=top,
         total_scanned=len(codes),
     )
+
+
+# --- Agent / Goal / Portfolio ---
+
+
+class GoalBody(BaseModel):
+    target_annual_return: float = 0.20
+    max_drawdown: float = -0.20
+    risk_tolerance: str = "medium"  # low / medium / high
+    universe_pool: str = ""
+    screener_name: str = ""
+    strategy_name: str = ""
+    params: dict = {}
+    rebalance_freq: str = "daily"
+    enabled: bool = False
+
+
+class ManualOrderBody(BaseModel):
+    code: str
+    direction: str  # buy / sell
+    strength: float = 1.0
+    reason: str = "manual"
+
+
+@router.get("/goal")
+async def get_goal_endpoint(request: Request):
+    goal = load_goal(request.app.state.db)
+    return goal.to_db()
+
+
+@router.post("/goal")
+async def set_goal_endpoint(body: GoalBody, request: Request):
+    try:
+        risk = RiskTolerance(body.risk_tolerance)
+    except ValueError:
+        raise HTTPException(status_code=422,
+                            detail=f"invalid risk_tolerance: {body.risk_tolerance!r}; "
+                                   "expected 'low' | 'medium' | 'high'")
+    goal = Goal(
+        target_annual_return=body.target_annual_return,
+        max_drawdown=body.max_drawdown,
+        risk_tolerance=risk,
+        universe_pool=body.universe_pool,
+        screener_name=body.screener_name,
+        strategy_name=body.strategy_name,
+        params=body.params,
+        rebalance_freq=body.rebalance_freq,
+        enabled=body.enabled,
+    )
+    save_goal(request.app.state.db, goal)
+    return {"ok": True, "goal": goal.to_db()}
+
+
+@router.get("/portfolio")
+async def get_portfolio(request: Request):
+    return request.app.state.broker.snapshot_portfolio()
+
+
+@router.post("/portfolio/reset")
+async def reset_portfolio(request: Request, initial_cash: float = 1_000_000.0):
+    request.app.state.db.reset_portfolio(initial_cash)
+    request.app.state.db.log_decision(
+        "portfolio_reset", f"组合重置，初始资金 {initial_cash:,.0f}")
+    return request.app.state.broker.snapshot_portfolio()
+
+
+@router.get("/portfolio/snapshots")
+async def list_portfolio_snapshots(request: Request, limit: int = 365):
+    return request.app.state.db.get_portfolio_snapshots(limit=limit)
+
+
+@router.get("/orders")
+async def list_orders(request: Request, limit: int = 200):
+    return request.app.state.db.list_orders(limit=limit)
+
+
+@router.get("/trades")
+async def list_trades(request: Request, limit: int = 200):
+    return request.app.state.db.list_trades(limit=limit)
+
+
+@router.post("/orders/manual")
+async def manual_order(body: ManualOrderBody, request: Request):
+    broker = request.app.state.broker
+    try:
+        direction = Direction(body.direction)
+    except ValueError:
+        raise HTTPException(status_code=422,
+                            detail=f"invalid direction: {body.direction!r}; "
+                                   "expected 'buy' or 'sell'")
+    if not body.code or not body.code.strip():
+        raise HTTPException(status_code=422, detail="code is required")
+    signal = Signal(
+        stock_code=body.code.strip(),
+        direction=direction,
+        strength=max(min(body.strength, 1.0), 0.05),
+        reason=body.reason,
+    )
+    filled = broker.execute_signal(signal, strategy_name="manual")
+    return {"filled": filled, "snapshot": broker.snapshot_portfolio()}
+
+
+@router.post("/agent/start")
+async def agent_start(request: Request):
+    request.app.state.agent.start()
+    return {"status": "started"}
+
+
+@router.post("/agent/stop")
+async def agent_stop(request: Request):
+    request.app.state.agent.stop()
+    return {"status": "stopped"}
+
+
+@router.post("/agent/tick")
+async def agent_tick(request: Request):
+    return request.app.state.agent.tick()
+
+
+@router.get("/agent/status")
+async def agent_status(request: Request):
+    s = request.app.state.agent.status()
+    return {
+        "enabled": s.enabled, "running": s.running,
+        "last_tick_at": s.last_tick_at, "last_tick_summary": s.last_tick_summary,
+        "last_strategy": s.last_strategy,
+        "last_evaluations": s.last_evaluations,
+        "total_value": s.total_value, "pnl_pct": s.pnl_pct,
+    }
+
+
+@router.get("/agent/decisions")
+async def agent_decisions(request: Request, limit: int = 100, kind: str | None = None):
+    return request.app.state.db.list_decisions(limit=limit, kind=kind)
+
+
+@router.post("/agent/decisions/prune")
+async def agent_prune_decisions(request: Request, older_than_days: int = 90):
+    """Manually trim the decision log to free space / focus the UI."""
+    if older_than_days < 1:
+        raise HTTPException(status_code=422,
+                            detail="older_than_days must be >= 1")
+    removed = request.app.state.db.prune_decisions(older_than_days)
+    return {"removed": removed, "older_than_days": older_than_days}
+
+
+@router.get("/strategies")
+async def list_strategies(request: Request):
+    """List available strategy plugins."""
+    strategies_dir = request.app.state.strategies_dir
+    if not strategies_dir:
+        return []
+    loader = StrategyLoader()
+    return [{"name": s.name} for s in loader.load_directory(strategies_dir)]
 
 
 @router.post("/backtest/run")

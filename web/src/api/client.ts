@@ -162,4 +162,110 @@ export const fetchPoolSyncStatus = (poolName: string, jobId: string) =>
     params: { job_id: jobId },
   });
 
+// --- Agent / Goal / Portfolio ---
+
+export interface Goal {
+  target_annual_return: number;
+  max_drawdown: number;
+  risk_tolerance: "low" | "medium" | "high";
+  universe_pool: string;
+  screener_name: string;
+  strategy_name: string;
+  params: Record<string, unknown>;
+  rebalance_freq: string;
+  enabled: boolean;
+}
+
+export interface AgentStatus {
+  enabled: boolean;
+  running: boolean;
+  last_tick_at: string | null;
+  last_tick_summary: string;
+  last_strategy: string;
+  last_evaluations: Array<{
+    strategy_name: string;
+    annual_return: number;
+    max_drawdown: number;
+    sharpe: number;
+    total_trades: number;
+    score: number;
+  }>;
+  total_value: number;
+  pnl_pct: number;
+}
+
+export interface PortfolioPosition {
+  code: string;
+  name: string;
+  quantity: number;
+  avg_cost: number;
+  current_price: number;
+  market_value: number;
+  pnl: number;
+  pnl_pct: number;
+  buy_date: string | null;
+}
+
+export interface Portfolio {
+  cash: number;
+  initial_cash: number;
+  market_value: number;
+  total_value: number;
+  pnl: number;
+  pnl_pct: number;
+  positions: PortfolioPosition[];
+  snapshot_date: string;
+}
+
+export interface OrderRecord {
+  order_id: string;
+  code: string;
+  direction: string;
+  quantity: number;
+  status: string;
+  filled_price: number;
+  filled_quantity: number;
+  strategy_name: string;
+  reason: string;
+  created_at: string;
+  filled_at: string | null;
+}
+
+export interface DecisionRecord {
+  id: number;
+  ts: string;
+  kind: string;
+  code: string;
+  summary: string;
+  details: Record<string, unknown>;
+}
+
+export interface StrategyInfo {
+  name: string;
+}
+
+export const fetchGoal = () => api.get<Goal>("/goal");
+export const updateGoal = (g: Partial<Goal>) => api.post<{ ok: boolean; goal: Goal }>("/goal", g);
+export const fetchPortfolio = () => api.get<Portfolio>("/portfolio");
+export const resetPortfolio = (initial_cash: number) =>
+  api.post<Portfolio>("/portfolio/reset", null, { params: { initial_cash } });
+export const fetchPortfolioSnapshots = () =>
+  api.get<Array<{ snapshot_date: string; cash: number; market_value: number; total_value: number }>>(
+    "/portfolio/snapshots"
+  );
+export const fetchOrders = (limit = 100) =>
+  api.get<OrderRecord[]>("/orders", { params: { limit } });
+export const fetchTrades = (limit = 100) => api.get<unknown[]>("/trades", { params: { limit } });
+export const manualOrder = (data: { code: string; direction: "buy" | "sell"; strength?: number; reason?: string }) =>
+  api.post<{ filled: boolean; snapshot: Portfolio }>("/orders/manual", data);
+
+export const agentStart = () => api.post<{ status: string }>("/agent/start");
+export const agentStop = () => api.post<{ status: string }>("/agent/stop");
+export const agentTick = () => api.post<Record<string, unknown>>("/agent/tick");
+export const fetchAgentStatus = () => api.get<AgentStatus>("/agent/status");
+export const fetchAgentDecisions = (limit = 50, kind?: string) =>
+  api.get<DecisionRecord[]>("/agent/decisions", { params: { limit, kind } });
+
+export const fetchStrategies = () => api.get<StrategyInfo[]>("/strategies");
+
 export default api;

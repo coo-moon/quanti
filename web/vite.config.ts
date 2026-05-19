@@ -15,6 +15,20 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url))
     },
   },
+  build: {
+    // Split the heaviest third-party libs into their own chunks so that
+    // first-paint pages (Dashboard / Agent) don't have to download the
+    // entire ECharts bundle up front.
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          echarts: ['echarts', 'vue-echarts'],
+          vendor: ['vue', 'vue-router', 'pinia', 'axios'],
+        },
+      },
+    },
+    chunkSizeWarningLimit: 600,
+  },
   server: {
     proxy: {
       "/api": {

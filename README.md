@@ -201,23 +201,75 @@ class MyScreener(BaseScreener):
 pytest tests/ -v
 ```
 
+## AI Agent 模式 — 开箱即用
+
+一行命令：设定目标，剩下交给 Agent。
+
+```bash
+quanti up --target 0.20 --max-drawdown -0.20 --risk medium
+```
+
+- 首次运行后台异步拉取股票列表，Web 立即可用 → http://127.0.0.1:8000
+- Agent 自治循环：每个 tick 完成 *同步数据 → 选股 → 策略评估 → 信号生成 → 风控 → 模拟下单 → 写决策日志*
+- 没指定 `--strategy` 时，Agent 用 `StrategySelector` 把所有策略按目标做近 1 年回测，挑得分最高的
+- 全部在 `data/quanti.db` 持久化：组合、持仓、订单、成交、目标、决策
+
+在 Web → **AI Agent** 页面可以：编辑目标、启停 Agent、立即跑一轮、查看持仓与决策日志、手动下单覆盖。
+
+### MCP 接入（OpenClaw / Claude Desktop / Cursor 等）
+
+`quanti mcp` 以 stdio JSON-RPC 启动 MCP server，暴露 18 个工具：
+
+| 工具 | 用途 |
+|------|------|
+| `get_goal` / `set_goal` | 读写目标 |
+| `agent_start` / `agent_stop` / `agent_status` / `agent_tick` | 控制循环 |
+| `get_portfolio` / `list_positions` / `list_orders` / `list_trades` | 账户视图 |
+| `place_order` | 手动覆盖买卖 |
+| `list_strategies` / `list_screeners` / `list_pools` | 资源清单 |
+| `run_backtest` / `run_screener` | 试跑（不影响实盘账户） |
+| `list_decisions` | 决策日志 |
+| `sync_stocks` / `sync_quotes` | 数据同步 |
+| `tune_strategy`（通过 `set_goal` 的 `params`） | 调策略参数 |
+
+OpenClaw 配置示例（MCP client config）：
+```json
+{
+  "mcpServers": {
+    "quanti": {
+      "command": "quanti",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### CLI 命令速查
+
+| 命令 | 说明 |
+|------|------|
+| `quanti up [--target 0.20 --no-agent ...]` | 一键启动数据 + 目标 + Web + Agent |
+| `quanti serve` | 只起 Web，不自动启 Agent |
+| `quanti agent tick` | 在本地强制跑一轮 Agent 周期（不需 server） |
+| `quanti agent status` / `decisions` / `goal` | 命令行观察 Agent |
+| `quanti agent set-goal --target 0.25 --risk high` | 命令行改目标 |
+| `quanti mcp` | 起 MCP server 供 OpenClaw 接入 |
+| `quanti sync --stocks` / `quanti backtest ...` | 原有命令 |
+
 ## 项目状态
 
-- [x] 数据采集与存储
-- [x] 技术因子计算
-- [x] 策略框架与动态加载
-- [x] 事件驱动回测引擎
-- [x] A股费用与 T+1 规则
-- [x] 风控模块
-- [x] REST API
-- [x] Web 可视化仪表盘
-- [x] 股票池管理
-- [x] 选股器框架
-- [x] 后台任务进度追踪
-- [ ] 实盘模拟交易对接
-- [ ] PostgreSQL 支持
-- [ ] 策略参数优化
-- [ ] 实时行情推送
+- [x] 数据采集与存储 / 因子 / 策略 / 选股 / 回测 / 风控（已接入实盘+回测链路）
+- [x] Web 可视化（含 AI Agent 页）
+- [x] 持久化组合：positions / orders / trades / snapshots
+- [x] **AI Agent 自治循环 + 目标管理**
+- [x] **StrategySelector：按目标自动挑最佳策略**
+- [x] **PaperBroker 模拟盘 + A 股 T+1/佣金/印花税完整模拟**
+- [x] **MCP server（stdio）— OpenClaw / Claude Desktop 即插即用**
+- [x] 决策日志自动保留（默认 90 天）+ 手动清理 (`quanti agent prune`)
+- [x] 前端按路由懒加载（ECharts 进 Backtest 才下载，首屏 -72%）
+- [ ] 接入真实券商 API（QMT / Easytrader） — 见 `quanti/execution/`，预留扩展点
+- [ ] 实时分钟级行情
+- [ ] PostgreSQL 后端
 
 ## 许可证
 

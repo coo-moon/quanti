@@ -1,0 +1,978 @@
+# Quanti 使用文档
+
+> 面向 A 股的 AI 自治量化交易系统。设定目标，剩下交给 Agent。
+
+适用版本：Quanti 0.2.0。当前所有交易走 PaperBroker 模拟盘，未接真实券商（参见 [`TODO-live-trading.md`](TODO-live-trading.md)）。
+
+---
+
+## 目录
+
+1. [60 秒上手](#1-60-秒上手)
+2. [完整安装](#2-完整安装)
+3. [核心概念](#3-核心概念)
+4. [CLI 命令大全](#4-cli-命令大全)
+5. [Web UI 操作手册](#5-web-ui-操作手册)
+6. [AI Agent 工作流](#6-ai-agent-工作流)
+7. [OpenClaw / MCP 接入](#7-openclaw--mcp-接入)
+8. [REST API 参考](#8-rest-api-参考)
+9. [自定义策略与选股器](#9-自定义策略与选股器)
+10. [数据同步与管理](#10-数据同步与管理)
+11. [回测](#11-回测)
+12. [风控配置](#12-风控配置)
+13. [运维与排错](#13-运维与排错)
+14. [系统架构](#14-系统架构)
+
+---
+
+## 1. 60 秒上手
+
+```bash
+# 一次性配环境（Python 3.11+，Node 18+）
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+cd web && npm install && npm run build && cd ..
+
+# 设定目标 + 一键起飞
+quanti up --target 0.20 --max-drawdown -0.20 --risk medium
+```
+
+浏览器打开 **http://127.0.0.1:8000/agent**，你会看到：
+- 净值卡：当前组合价值与累计收益
+- 目标卡：你和目标年化的距离
+- Agent 状态卡：是否在跑
+- 目标设定区：可改的目标参数
+- 当前持仓表
+- 最近策略评估表（Agent 是怎么选策略的）
+- 决策日志
+
+首次运行库是空的，Agent 会自动在后台拉股票列表（约 5000 只，1~3 分钟），完成后下一个 tick 就开始正经干活。
+
+---
+
+## 2. 完整安装
+
+### 2.1 环境要求
+
+- Python **3.11+**
+- Node.js **18+**（仅构建前端时需要）
+- 操作系统：macOS / Linux（Windows 也行，但 AkShare 在 macOS/Linux 更稳）
+- 磁盘：5GB 可用（全 A 股 1 年 K 线 ≈ 2GB）
+
+### 2.2 安装步骤
+
+```bash
+# 克隆项目（如果是新机器）
+git clone <repo-url> quanti
+cd quanti
+
+# Python 后端
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e ".[dev]"
+
+# 前端构建（不构建的话只有 API 可用，没有 Web 页面）
+cd web
+npm install
+npm run build
+cd ..
+
+# 验证安装
+quanti --help
+pytest -q              # 应该 59 passed
+```
+
+### 2.3 目录结构
+
+```
+quanti/
+├── data/                     # SQLite 数据库（quanti.db）
+├── docs/                     # 文档
+├── strategies/               # 内置 + 你自定义的策略
+├── screeners/                # 内置 + 你自定义的选股器
+├── tests/                    # 单元测试
+├── web/                      # Vue 3 前端
+└── quanti/                   # Python 包
+    ├── agent/                # Agent 自治模块
+    ├── api/                  # FastAPI 路由
+    ├── backtest/             # 回测引擎
+    ├── data/                 # 数据层（SQLite + AkShare）
+    ├── execution/            # 模拟盘 / 实盘执行器
+    ├── factors/              # 技术因子
+    ├── risk/                 # 风控
+    ├── screener/             # 选股器框架
+    ├── strategy/             # 策略框架
+    ├── cli.py                # quanti 命令入口
+    └── mcp_server.py         # MCP server
+```
+
+---
+
+## 3. 核心概念
+
+| 概念 | 说明 |
+|------|------|
+| **Strategy（策略）** | 输入每根 K 线，输出 `Signal`（买 / 卖 / 持有）。内置 6 个，可加自定义 |
+| **Screener（选股器）** | 给一只股票打分，分数越高越值得关注。用于在大量候选里筛选 |
+| **Signal（信号）** | 策略产物：`stock_code + direction + strength + reason` |
+| **PaperBroker（模拟盘）** | 接收 Signal，模拟撮合，记账到本地 DB，遵守 A 股 T+1 / 佣金 / 印花税 |
+| **RiskManager（风控）** | 拦截违规信号（单股仓位、组合仓位、止损、ST 黑名单等） |
+| **Goal（目标）** | 你设定的目标（年化、最大回撤、风险偏好等），Agent 据此挑策略 |
+| **StrategySelector** | 给定 Goal，自动回测所有策略，按得分挑最佳的那个 |
+| **AgentRuntime** | 后台循环线程：同步数据→选股→评估策略→生成信号→风控→PaperBroker→记日志 |
+| **Decision Log（决策日志）** | Agent 每一次动作都写入 DB，可在 Web/CLI/MCP 回放 |
+| **Pool（股票池）** | 你定义的一组 codes，可作为 Agent 的交易宇宙 |
+
+数据流：
+
+```
+AkShare ──→ Database ──→ Provider ──→ Strategy ──→ Signal
+                                          │
+Pool ─→ Screener ─→ 候选 codes ───────────┘
+                                          │
+                                          ▼
+                              RiskManager ──→ PaperBroker ──→ DB（orders/trades/positions）
+                                                                 │
+                                                                 ▼
+                                                          Decision Log
+```
+
+---
+
+## 4. CLI 命令大全
+
+### 4.1 `quanti up` — 一键启动（最常用）
+
+```bash
+quanti up [--target 0.20] [--max-drawdown -0.20] [--risk low|medium|high]
+         [--pool POOL_NAME] [--screener SCR_NAME] [--strategy STRAT_NAME]
+         [--cash 1000000] [--host 127.0.0.1] [--port 8000] [--no-agent]
+```
+
+参数：
+
+| 参数 | 默认 | 说明 |
+|------|-----|------|
+| `--target` | 0.20 | 目标年化收益（0.20 = 20%） |
+| `--max-drawdown` | -0.20 | 可接受最大回撤（负数） |
+| `--risk` | medium | 风险偏好；影响 Selector 给夏普/回撤的权重 |
+| `--pool` | "" | 股票池名（空 = 用全部已同步股票） |
+| `--screener` | "" | 选股器名（空 = 不预筛） |
+| `--strategy` | "" | 指定策略名（空 = Agent 自动挑） |
+| `--cash` | 1000000 | 初始资金（仅首次创建组合时生效） |
+| `--no-agent` | False | 只起 Web，不自动启 Agent |
+
+例子：
+
+```bash
+# 默认（年化 20%、平衡风险、自动挑策略）
+quanti up
+
+# 激进：年化 30%，回撤可到 -25%，高风险偏好
+quanti up --target 0.30 --max-drawdown -0.25 --risk high
+
+# 用我自己的股票池，只跑 MA 均线交叉策略
+quanti up --pool my_watchlist --strategy ma_cross
+
+# 仅起 Web，不让 Agent 跑（手动模式）
+quanti up --no-agent
+```
+
+### 4.2 `quanti agent` — 不起 Web 操作 Agent
+
+```bash
+quanti agent tick                       # 立即跑一轮（同步执行，返回结果）
+quanti agent status                     # 查看 Agent 状态
+quanti agent goal                       # 查看当前目标
+quanti agent set-goal --target 0.25 --risk high   # 修改目标
+quanti agent decisions --limit 50       # 查看最近 50 条决策日志
+quanti agent prune --older-than-days 90 # 手动清理 90 天前的决策日志
+```
+
+### 4.3 `quanti mcp` — 启 MCP server
+
+```bash
+quanti mcp
+```
+
+这是 stdio JSON-RPC server，给 OpenClaw / Claude Desktop / Cursor 等 MCP 客户端用的。直接在终端跑会等你输入，正常用法是让 MCP 客户端拉起它。
+
+### 4.4 `quanti serve` — 只起 Web 不动 Agent
+
+```bash
+quanti serve --port 8000
+```
+
+`up` 的子集：不会自动同步股票列表、不会自动启 Agent。适合调试。
+
+### 4.5 `quanti sync` — 手动同步数据
+
+```bash
+quanti sync --stocks                   # 同步股票列表
+quanti sync --calendar                 # 同步交易日历
+quanti sync --quotes                   # 同步所有库内股票的 K 线
+quanti sync --quotes --codes 600519,000001   # 只同步指定的
+```
+
+### 4.6 `quanti backtest` — 命令行回测
+
+```bash
+quanti backtest \
+  --strategy ma_cross \
+  --codes 600519,000001 \
+  --start 2025-01-01 \
+  --end 2025-12-31 \
+  --cash 1000000
+```
+
+---
+
+## 5. Web UI 操作手册
+
+启动 `quanti up` 后访问 http://127.0.0.1:8000
+
+### 5.1 仪表盘（/）
+
+总览页：
+- 已同步股票数 / 股票池总数 / 最近更新时间
+- 添加股票（输入代码批量加入）
+- 一键下载 K 线 / 同步全 A 股池
+- 任务进度条 + ETA
+
+### 5.2 AI Agent（/agent）⭐ 核心页面
+
+**目标设定区**：
+- 目标年化收益：例如 0.20 = 20%
+- 可接受最大回撤：例如 -0.20，负数
+- 风险偏好：保守 / 平衡 / 激进
+- 股票池：选一个已建好的 pool，留空 = 用全部
+- 选股器：留空 = 不预筛
+- 策略：留空 = Agent 自动挑最佳
+
+**操作按钮**：
+- 保存目标
+- 立即跑一轮（强制触发一次完整 tick）
+- 启动 / 停止 Agent
+- 重置组合（清空持仓和交易记录）
+
+**当前持仓表**：代码 / 名称 / 数量 / 成本 / 现价 / 市值 / 盈亏（含手动卖出按钮）
+
+**手动下单区**：你可以越过 Agent 直接下单（OpenClaw 也走同一个接口）
+
+**最近策略评估表**：Agent 上一次是怎么挑策略的，每个策略的年化、最大回撤、夏普、成交数和综合得分都有
+
+**决策日志**：按颜色分类
+- 蓝色 = 成交（trade）
+- 黄色 = 风控拒绝（risk_reject）
+- 绿色 = 周期完成 / 策略挑选（cycle / strategy_pick）
+- 红色 = Agent 报错（agent_error）
+- 灰色 = 启停事件（agent_start / agent_stop）
+
+页面每 15 秒自动刷新。
+
+### 5.3 股票池（/pool）
+
+- 创建 / 删除 pool
+- 给 pool 加 / 删股票
+- 一键同步 pool 内股票的 K 线（带 ETA 进度条）
+
+### 5.4 选股中心（/screener）
+
+- 选一个选股器
+- 选数据来源（pool 或全部）
+- 设定参数（lookback 天数、top N）
+- 跑出来按得分排序的 top 列表
+
+### 5.5 回测中心（/backtest）
+
+- 选策略 + 股票代码 + 时间区间 + 初始资金
+- 一键回测，看绩效曲线 + 全部交易 + 指标（夏普、年化、最大回撤等）
+
+---
+
+## 6. AI Agent 工作流
+
+### 6.1 一个完整 tick 干了什么
+
+```
+1. load_goal()                        从 DB 取最新 Goal
+2. resolve_universe(goal)             解析交易宇宙
+   ├─ goal.universe_pool 有值 → pool 内 codes
+   └─ 否则                  → DB 内所有有 K 线的 codes
+3. ensure_recent_data(codes)          为缺最近 7 天数据的 codes 补 sync（一次最多 20 只）
+4. run_screener(goal, codes)          可选：用 screener 筛 top-20
+5. pick_strategy:
+   ├─ goal.strategy_name 有值 → 用它
+   └─ 否则 → StrategySelector.pick_best
+       └─ 对每个策略回测最近 365 天，按 Goal 算综合得分，选最高
+6. for each candidate code:
+      bars = provider.get_daily_bars(code, last 365d)
+      strategy.on_bar(bar) → 收集最近 3 天的 signals
+7. broker.check_stop_loss()           先做止损卖出，释放现金
+8. broker.execute_signals(signals)
+   ├─ RiskManager.check 一道
+   ├─ 通过 → 模拟撮合，写 orders / trades / positions
+   └─ 拒绝 → 写 risk_reject 日志
+9. broker.snapshot_portfolio()        快照写入 portfolio_snapshots
+10. log_decision("cycle", summary)    周期日志
+```
+
+### 6.2 tick 频率
+
+默认每 **4 小时**一次 tick。改的话编辑 `quanti/api/app.py` 里 `AgentRuntime(...)` 的构造参数 `tick_interval_sec`。
+
+启动时立即跑一次，之后按间隔。
+
+### 6.3 Goal 字段含义
+
+| 字段 | 含义 | 示例 |
+|------|------|------|
+| `target_annual_return` | 期望的 CAGR | 0.20（20%） |
+| `max_drawdown` | 可接受的回撤上限（负数） | -0.20 |
+| `risk_tolerance` | 影响 Selector 评分 | "low" / "medium" / "high" |
+| `universe_pool` | 交易宇宙的 pool 名 | "core_50"，空 = 全部 |
+| `screener_name` | 预筛器 | "ma_trend"，空 = 不筛 |
+| `strategy_name` | 钉死的策略 | "ma_cross"，空 = 自动挑 |
+| `params` | 传给 strategy.init() 的字典 | `{"short_period": 5}` |
+| `rebalance_freq` | 调仓节奏（目前仅 "daily"） | "daily" |
+| `enabled` | Agent 是否在跑 | true / false |
+
+### 6.4 StrategySelector 怎么打分
+
+```
+score = w_ret × (annual_return - target_annual_return)
+      + w_dd  × min(max_drawdown - goal.max_drawdown, 0)
+      + w_sharpe × sharpe_ratio
+      + activity_bonus
+```
+
+权重随风险偏好变：
+
+| risk_tolerance | w_ret | w_dd | w_sharpe |
+|----------------|-------|------|----------|
+| low            | 0.3   | 1.8  | 0.6      |
+| medium         | 0.8   | 1.0  | 0.5      |
+| high           | 1.2   | 0.6  | 0.4      |
+
+`activity_bonus` = +1（有成交）/ -1（零成交）—— 不交易的策略不会拿高分。
+
+### 6.5 怎么让 Agent 一直跑
+
+```bash
+# 方式 1：CLI 启动，前台跑（关终端就停）
+quanti up
+
+# 方式 2：后台跑
+nohup quanti up >/tmp/quanti.log 2>&1 &
+
+# 方式 3：systemd（Linux）
+# /etc/systemd/system/quanti.service
+[Unit]
+Description=Quanti AI Agent
+After=network.target
+[Service]
+WorkingDirectory=/opt/quanti
+ExecStart=/opt/quanti/.venv/bin/quanti up
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+
+# 方式 4：launchd（macOS）
+# ~/Library/LaunchAgents/com.quanti.agent.plist
+```
+
+---
+
+## 7. OpenClaw / MCP 接入
+
+### 7.1 配置 MCP 客户端
+
+OpenClaw / Claude Desktop / Cursor 的配置文件加：
+
+```json
+{
+  "mcpServers": {
+    "quanti": {
+      "command": "quanti",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+如果 `quanti` 不在 PATH，用绝对路径：
+
+```json
+{
+  "mcpServers": {
+    "quanti": {
+      "command": "/Users/you/source/quanti/.venv/bin/quanti",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+⚠️ MCP server 用的数据库是 `data/quanti.db`（相对于 MCP 启动时的工作目录）。配置 `cwd` 字段或者用绝对路径的数据库：
+
+```json
+{
+  "mcpServers": {
+    "quanti": {
+      "command": "/Users/you/source/quanti/.venv/bin/quanti",
+      "args": ["mcp"],
+      "cwd": "/Users/you/source/quanti"
+    }
+  }
+}
+```
+
+### 7.2 可调用的 MCP 工具（18 个）
+
+| 工具 | 干什么 |
+|------|--------|
+| `list_strategies` | 列出所有策略 |
+| `list_screeners` | 列出所有选股器 |
+| `list_pools` | 列出所有股票池 |
+| `get_goal` | 读当前目标 |
+| `set_goal` | 改目标（年化、回撤、风险、策略、选股、pool） |
+| `agent_start` | 启动 Agent |
+| `agent_stop` | 停止 Agent |
+| `agent_status` | 当前状态 + 上一次决策概要 |
+| `agent_tick` | 立即跑一轮 |
+| `get_portfolio` | 持仓和净值 |
+| `list_orders` | 最近订单 |
+| `list_trades` | 最近成交 |
+| `list_decisions` | 决策日志 |
+| `prune_decisions` | 清理 N 天前的决策日志 |
+| `place_order` | 手动下单 |
+| `run_backtest` | 试跑一次回测（不影响实盘） |
+| `run_screener` | 跑选股器 |
+| `sync_stocks` | 同步股票列表 |
+| `sync_quotes` | 同步指定股票的 K 线 |
+
+### 7.3 OpenClaw 典型对话
+
+> 用户："看一下当前组合，距离目标还差多少？"
+> OpenClaw：调 `get_portfolio` + `get_goal` → 报告净值、累计收益、目标差距
+
+> 用户："把目标改成年化 30%，激进点"
+> OpenClaw：调 `set_goal({"target_annual_return": 0.30, "risk_tolerance": "high"})`
+
+> 用户："让 Agent 立刻跑一轮看看"
+> OpenClaw：调 `agent_tick`，回报选了什么策略、出了多少单
+
+> 用户："帮我手动买点平安银行"
+> OpenClaw：调 `place_order({"code": "000001", "direction": "buy", "strength": 0.2})`
+
+> 用户："最近有没有什么风控拒绝？"
+> OpenClaw：调 `list_decisions({"kind": "risk_reject", "limit": 20})`
+
+---
+
+## 8. REST API 参考
+
+API 基地址：`http://127.0.0.1:8000/api`
+
+### 8.1 目标 / Agent
+
+| Method | Path | 说明 |
+|--------|------|------|
+| GET | `/goal` | 取当前目标 |
+| POST | `/goal` | 改目标（JSON body） |
+| POST | `/agent/start` | 启动 |
+| POST | `/agent/stop` | 停止 |
+| POST | `/agent/tick` | 强制跑一轮 |
+| GET | `/agent/status` | 状态 |
+| GET | `/agent/decisions?limit=50&kind=trade` | 决策日志 |
+| POST | `/agent/decisions/prune?older_than_days=90` | 手动清理 N 天前的决策日志 |
+
+### 8.2 组合 / 订单 / 成交
+
+| Method | Path | 说明 |
+|--------|------|------|
+| GET | `/portfolio` | 当前组合（现金、持仓、市值、盈亏） |
+| POST | `/portfolio/reset?initial_cash=1000000` | 重置（清持仓） |
+| GET | `/portfolio/snapshots?limit=365` | 历史净值快照 |
+| GET | `/orders?limit=200` | 订单列表 |
+| GET | `/trades?limit=200` | 成交列表 |
+| POST | `/orders/manual` | 手动下单 |
+
+`/orders/manual` body：
+```json
+{
+  "code": "600519",
+  "direction": "buy",       // 或 "sell"
+  "strength": 0.2,          // 0~1，作为现金占比
+  "reason": "manual via API"
+}
+```
+
+### 8.3 资源清单
+
+| Method | Path | 说明 |
+|--------|------|------|
+| GET | `/strategies` | 所有策略 |
+| GET | `/screeners` | 所有选股器 |
+| GET | `/pools` | 所有股票池 |
+| GET | `/stocks` | 所有股票 |
+| GET | `/stocks/stats` | 统计信息 |
+
+### 8.4 数据同步
+
+| Method | Path | 说明 |
+|--------|------|------|
+| POST | `/sync/stocks` | 同步股票列表 |
+| POST | `/sync/quotes` | 同步指定 codes（同步阻塞） |
+| POST | `/sync/quotes/async` | 同步指定 codes（异步带进度） |
+| GET | `/sync/quotes/status?job_id=xxx` | 查询进度 |
+
+### 8.5 回测 / 选股
+
+| Method | Path | 说明 |
+|--------|------|------|
+| POST | `/backtest/run` | 跑回测 |
+| POST | `/screen/run` | 跑选股 |
+
+### 8.6 curl 例子
+
+```bash
+# 改目标
+curl -X POST http://127.0.0.1:8000/api/goal \
+  -H 'Content-Type: application/json' \
+  -d '{"target_annual_return": 0.25, "risk_tolerance": "high"}'
+
+# 启动 Agent
+curl -X POST http://127.0.0.1:8000/api/agent/start
+
+# 立即跑一轮
+curl -X POST http://127.0.0.1:8000/api/agent/tick
+
+# 查组合
+curl http://127.0.0.1:8000/api/portfolio | jq
+
+# 手动下单
+curl -X POST http://127.0.0.1:8000/api/orders/manual \
+  -H 'Content-Type: application/json' \
+  -d '{"code": "600519", "direction": "buy", "strength": 0.1, "reason": "test"}'
+
+# 看最近 10 条决策
+curl 'http://127.0.0.1:8000/api/agent/decisions?limit=10' | jq
+```
+
+---
+
+## 9. 自定义策略与选股器
+
+### 9.1 写一个策略
+
+在 `strategies/` 下新建 `.py` 文件，继承 `BaseStrategy`：
+
+```python
+# strategies/my_breakout.py
+from quanti.strategy.base import BaseStrategy
+from quanti.models import BarData, Direction, Signal
+
+
+class MyBreakoutStrategy(BaseStrategy):
+    name = "my_breakout"
+
+    def init(self, config: dict) -> None:
+        self.window = config.get("window", 20)
+        self.threshold = config.get("threshold", 1.02)
+        self._highs: dict[str, list[float]] = {}
+        self._holding: set[str] = set()
+
+    def on_bar(self, bar: BarData) -> list[Signal]:
+        highs = self._highs.setdefault(bar.code, [])
+        highs.append(bar.high)
+        if len(highs) < self.window + 1:
+            return []
+        recent_max = max(highs[-self.window-1:-1])
+        if bar.code not in self._holding and bar.close > recent_max * self.threshold:
+            self._holding.add(bar.code)
+            return [Signal(stock_code=bar.code, direction=Direction.BUY,
+                           strength=0.6, reason=f"突破 {self.window} 日新高")]
+        if bar.code in self._holding and bar.close < recent_max * 0.95:
+            self._holding.discard(bar.code)
+            return [Signal(stock_code=bar.code, direction=Direction.SELL,
+                           strength=1.0, reason="跌破止损线")]
+        return []
+```
+
+保存后无需任何注册，Agent / Web / MCP / CLI 都能立刻看到 `my_breakout`。
+
+### 9.2 写一个选股器
+
+`screeners/` 下新建 `.py`，继承 `BaseScreener`：
+
+```python
+# screeners/volume_surge.py
+from quanti.models import BarData
+from quanti.screener.base import BaseScreener
+
+
+class VolumeSurgeScreener(BaseScreener):
+    name = "volume_surge"
+    description = "成交量异常放大且价格上涨"
+
+    def init(self, config: dict) -> None:
+        self.lookback = config.get("lookback", 20)
+        self.vol_multi = config.get("vol_multi", 2.0)
+
+    def screen(self, code: str, bars: list[BarData]) -> float:
+        if len(bars) < self.lookback + 1:
+            return 0.0
+        latest = bars[-1]
+        baseline = bars[-self.lookback-1:-1]
+        avg_vol = sum(b.volume for b in baseline) / len(baseline)
+        if latest.volume < avg_vol * self.vol_multi:
+            return 0.0
+        if latest.close <= baseline[-1].close:
+            return 0.0
+        return round((latest.volume / avg_vol) * (latest.close / baseline[-1].close - 1), 4)
+```
+
+### 9.3 让 Agent 用上
+
+```bash
+# CLI
+quanti agent set-goal --strategy my_breakout
+
+# 或 Web → AI Agent 页 → 策略下拉框 → 选 my_breakout
+
+# 或 MCP
+# set_goal({"strategy_name": "my_breakout", "params": {"window": 30}})
+```
+
+---
+
+## 10. 数据同步与管理
+
+### 10.1 首次部署
+
+```bash
+# 1) 同步股票列表（5000 只，~30 秒）
+quanti sync --stocks
+
+# 2) 同步交易日历
+quanti sync --calendar
+
+# 3) 同步 K 线（重活，全 A 股 1 年 ~10 分钟）
+quanti sync --quotes
+```
+
+或者直接 `quanti up`：首次启动会自动后台同步股票列表。K 线随用随同步（screener / agent 都会自动 sync 缺数据的）。
+
+### 10.2 增量同步
+
+`sync_daily_quotes` 默认从 DB 里该股票的最新一天往后拉。所以每天跑一次 `quanti sync --quotes` 就是增量更新。
+
+```bash
+# 每日定时增量（cron）
+0 18 * * 1-5 cd /opt/quanti && .venv/bin/quanti sync --quotes
+```
+
+### 10.3 数据源
+
+主源 **AkShare** → 东方财富，备源 **新浪财经**。两边都拉不到才报错。`AkShareAdapter` 内置：
+
+- 自动重试 3 次（指数退避）
+- 跨源补缺口（detect_gaps + 用另一个源回填）
+- 数据完整性校验（OHLC 合法、零价检查、重复日期）
+- 行数合理性检查（实际行数 vs 期望行数）
+
+### 10.4 数据库
+
+SQLite，路径 `data/quanti.db`，WAL 模式，单文件。
+
+主要表：
+- `stocks` / `daily_quotes` / `trade_calendar`
+- `stock_pools` / `pool_stocks`
+- `sync_jobs`（同步进度）
+- `portfolio_state` / `positions` / `orders` / `trades` / `portfolio_snapshots`
+- `agent_goal` / `agent_decisions`
+
+备份：
+
+```bash
+cp data/quanti.db data/quanti.db.bak.$(date +%Y%m%d)
+```
+
+### 10.5 决策日志保留
+
+Agent 每次 tick 末尾自动调用 `prune_decisions(older_than_days)`，默认保留 90 天 (~3 个月)。配置项在 `AgentRuntime` 构造参数 `decision_retention_days`。
+
+手动清理：
+
+```bash
+quanti agent prune --older-than-days 30   # 改成保留 30 天
+# 或 API
+curl -X POST 'http://127.0.0.1:8000/api/agent/decisions/prune?older_than_days=30'
+# 或 MCP: prune_decisions({"older_than_days": 30})
+```
+
+切换到 PostgreSQL：暂未支持，路线图里有。
+
+---
+
+## 11. 回测
+
+### 11.1 命令行
+
+```bash
+quanti backtest \
+  --strategy ma_cross \
+  --codes 600519,000001,000858 \
+  --start 2025-01-01 \
+  --end 2025-12-31 \
+  --cash 1000000
+```
+
+输出包含：
+- 总收益 / 年化 / 年化波动 / 最大回撤
+- 夏普 / 索提诺 / Calmar
+- 胜率 / 总交易次数
+
+### 11.2 Web
+
+`/backtest` 页面提供同样能力 + 净值曲线 + 交易明细表。
+
+### 11.3 API
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/backtest/run \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "strategy_name": "ma_cross",
+    "codes": ["600519", "000001"],
+    "start": "2025-01-01",
+    "end": "2025-12-31",
+    "initial_cash": 1000000,
+    "params": {"short_period": 5, "long_period": 20}
+  }'
+```
+
+### 11.4 与实盘的一致性
+
+回测引擎 (`BacktestEngine`) 和模拟盘 (`PaperBroker`) 共用同一个 `RiskManager`、同一个 `AShareCommission` 模型、同一套 T+1 规则。**回测出来什么样，模拟盘就大概率什么样**。
+
+---
+
+## 12. 风控配置
+
+默认 `RiskConfig`（在 `quanti/risk/manager.py`）：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `max_position_pct` | 0.10 | 单股不超过组合的 10% |
+| `max_industry_pct` | 0.30 | 单行业不超过 30% |
+| `max_total_position_pct` | 0.80 | 总仓位不超过 80%（留 20% 现金缓冲） |
+| `stop_loss_pct` | -0.08 | 单股止损 -8% |
+| `portfolio_stop_loss_pct` | -0.15 | 组合止损 -15% |
+| `max_daily_trades` | 20 | 每日最多 20 笔 |
+| `blocked_prefixes` | ("ST", "*ST") | 黑名单前缀 |
+
+### 12.1 改风控
+
+目前 PaperBroker 用默认配置。要改，编辑 `quanti/api/app.py`：
+
+```python
+from quanti.risk.manager import RiskConfig
+app.state.broker = PaperBroker(
+    db=db, provider=app.state.provider,
+    initial_cash=initial_cash,
+    risk_config=RiskConfig(
+        max_position_pct=0.05,        # 改成 5%
+        stop_loss_pct=-0.10,          # 改成 -10%
+    ),
+)
+```
+
+或者新加一个 `--risk-config` 参数走 yaml 配置（小改造）。
+
+---
+
+## 13. 运维与排错
+
+### 13.1 服务起不来
+
+```bash
+# 端口被占
+lsof -i :8000          # 看谁占
+quanti up --port 8001  # 换端口
+
+# Python 依赖
+.venv/bin/pip install -e ".[dev]" --upgrade
+
+# 前端没编
+cd web && npm run build
+```
+
+### 13.2 Agent 不动
+
+检查：
+
+```bash
+# 状态
+quanti agent status
+
+# 看日志（如果 nohup 启动）
+tail -f /tmp/quanti.log
+
+# 强制跑一轮看错在哪
+quanti agent tick
+```
+
+常见原因：
+- 数据库为空 → `quanti sync --stocks` 先
+- universe_pool 设了但 pool 里没股票 → 改回空 pool 或加股票
+- AkShare 接口被限流 → 等几分钟重试
+
+### 13.3 数据没更新
+
+```bash
+# 看最近一只股票的最新日期
+sqlite3 data/quanti.db 'SELECT code, MAX(date) FROM daily_quotes GROUP BY code LIMIT 5;'
+
+# 手动补
+quanti sync --quotes --codes 600519
+```
+
+### 13.4 想清空所有交易记录重新来
+
+Web → AI Agent → 重置组合按钮。
+
+或 API：
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/portfolio/reset?initial_cash=1000000'
+```
+
+或直接删整个数据库：
+
+```bash
+rm data/quanti.db*
+quanti up  # 会重新初始化
+```
+
+### 13.5 测试
+
+```bash
+.venv/bin/python -m pytest tests -v
+```
+
+应该 59 passed。
+
+### 13.6 日志
+
+- Uvicorn 标准输出：HTTP 请求日志
+- Agent 决策日志：写到 DB 表 `agent_decisions`，永久保存
+- AkShare 同步：标准输出 + DB 表 `sync_jobs`
+
+查决策日志：
+
+```bash
+quanti agent decisions --limit 100
+# 或
+sqlite3 data/quanti.db 'SELECT ts, kind, summary FROM agent_decisions ORDER BY id DESC LIMIT 20;'
+```
+
+---
+
+## 14. 系统架构
+
+### 14.1 模块依赖
+
+```
+       ┌──────────────────────────────────────────────────┐
+       │                     CLI / MCP                     │
+       └──────┬──────────────────────────┬─────────────────┘
+              │                          │
+              ▼                          ▼
+       ┌─────────────┐           ┌──────────────────┐
+       │  FastAPI    │           │  MCP stdio       │
+       │  (api/app)  │           │  (mcp_server)    │
+       └──────┬──────┘           └────────┬─────────┘
+              │                           │
+              ▼                           ▼
+       ┌──────────────────────────────────────────┐
+       │              AgentRuntime                 │
+       │  (daily loop: tick → cycle)               │
+       └──┬─────────────┬──────────────┬──────────┘
+          │             │              │
+          ▼             ▼              ▼
+   ┌────────────┐  ┌──────────┐  ┌──────────────┐
+   │  Strategy   │  │ Screener │  │  PaperBroker │
+   │  Selector   │  │  Loader  │  │  (or QmtBroker future)
+   └─────┬──────┘  └────┬─────┘  └──────┬───────┘
+         │              │                │
+         ▼              ▼                ▼
+   ┌────────────┐  ┌──────────┐  ┌──────────────┐
+   │ Backtest   │  │ Strategy │  │ RiskManager  │
+   │ Engine     │  │  Loader  │  └──────┬───────┘
+   └─────┬──────┘  └────┬─────┘         │
+         │              │                │
+         ▼              ▼                ▼
+   ┌──────────────────────────────────────────┐
+   │             DataProvider                  │
+   └──────────────────┬───────────────────────┘
+                      ▼
+                  ┌──────────┐
+                  │ Database │ (SQLite)
+                  │  WAL     │
+                  └────┬─────┘
+                       ▲
+                       │
+                ┌──────┴───────┐
+                │ AkShare      │
+                │ Adapter      │ (东财 / 新浪)
+                └──────────────┘
+```
+
+### 14.2 关键设计选择
+
+| 决策 | 取舍 |
+|------|------|
+| SQLite 单文件 | 部署简单；不适合超大规模数据，分布式时考虑 PostgreSQL |
+| 文件夹 + 动态加载 = 策略/选股器 | 写完就生效，零配置；但启动稍慢 |
+| 风控同时在回测和实盘 | 行为一致；缺点是回测速度有 5~10% 折损 |
+| Agent 用 threading 而非 asyncio | 因为策略代码可能阻塞，线程隔离更稳 |
+| MCP 走 stdio 而非 HTTP | 标准 MCP 协议，OpenClaw / Claude Desktop 都用这个；安全模型简单 |
+| DB 是事实记录，broker 持仓也写 DB | 万一进程崩溃，下次启动可恢复 |
+
+---
+
+## 附录
+
+### A. 内置策略
+
+| 名称 | 说明 |
+|------|------|
+| `ma_cross` | 短期 MA 上穿长期 MA 买入 |
+| `macd_cross` | MACD 金叉买入 / 死叉卖出 |
+| `rsi_ob_os` | RSI 超卖买入 / 超买卖出 |
+| `bollinger_band` | 布林带突破策略 |
+| `ma_volume` | 均线 + 成交量双确认 |
+| `turtle_breakout` | 海龟交易法则突破 |
+
+### B. 内置选股器
+
+| 名称 | 说明 |
+|------|------|
+| `ma_trend` | 多头排列（短>中>长 MA） |
+| `new_high` | 创 N 日新高 |
+| `rsi_oversold` | RSI 超卖 |
+| `volume_breakout` | 量价齐升 |
+
+### C. 相关文档
+
+- [`README.md`](../README.md) — 项目总览
+- [`TODO-live-trading.md`](TODO-live-trading.md) — 接真实券商的 TODO 清单
+- `docs/plans/` — 历史实现计划
+
+### D. 反馈渠道
+
+- Issue：项目仓库 issues
+- PR：欢迎补充策略 / 选股器 / 文档

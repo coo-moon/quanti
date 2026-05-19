@@ -11,6 +11,7 @@ from quanti.backtest.commission import AShareCommission
 from quanti.backtest.metrics import compute_metrics
 from quanti.data.provider import DataProvider
 from quanti.models import BarData, Direction, Order, OrderStatus, Portfolio, Position, Signal
+from quanti.risk.manager import RiskManager
 from quanti.strategy.base import BaseStrategy
 
 
@@ -48,11 +49,13 @@ class BacktestEngine:
         initial_cash: float = 1_000_000.0,
         commission: AShareCommission | None = None,
         slippage: float = 0.001,  # 0.1%
+        risk_manager: RiskManager | None = None,
     ):
         self._provider = provider
         self._initial_cash = initial_cash
         self._commission = commission or AShareCommission()
         self._slippage = slippage
+        self._risk = risk_manager
 
     def run(
         self,
@@ -96,6 +99,16 @@ class BacktestEngine:
                 if code in portfolio.positions:
                     portfolio.positions[code].current_price = bar.close
 
+            # Risk-driven sells first (stop-loss) so cash frees up before buys
+            if self._risk is not None:
+                self._risk.reset_daily()
+                for sl in self._risk.check_stop_loss(portfolio):
+                    sl_bar = today_bars.get(sl.stock_code)
+                    if sl_bar is None:
+                        continue
+                    self._process_signal(sl, sl_bar, portfolio, trades,
+                                         current_date, bought_today, "risk_stop_loss")
+
             # Generate signals from strategy
             for code, bar in today_bars.items():
                 signals = strategy.on_bar(bar)
@@ -104,11 +117,18 @@ class BacktestEngine:
                     signal_bar = today_bars.get(signal.stock_code, bar)
                     if signal_bar.code != signal.stock_code:
                         continue  # Skip if we don't have price data for the target stock
+                    if self._risk is not None:
+                        ok, _ = self._risk.check(signal, portfolio)
+                        if not ok:
+                            skipped_signals += 1
+                            continue
                     executed = self._process_signal(
                         signal, signal_bar, portfolio, trades, current_date, bought_today, strategy.name
                     )
                     if not executed:
                         skipped_signals += 1
+                    elif self._risk is not None:
+                        self._risk.record_trade()
 
             # Record equity
             equity_values[current_date] = portfolio.total_value

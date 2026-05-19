@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -9,8 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from quanti.agent.runtime import AgentRuntime
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
+from quanti.execution.paper_broker import PaperBroker
 
 # Resolve web/dist relative to project root
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -22,8 +25,35 @@ def create_app(
     provider: DataProvider | None = None,
     strategies_dir: str | None = "strategies",
     screeners_dir: str | None = "screeners",
+    initial_cash: float = 1_000_000.0,
+    autostart_agent: bool = False,
 ) -> FastAPI:
-    app = FastAPI(title="Quanti", version="0.1.0")
+    if db is None:
+        db = Database()
+        db.initialize()
+    provider = provider or DataProvider(db)
+    broker = PaperBroker(db=db, provider=provider, initial_cash=initial_cash)
+    agent = AgentRuntime(
+        db=db, provider=provider, broker=broker,
+        strategies_dir=strategies_dir or "strategies",
+        screeners_dir=screeners_dir or "screeners")
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        from quanti.agent.goal import load_goal
+        try:
+            goal = load_goal(db)
+            if autostart_agent or goal.enabled:
+                agent.start()
+        except Exception:
+            pass
+        yield
+        try:
+            agent.stop()
+        except Exception:
+            pass
+
+    app = FastAPI(title="Quanti", version="0.2.0", lifespan=_lifespan)
 
     app.add_middleware(
         CORSMiddleware,
@@ -32,20 +62,17 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # Store dependencies on app state
-    if db is None:
-        db = Database()
-        db.initialize()
     app.state.db = db
-    app.state.provider = provider or DataProvider(db)
+    app.state.provider = provider
     app.state.strategies_dir = strategies_dir
     app.state.screeners_dir = screeners_dir
+    app.state.broker = broker
+    app.state.agent = agent
 
     from quanti.api.routes import router
 
     app.include_router(router, prefix="/api")
 
-    # Serve Vue frontend static files
     if _DIST_DIR.is_dir():
         app.mount("/assets", StaticFiles(directory=_DIST_DIR / "assets"), name="assets")
 

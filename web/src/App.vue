@@ -16,6 +16,13 @@
             </svg>
             仪表盘
           </router-link>
+          <router-link to="/agent" class="nav-link">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="6" r="3" stroke="currentColor" stroke-width="1.5" />
+              <path d="M2 14c0-3 2.5-5 6-5s6 2 6 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+            </svg>
+            AI Agent
+          </router-link>
           <router-link to="/screener" class="nav-link">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.5" />
