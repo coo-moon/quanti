@@ -324,6 +324,14 @@ quanti backtest \
 
 启动时立即跑一次，之后按间隔。
 
+### 6.2.1 Selector 缓存（自动挑策略时的优化）
+
+如果没钉死策略（`goal.strategy_name` 为空），Agent 默认每 **24 小时**才重新跑一次 Selector（6 策略全量回测）。中间的 tick 复用上次的选择，单次 tick 从 ~640ms 降到 ~40ms（约 **16× 提速**）。
+
+调整：构造 `AgentRuntime` 时传 `selector_reselect_interval_sec`。设成 0 表示每次 tick 都重选。
+
+钉死策略（`goal.strategy_name = "ma_cross"` 等）时 Selector 完全跳过，无缓存开销。
+
 ### 6.3 Goal 字段含义
 
 | 字段 | 含义 | 示例 |

@@ -137,6 +137,43 @@ class TestAgentRuntime:
                     if o["status"] == "rejected" and o["reason"] == "no position"]
         assert rejected == [], f"unexpected 'no position' rejections: {rejected}"
 
+    def test_selector_cache_skips_repick(self, seeded):
+        """When strategy is auto-picked, the Selector should only re-evaluate
+        once per `selector_reselect_interval_sec`. Subsequent ticks within
+        the window reuse the cached choice, avoiding a 6-strategy backtest."""
+        provider = DataProvider(seeded)
+        broker = PaperBroker(seeded, provider, initial_cash=200_000)
+        # Force re-pick interval to be very long so the cache stays valid.
+        agent = AgentRuntime(seeded, provider, broker,
+                             strategies_dir="strategies",
+                             screeners_dir="strategies",
+                             selector_reselect_interval_sec=60 * 60 * 24)
+        # No pinned strategy → auto-select path
+        save_goal(seeded, Goal(target_annual_return=0.15))
+        # Tick 1 should trigger a strategy_pick
+        agent.tick()
+        picks_after_1 = seeded.list_decisions(limit=100, kind="strategy_pick")
+        # Tick 2 should reuse cached pick — no new strategy_pick decision
+        agent.tick()
+        picks_after_2 = seeded.list_decisions(limit=100, kind="strategy_pick")
+        assert len(picks_after_2) == len(picks_after_1), \
+            f"expected cache hit, but got new strategy_pick (1: {len(picks_after_1)}, 2: {len(picks_after_2)})"
+
+    def test_selector_cache_expires(self, seeded):
+        """Force a 0-second reselect interval → every tick must re-pick."""
+        provider = DataProvider(seeded)
+        broker = PaperBroker(seeded, provider, initial_cash=200_000)
+        agent = AgentRuntime(seeded, provider, broker,
+                             strategies_dir="strategies",
+                             screeners_dir="strategies",
+                             selector_reselect_interval_sec=0)
+        save_goal(seeded, Goal(target_annual_return=0.15))
+        agent.tick()
+        n1 = len(seeded.list_decisions(limit=100, kind="strategy_pick"))
+        agent.tick()
+        n2 = len(seeded.list_decisions(limit=100, kind="strategy_pick"))
+        assert n2 > n1, f"expected cache miss, but stale cache used (1: {n1}, 2: {n2})"
+
     def test_shutdown_does_not_disable_goal(self, seeded):
         """Process-shutdown must NOT flip goal.enabled to False — otherwise the
         agent would never auto-resume on the next server start (defeats the

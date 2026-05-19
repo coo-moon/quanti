@@ -64,6 +64,7 @@ class AgentRuntime:
         screeners_dir: str | Path = "screeners",
         tick_interval_sec: int = 60 * 60 * 4,  # 4h between cycles by default
         decision_retention_days: int = 90,
+        selector_reselect_interval_sec: int = 60 * 60 * 24,  # 24h
     ) -> None:
         self._db = db
         self._provider = provider
@@ -72,6 +73,12 @@ class AgentRuntime:
         self._screeners_dir = str(screeners_dir)
         self._tick_interval = tick_interval_sec
         self._decision_retention_days = decision_retention_days
+        self._reselect_interval = selector_reselect_interval_sec
+        # Selector cache: (timestamp, strategy_name, evaluations). The
+        # Selector runs at most once per `_reselect_interval`. In between we
+        # reuse the cached pick — saves running a 6-strategy backtest sweep
+        # on every 4h tick (~9× faster ticks once cache is warm).
+        self._selector_cache: tuple[float, str, list[dict]] | None = None
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
         self._status = AgentStatus()
@@ -254,20 +261,44 @@ class AgentRuntime:
                 f"使用钉选策略：{strategy.name}",
                 details={"strategy": strategy.name, "params": goal.params or {}})
         else:
-            selector = StrategySelector(
-                self._db, self._provider, self._strategies_dir)
-            strategy, ranking = selector.pick_best(goal, candidates)
-            evaluations = [e.as_dict() for e in ranking]
-            if strategy is None:
-                summary = "未能选出策略"
-                self._db.log_decision("cycle_skip", summary,
-                                      details={"evaluations": evaluations})
-                return {"ok": False, "reason": summary}
-            strategy.init(goal.params or {})
-            self._db.log_decision(
-                "strategy_pick",
-                f"选定策略：{strategy.name}",
-                details={"evaluations": evaluations, "goal": goal.to_db()})
+            # Re-pick at most once per _reselect_interval. In between, the
+            # cached winner is re-loaded as a fresh instance so its internal
+            # state starts clean.
+            now_ts = time.time()
+            cached = self._selector_cache
+            needs_pick = (cached is None
+                          or now_ts - cached[0] >= self._reselect_interval)
+            if needs_pick:
+                selector = StrategySelector(
+                    self._db, self._provider, self._strategies_dir)
+                strategy, ranking = selector.pick_best(goal, candidates)
+                evaluations = [e.as_dict() for e in ranking]
+                if strategy is None:
+                    summary = "未能选出策略"
+                    self._db.log_decision("cycle_skip", summary,
+                                          details={"evaluations": evaluations})
+                    return {"ok": False, "reason": summary}
+                self._selector_cache = (now_ts, strategy.name, evaluations)
+                strategy.init(goal.params or {})
+                self._db.log_decision(
+                    "strategy_pick",
+                    f"选定策略：{strategy.name}",
+                    details={"evaluations": evaluations, "goal": goal.to_db()})
+            else:
+                # Use the cached winner. Load a fresh instance so per-tick
+                # state (e.g. price buffers in MA strategies) isn't carried
+                # across.
+                cached_name = cached[1]
+                evaluations = cached[2]
+                loader = StrategyLoader()
+                strategies = loader.load_directory(self._strategies_dir)
+                strategy = next((s for s in strategies if s.name == cached_name),
+                                None)
+                if strategy is None:
+                    # Strategy file got removed — invalidate cache and recurse.
+                    self._selector_cache = None
+                    return self._run_one_cycle()
+                strategy.init(goal.params or {})
 
         # Generate signals — feed each candidate's full history; the strategy
         # decides if it has enough state to act today.

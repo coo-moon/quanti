@@ -250,17 +250,30 @@ def _handle_tool_call(ctx: QuantiContext, name: str, args: dict[str, Any]) -> An
         current = load_goal(ctx.db)
         merged = current.to_db()
         merged.update({k: v for k, v in args.items() if v is not None})
-        if "risk_tolerance" in merged:
-            merged["risk_tolerance"] = RiskTolerance(merged["risk_tolerance"]).value
+        # Coerce + validate the numeric / enum fields before we write back —
+        # the DB has no schema-level type guard so junk would silently rot
+        # until the next agent tick failed at runtime.
+        try:
+            target = float(merged["target_annual_return"])
+            dd = float(merged["max_drawdown"])
+        except (TypeError, ValueError) as e:
+            return {"error": f"target_annual_return/max_drawdown must be numbers: {e}"}
+        try:
+            risk = RiskTolerance(merged["risk_tolerance"])
+        except ValueError as e:
+            return {"error": f"invalid risk_tolerance: {e}"}
+        params = merged.get("params", {})
+        if not isinstance(params, dict):
+            return {"error": f"params must be an object, got {type(params).__name__}"}
         save_goal(ctx.db, Goal(
-            target_annual_return=merged["target_annual_return"],
-            max_drawdown=merged["max_drawdown"],
-            risk_tolerance=RiskTolerance(merged["risk_tolerance"]),
-            universe_pool=merged.get("universe_pool", ""),
-            screener_name=merged.get("screener_name", ""),
-            strategy_name=merged.get("strategy_name", ""),
-            params=merged.get("params", {}),
-            rebalance_freq=merged.get("rebalance_freq", "daily"),
+            target_annual_return=target,
+            max_drawdown=dd,
+            risk_tolerance=risk,
+            universe_pool=str(merged.get("universe_pool", "") or ""),
+            screener_name=str(merged.get("screener_name", "") or ""),
+            strategy_name=str(merged.get("strategy_name", "") or ""),
+            params=params,
+            rebalance_freq=str(merged.get("rebalance_freq", "daily") or "daily"),
             enabled=bool(merged.get("enabled", False)),
         ))
         return {"ok": True, "goal": load_goal(ctx.db).to_db()}
