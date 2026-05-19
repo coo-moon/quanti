@@ -94,14 +94,33 @@ class AgentRuntime:
         self._db.log_decision("agent_start", "Agent started")
 
     def stop(self) -> None:
+        """User-initiated stop: halt the loop AND persist disabled state so the
+        agent does not auto-resume across server restarts."""
+        was_running = self._thread is not None and self._thread.is_alive()
         self._stop_flag.set()
         goal = load_goal(self._db)
-        goal.enabled = False
-        save_goal(self._db, goal)
+        if goal.enabled:
+            goal.enabled = False
+            save_goal(self._db, goal)
         with self._lock:
             self._status.enabled = False
             self._status.running = False
-        self._db.log_decision("agent_stop", "Agent stopped")
+        if was_running:
+            self._db.log_decision("agent_stop", "Agent stopped")
+
+    def shutdown(self) -> None:
+        """Process-shutdown: halt the loop but DO NOT touch goal.enabled — so
+        the agent will auto-resume on the next server start. No decision log.
+        """
+        if self._thread is None or not self._thread.is_alive():
+            return
+        self._stop_flag.set()
+        with self._lock:
+            self._status.running = False
+        try:
+            self._thread.join(timeout=2)
+        except Exception:
+            pass
 
     def status(self) -> AgentStatus:
         with self._lock:

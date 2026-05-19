@@ -112,8 +112,28 @@ class AkShareAdapter:
         self._db.upsert_stock(code, name, exchange, list_date, industry)
 
     def sync_stock_list(self) -> int:
-        """Fetch and save A-share stock list (code + name only). Returns count."""
-        df = ak.stock_info_a_code_name()
+        """Fetch and save A-share stock list (code + name only). Returns count.
+
+        Retries on network failure — AkShare upstream occasionally resets
+        connections and a one-shot failure shouldn't bring down the bootstrap.
+        """
+        df = None
+        last_err: Exception | None = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                df = ak.stock_info_a_code_name()
+                if df is not None and not df.empty:
+                    break
+            except Exception as e:
+                last_err = e
+                logger.warning(f"sync_stock_list attempt {attempt}/{MAX_RETRIES}: {e}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * attempt)
+        if df is None or df.empty:
+            if last_err is not None:
+                raise last_err
+            return 0
+
         count = 0
         for _, row in df.iterrows():
             code = str(row["code"])

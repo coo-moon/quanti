@@ -48,8 +48,11 @@ def create_app(
         except Exception:
             pass
         yield
+        # Process shutdown — halt the thread but do NOT flip the goal back
+        # to disabled, otherwise the agent would never auto-resume across
+        # server restarts. User-driven stop goes through agent.stop().
         try:
-            agent.stop()
+            agent.shutdown()
         except Exception:
             pass
 

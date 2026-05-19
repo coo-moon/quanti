@@ -137,6 +137,46 @@ class TestAgentRuntime:
                     if o["status"] == "rejected" and o["reason"] == "no position"]
         assert rejected == [], f"unexpected 'no position' rejections: {rejected}"
 
+    def test_shutdown_does_not_disable_goal(self, seeded):
+        """Process-shutdown must NOT flip goal.enabled to False — otherwise the
+        agent would never auto-resume on the next server start (defeats the
+        whole point of 'set goal and walk away')."""
+        provider = DataProvider(seeded)
+        broker = PaperBroker(seeded, provider, initial_cash=200_000)
+        agent = AgentRuntime(seeded, provider, broker,
+                             strategies_dir="/tmp/qe2e/strategies",
+                             screeners_dir="strategies")
+        save_goal(seeded, Goal(strategy_name="e2e_force_buy",
+                               target_annual_return=0.15, enabled=True))
+        agent.start()
+        # User intent: keep it running across restarts.
+        assert load_goal(seeded).enabled is True
+        agent.shutdown()  # simulate SIGTERM
+        # Critical invariant: goal.enabled survived shutdown.
+        assert load_goal(seeded).enabled is True
+
+    def test_stop_disables_goal_and_logs(self, seeded):
+        """User-initiated stop must disable the goal (so we don't auto-resume)
+        AND only log a decision if the agent was actually running."""
+        provider = DataProvider(seeded)
+        broker = PaperBroker(seeded, provider, initial_cash=200_000)
+        agent = AgentRuntime(seeded, provider, broker,
+                             strategies_dir="/tmp/qe2e/strategies",
+                             screeners_dir="strategies")
+        save_goal(seeded, Goal(strategy_name="e2e_force_buy",
+                               target_annual_return=0.15, enabled=True))
+        # Stop without ever starting: should be a quiet no-op (no decision row)
+        prior = len(seeded.list_decisions(limit=100, kind="agent_stop"))
+        agent.stop()
+        assert len(seeded.list_decisions(limit=100, kind="agent_stop")) == prior
+        # Now start, then stop: should log exactly one agent_stop
+        agent.start()
+        agent.stop()
+        stops = seeded.list_decisions(limit=100, kind="agent_stop")
+        assert len(stops) == prior + 1
+        # Goal should now be disabled.
+        assert load_goal(seeded).enabled is False
+
     def test_prune_decisions(self, tmp_path):
         """prune_decisions should drop rows older than the retention window."""
         db = Database(str(tmp_path / "prune.db")); db.initialize()

@@ -417,7 +417,13 @@ async def list_stocks(request: Request):
 @router.get("/stocks/{code}/quotes")
 async def get_quotes(code: str, start: str, end: str, request: Request):
     provider = request.app.state.provider
-    df = provider.get_daily_df(code, date.fromisoformat(start), date.fromisoformat(end))
+    try:
+        start_d = date.fromisoformat(start)
+        end_d = date.fromisoformat(end)
+    except ValueError as e:
+        raise HTTPException(status_code=422,
+                            detail=f"invalid date (use YYYY-MM-DD): {e}")
+    df = provider.get_daily_df(code, start_d, end_d)
     records = []
     for _, row in df.iterrows():
         d = row["date"]
@@ -726,8 +732,12 @@ async def run_backtest(body: BacktestRequest, request: Request):
     provider = request.app.state.provider
 
     # Auto-sync: if any stock has no data, fetch it automatically
-    start_d = date.fromisoformat(body.start)
-    end_d = date.fromisoformat(body.end)
+    try:
+        start_d = date.fromisoformat(body.start)
+        end_d = date.fromisoformat(body.end)
+    except ValueError as e:
+        raise HTTPException(status_code=422,
+                            detail=f"invalid date (use YYYY-MM-DD): {e}")
     for code in body.codes:
         bars = provider.get_daily_bars(code, start_d, end_d)
         if len(bars) == 0:
@@ -738,37 +748,17 @@ async def run_backtest(body: BacktestRequest, request: Request):
             except Exception as e:
                 logger.warning(f"Auto-sync failed for {code}: {e}")
 
-    # Find strategy by name
+    # Find strategy by name via the dynamic loader. The user can plug a
+    # strategy at any path via app.state.strategies_dir, so we no longer
+    # hard-import any built-in modules here.
     strategy = None
     strategies_dir = request.app.state.strategies_dir
     if strategies_dir:
         loader = StrategyLoader()
-        strategies = loader.load_directory(strategies_dir)
-        for s in strategies:
+        for s in loader.load_directory(strategies_dir):
             if s.name == body.strategy_name:
                 strategy = s
                 break
-
-    if strategy is None:
-        # Fallback: import built-in strategies
-        from strategies.bollinger_band import BollingerBandStrategy
-        from strategies.ma_cross import MACrossStrategy
-        from strategies.ma_volume import MAVolumeStrategy
-        from strategies.macd_cross import MACDCrossStrategy
-        from strategies.rsi_ob_os import RSIOverboughtOversoldStrategy
-        from strategies.turtle_breakout import TurtleBreakoutStrategy
-
-        builtin = {
-            "ma_cross": MACrossStrategy,
-            "macd_cross": MACDCrossStrategy,
-            "rsi_ob_os": RSIOverboughtOversoldStrategy,
-            "bollinger_band": BollingerBandStrategy,
-            "ma_volume": MAVolumeStrategy,
-            "turtle_breakout": TurtleBreakoutStrategy,
-        }
-        cls = builtin.get(body.strategy_name)
-        if cls:
-            strategy = cls()
 
     if strategy is None:
         return {"error": f"Strategy '{body.strategy_name}' not found"}

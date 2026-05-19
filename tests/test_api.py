@@ -44,7 +44,7 @@ def db(tmp_path):
 @pytest.fixture
 def app(db):
     provider = DataProvider(db)
-    return create_app(db=db, provider=provider, strategies_dir=None)
+    return create_app(db=db, provider=provider, strategies_dir="strategies")
 
 
 @pytest.fixture
