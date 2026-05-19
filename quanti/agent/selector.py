@@ -127,23 +127,47 @@ class StrategySelector:
     def _score(ev: StrategyEvaluation, goal: Goal) -> float:
         """Composite score: higher is better.
 
-        Weights shift with risk tolerance:
-          - LOW  cares most about drawdown
-          - HIGH cares most about hitting the return target
+        Components (all on roughly the same 0-1 scale, then weighted):
+          - return_score: how close the strategy is to the target (1.0 = hits
+            target exactly, capped at 1.5 above target so 5× wins don't
+            dominate, can go negative for losing strategies).
+          - dd_score: how well it respects the user's drawdown ceiling
+            (positive when comfortably within, negative when breaching).
+          - sharpe: as-is — risk-adjusted return signal.
+
+        Weights shift with risk_tolerance:
+          - LOW  weights drawdown most  (capital preservation)
+          - HIGH weights return most    (target-chasing)
         """
         tol = goal.risk_tolerance
         if isinstance(tol, str):
             tol = RiskTolerance(tol)
-        return_gap = ev.annual_return - goal.target_annual_return
-        dd_breach = min(ev.max_drawdown - goal.max_drawdown, 0.0)  # negative = breach
-        # Weights
+
+        # Normalize return relative to the target. A strategy that exactly
+        # hits target earns 1.0; one that returns half earns 0.5; one that
+        # doubles is capped at 1.5 so lottery-style outliers can't bury
+        # solid-but-balanced picks.
+        target = max(goal.target_annual_return, 0.01)
+        return_score = max(min(ev.annual_return / target, 1.5), -1.0)
+
+        # Normalize drawdown relative to the user-stated ceiling. Positive
+        # when comfortably within tolerance, 0 right at the limit, negative
+        # when breaching.
+        dd_ceiling = abs(goal.max_drawdown) if goal.max_drawdown != 0 else 0.20
+        dd_score = (ev.max_drawdown - goal.max_drawdown) / dd_ceiling
+        # Clamp so a 10× breach doesn't dominate — at -2 a strategy is already
+        # losing badly regardless.
+        dd_score = max(min(dd_score, 1.5), -2.0)
+
         if tol is RiskTolerance.LOW:
             w_ret, w_dd, w_sharpe = 0.3, 1.8, 0.6
         elif tol is RiskTolerance.HIGH:
             w_ret, w_dd, w_sharpe = 1.2, 0.6, 0.4
         else:
             w_ret, w_dd, w_sharpe = 0.8, 1.0, 0.5
-        # Penalize zero-trade strategies — they technically don't lose money
-        # but they also can't earn it.
+
         activity = 1.0 if ev.total_trades > 0 else -1.0
-        return (w_ret * return_gap) + (w_dd * dd_breach) + (w_sharpe * ev.sharpe) + activity
+        return (w_ret * return_score
+                + w_dd * dd_score
+                + w_sharpe * ev.sharpe
+                + activity)

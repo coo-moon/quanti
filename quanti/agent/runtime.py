@@ -152,20 +152,28 @@ class AgentRuntime:
     # ------------------------------------------------------------ internal
     def _loop(self) -> None:
         # Run immediately so the user gets feedback without waiting.
-        try:
-            self._run_one_cycle()
-        except Exception as e:
-            logger.exception(f"Agent first tick failed: {e}")
+        self._safe_cycle()
         while not self._stop_flag.is_set():
             if self._stop_flag.wait(self._tick_interval):
                 break
+            self._safe_cycle()
+
+    def _safe_cycle(self) -> None:
+        """Run one cycle and swallow ALL errors — including ones thrown by the
+        error-logging path itself — so a transient DB / disk issue cannot
+        kill the agent thread. The next tick will get another chance."""
+        try:
+            self._run_one_cycle()
+        except Exception as e:
+            logger.exception(f"Agent tick failed: {e}")
             try:
-                self._run_one_cycle()
-            except Exception as e:
-                logger.exception(f"Agent tick failed: {e}")
                 self._db.log_decision(
                     "agent_error", f"Tick error: {e}",
                     details={"trace": str(e)})
+            except Exception as log_err:
+                # DB itself may be the problem (read-only, full, locked).
+                # Logging here failing is fine — we already log to stderr above.
+                logger.warning(f"Could not persist agent_error decision: {log_err}")
 
     # ---------------------------------------------------- universe helpers
     def _resolve_universe(self, goal: Goal) -> list[str]:

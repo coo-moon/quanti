@@ -75,6 +75,41 @@ class TestStrategySelector:
         # Built-ins under strategies/
         assert "ma_cross" in names
 
+    def test_score_rewards_target_hit(self):
+        """A balanced strategy that hits the target with low drawdown must
+        beat a high-Sharpe-but-under-target strategy at MEDIUM tolerance.
+        This was the original "balanced strategies can never win" bug."""
+        from quanti.agent.selector import StrategyEvaluation
+        from quanti.agent.goal import RiskTolerance
+
+        target = Goal(target_annual_return=0.20, max_drawdown=-0.20,
+                      risk_tolerance=RiskTolerance.MEDIUM)
+        balanced = StrategyEvaluation("balanced", 0.20, -0.05, 1.5, 40, 0)
+        conservative = StrategyEvaluation("conservative", 0.10, -0.04, 1.8, 15, 0)
+        score_balanced = StrategySelector._score(balanced, target)
+        score_conservative = StrategySelector._score(conservative, target)
+        assert score_balanced > score_conservative, (
+            f"balanced ({score_balanced:.3f}) should beat conservative "
+            f"({score_conservative:.3f}) at MEDIUM when balanced hits target")
+
+    def test_score_penalizes_dd_breach_even_at_high_risk(self):
+        """A strategy that breaches the user's stated max_drawdown must lose
+        to one that respects it — even when the user said HIGH risk
+        tolerance. The drawdown ceiling is an explicit user contract, not
+        a soft suggestion."""
+        from quanti.agent.selector import StrategyEvaluation
+        from quanti.agent.goal import RiskTolerance
+
+        goal = Goal(target_annual_return=0.20, max_drawdown=-0.20,
+                    risk_tolerance=RiskTolerance.HIGH)
+        breacher = StrategyEvaluation("breacher", 0.45, -0.30, 0.9, 80, 0)
+        respecter = StrategyEvaluation("respecter", 0.25, -0.15, 1.0, 50, 0)
+        s_breach = StrategySelector._score(breacher, goal)
+        s_respect = StrategySelector._score(respecter, goal)
+        assert s_respect > s_breach, (
+            f"respecter ({s_respect:.3f}) should beat breacher "
+            f"({s_breach:.3f}) even at HIGH because dd breach is real")
+
     def test_pick_best_returns_strategy(self, seeded):
         provider = DataProvider(seeded)
         selector = StrategySelector(seeded, provider,
@@ -235,6 +270,31 @@ class TestAgentRuntime:
         # Calling again is a no-op.
         assert db.prune_decisions(older_than_days=90) == 0
         db.close()
+
+    def test_safe_cycle_swallows_db_log_failure(self, seeded, monkeypatch):
+        """If a tick fails AND the error-log write also fails, _safe_cycle
+        must NOT raise — otherwise the agent thread would die and the loop
+        would stop."""
+        provider = DataProvider(seeded)
+        broker = PaperBroker(seeded, provider, initial_cash=200_000)
+        agent = AgentRuntime(seeded, provider, broker,
+                             strategies_dir="strategies",
+                             screeners_dir="strategies")
+        save_goal(seeded, Goal(strategy_name="ma_cross",
+                               target_annual_return=0.15))
+
+        # Force _run_one_cycle to fail
+        def bad_cycle(*a, **kw):
+            raise RuntimeError("simulated tick failure")
+        monkeypatch.setattr(agent, "_run_one_cycle", bad_cycle)
+
+        # Also force log_decision to fail (mimic full disk / locked DB)
+        def bad_log(*a, **kw):
+            raise RuntimeError("simulated DB log failure")
+        monkeypatch.setattr(seeded, "log_decision", bad_log)
+
+        # Must not raise
+        agent._safe_cycle()
 
     def test_tick_empty_universe(self, tmp_path):
         db = Database(str(tmp_path / "empty.db"))
