@@ -188,18 +188,41 @@ class AgentRuntime:
         return []
 
     def _ensure_recent_data(self, codes: list[str], lookback_days: int = 200) -> None:
-        """Trigger an AkShare sync for any code missing recent bars. Bounded."""
+        """Trigger an AkShare sync for any code missing recent bars. Bounded.
+
+        Two priorities:
+          1. Currently held positions go first — they drive the mark-to-market
+             pnl on the dashboard, so stale prices visibly "freeze" the UI.
+          2. Other candidates fill the rest of the per-tick budget.
+
+        Freshness: a bar from before yesterday is considered stale (was 7
+        days, which left positions frozen for nearly a trading week).
+        """
         from quanti.data.akshare_adapter import AkShareAdapter
         end = date.today()
         start = end - timedelta(days=lookback_days)
-        missing = []
-        for c in codes:
+        stale_after = end - timedelta(days=1)  # bars older than yesterday
+
+        held = [p["code"] for p in self._db.list_positions()]
+        held_set = set(held)
+        # Held codes first, others after, dedupe while preserving order
+        ordered: list[str] = []
+        for c in held + [c for c in codes if c not in held_set]:
+            if c not in ordered:
+                ordered.append(c)
+
+        missing: list[str] = []
+        for c in ordered:
             bars = self._provider.get_daily_bars(c, start, end)
-            if not bars or bars[-1].date < end - timedelta(days=7):
+            if not bars or bars[-1].date < stale_after:
                 missing.append(c)
         if not missing:
             return
-        missing = missing[:20]  # cap per tick
+        # Cap per tick. Held positions are guaranteed to be in the first
+        # `len(held)` slots; the rest of the budget covers candidates.
+        budget = max(20, len(held_set))
+        missing = missing[:budget]
+
         adapter = AkShareAdapter(self._db)
         for c in missing:
             try:

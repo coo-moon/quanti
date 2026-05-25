@@ -41,6 +41,31 @@ def seeded(tmp_path):
     db.close()
 
 
+@pytest.fixture
+def test_strategies_dir(tmp_path):
+    """Materialize a test-only strategies directory with an e2e_force_buy
+    strategy that emits a BUY on every bar. Lets the suite exercise the full
+    Agent → PaperBroker path without relying on real strategy crossover
+    events happening to land in the recent 3-day window of synthetic data.
+    """
+    strat_dir = tmp_path / "strategies"
+    strat_dir.mkdir()
+    (strat_dir / "e2e_force_buy.py").write_text(
+        '"""Test-only: emit a BUY on every bar (agent dedup keeps one)."""\n'
+        "from quanti.models import BarData, Direction, Signal\n"
+        "from quanti.strategy.base import BaseStrategy\n"
+        "\n\n"
+        "class ForceBuyStrategy(BaseStrategy):\n"
+        '    name = "e2e_force_buy"\n'
+        "    def init(self, config: dict) -> None:\n"
+        '        self.strength = config.get("strength", 0.15)\n'
+        "    def on_bar(self, bar: BarData) -> list[Signal]:\n"
+        "        return [Signal(stock_code=bar.code, direction=Direction.BUY,\n"
+        '                       strength=self.strength, reason="e2e force buy")]\n'
+    )
+    return str(strat_dir)
+
+
 class TestGoal:
     def test_default_goal(self):
         g = default_goal()
@@ -138,12 +163,12 @@ class TestAgentRuntime:
         kinds = {d["kind"] for d in decisions}
         assert "cycle" in kinds
 
-    def test_tick_dedupes_same_code_same_direction(self, seeded):
+    def test_tick_dedupes_same_code_same_direction(self, seeded, test_strategies_dir):
         """Multiple bars within the recent window must not multiply orders."""
         provider = DataProvider(seeded)
         broker = PaperBroker(seeded, provider, initial_cash=200_000)
         agent = AgentRuntime(seeded, provider, broker,
-                             strategies_dir="/tmp/qe2e/strategies",
+                             strategies_dir=test_strategies_dir,
                              screeners_dir="strategies")
         save_goal(seeded, Goal(strategy_name="e2e_force_buy",
                                target_annual_return=0.15))
@@ -156,13 +181,13 @@ class TestAgentRuntime:
         assert len(codes_bought) == len(set(codes_bought)), \
             f"duplicate buys in same tick: {codes_bought}"
 
-    def test_tick_filters_sell_without_position(self, seeded):
+    def test_tick_filters_sell_without_position(self, seeded, test_strategies_dir):
         """SELL signals for codes we don't hold should not produce rejected
         broker orders — they're strategy-state echoes, not real decisions."""
         provider = DataProvider(seeded)
         broker = PaperBroker(seeded, provider, initial_cash=200_000)
         agent = AgentRuntime(seeded, provider, broker,
-                             strategies_dir="/tmp/qe2e/strategies",
+                             strategies_dir=test_strategies_dir,
                              screeners_dir="strategies")
         # We never bought anything, but pin a strategy that may emit historical sells.
         save_goal(seeded, Goal(strategy_name="ma_cross",
@@ -209,14 +234,14 @@ class TestAgentRuntime:
         n2 = len(seeded.list_decisions(limit=100, kind="strategy_pick"))
         assert n2 > n1, f"expected cache miss, but stale cache used (1: {n1}, 2: {n2})"
 
-    def test_shutdown_does_not_disable_goal(self, seeded):
+    def test_shutdown_does_not_disable_goal(self, seeded, test_strategies_dir):
         """Process-shutdown must NOT flip goal.enabled to False — otherwise the
         agent would never auto-resume on the next server start (defeats the
         whole point of 'set goal and walk away')."""
         provider = DataProvider(seeded)
         broker = PaperBroker(seeded, provider, initial_cash=200_000)
         agent = AgentRuntime(seeded, provider, broker,
-                             strategies_dir="/tmp/qe2e/strategies",
+                             strategies_dir=test_strategies_dir,
                              screeners_dir="strategies")
         save_goal(seeded, Goal(strategy_name="e2e_force_buy",
                                target_annual_return=0.15, enabled=True))
@@ -227,13 +252,13 @@ class TestAgentRuntime:
         # Critical invariant: goal.enabled survived shutdown.
         assert load_goal(seeded).enabled is True
 
-    def test_stop_disables_goal_and_logs(self, seeded):
+    def test_stop_disables_goal_and_logs(self, seeded, test_strategies_dir):
         """User-initiated stop must disable the goal (so we don't auto-resume)
         AND only log a decision if the agent was actually running."""
         provider = DataProvider(seeded)
         broker = PaperBroker(seeded, provider, initial_cash=200_000)
         agent = AgentRuntime(seeded, provider, broker,
-                             strategies_dir="/tmp/qe2e/strategies",
+                             strategies_dir=test_strategies_dir,
                              screeners_dir="strategies")
         save_goal(seeded, Goal(strategy_name="e2e_force_buy",
                                target_annual_return=0.15, enabled=True))
