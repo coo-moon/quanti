@@ -2,7 +2,7 @@
 
 > 面向 A 股的 AI 自治量化交易系统。设定目标，剩下交给 Agent。
 
-适用版本：Quanti 0.2.0。当前所有交易走 PaperBroker 模拟盘，未接真实券商（参见 [`TODO-live-trading.md`](TODO-live-trading.md)）。
+适用版本：Quanti 0.3.0(2026-05 升级:walk-forward 验证、截面因子、Top-K ensemble、Claude LLM agent 接入)。当前所有交易走 PaperBroker 模拟盘,未接真实券商(参见 [`TODO-live-trading.md`](TODO-live-trading.md))。
 
 ---
 
@@ -80,7 +80,7 @@ cd ..
 
 # 验证安装
 quanti --help
-pytest -q              # 应该 59 passed
+pytest -q              # 应该 137 passed(含 walk-forward / 因子 / ensemble / LLM 测试)
 ```
 
 ### 2.3 目录结构
@@ -123,6 +123,11 @@ quanti/
 | **AgentRuntime** | 后台循环线程：同步数据→选股→评估策略→生成信号→风控→PaperBroker→记日志 |
 | **Decision Log（决策日志）** | Agent 每一次动作都写入 DB，可在 Web/CLI/MCP 回放 |
 | **Pool（股票池）** | 你定义的一组 codes，可作为 Agent 的交易宇宙 |
+| **Walk-forward(2026-05)** | 用 N 个非重叠 OOS 窗口验证策略,Selector 评分用 OOS Sharpe + 一致性。杜绝单窗 IS 过拟合 |
+| **Factor Panel(2026-05)** | 截面因子(动量/反转/换手/波动)→ 横截面 z-score → 行业中性化 → 等权合成,产出每只股的 composite 分 |
+| **Ensemble(2026-05)** | Selector 选 Top-K 策略按 OOS Sharpe softmax 加权,信号融合 + 因子覆盖 |
+| **VolTargetSizer(2026-05)** | 反波动率仓位:低波加仓、高波减仓,目标组合年化波动 18%。opt-in |
+| **LLM Agent(2026-05)** | Claude 看完候选股 + 持仓 + 历史决策,通过 `propose_orders` 工具最终落子。需要 ANTHROPIC_API_KEY |
 
 数据流：
 
@@ -365,7 +370,139 @@ score = w_ret × (annual_return - target_annual_return)
 
 `activity_bonus` = +1（有成交）/ -1（零成交）—— 不交易的策略不会拿高分。
 
-### 6.5 怎么让 Agent 一直跑
+### 6.5 三种 Agent 运行模式(2026-05 升级)
+
+升级后 Agent 有三条路径,都通过 `goal.params` 切换,**默认仍是 rule 模式以保兼容**:
+
+| 模式 | 触发条件 | 行为 |
+|---|---|---|
+| **rule**(默认) | 不设 `agent_mode`,或显式 `"rule"` | 走老路径:Selector 挑一个最佳策略,生成信号,直接执行。 |
+| **ensemble** | `params["ensemble_enabled"]=True` 且未钉策略 | Selector 选 Top-K(默认 3)策略,softmax 按 OOS Sharpe 加权;运行所有候选策略;乘上截面因子分;按阈值过滤 → 下单。 |
+| **llm** | `params["agent_mode"]="llm"` 且未钉策略 | 先走 ensemble 流程产出候选股,把候选 + 持仓 + 近期决策喂给 Claude,LLM 通过 `propose_orders` 工具决定最终下单。LLM 没装时优雅降级到 ensemble。 |
+
+钉死策略(`goal.strategy_name="ma_cross"`)总是优先级最高,任何模式下都直接用钉选策略。
+
+### 6.6 新增 `goal.params` 字段(2026-05 升级)
+
+完整参考表。所有字段都有合理默认值,**全部缺省就是 rule 模式 + 老行为**。
+
+#### 6.6.1 Walk-forward 验证(Phase 1)
+
+Selector 默认从 IS 评分改为 OOS 评分,杜绝过拟合。
+
+| key | 默认 | 说明 |
+|---|---|---|
+| `wf_enabled` | `True` | 是否启用 walk-forward。`False` 则退化为单窗 IS 回测(旧行为)。 |
+| `wf_n_folds` | `3` | 滚动 OOS 测试窗数。3 个非重叠窗共约 2 个月 OOS。 |
+| `wf_warmup_days` | `120` | 每个测试窗前的暖机天数(指标如 MA(20)/MACD 需要状态)。 |
+| `wf_test_days` | `21` | 每个测试窗的天数(约 1 个月)。 |
+
+数据要求:`wf_n_folds × (wf_warmup_days + wf_test_days)` 天的历史。3×141 ≈ 一年。
+
+#### 6.6.2 Ensemble + 截面因子(Phase 2)
+
+| key | 默认 | 说明 |
+|---|---|---|
+| `ensemble_enabled` | `False` | 是否启用 Top-K 策略组合。 |
+| `top_k_strategies` | `3` | Top-K 个策略,按 OOS Sharpe softmax 加权。 |
+| `signal_threshold` | `0.30` | 融合后 `final_score` 阈值。越高越精挑。 |
+| `factor_blend` | `0.5` | 因子覆盖权重。0=只看策略投票,1=只看截面因子,0.5 平衡。 |
+| `industry_neutral` | `False` | 是否做主动行业中性化(每行业最多 N 个候选)。 |
+| `n_per_industry` | `2` | 启用行业中性化时,每行业最多保留几个候选。 |
+
+#### 6.6.3 LLM 决策(Phase 3)
+
+| key | 默认 | 说明 |
+|---|---|---|
+| `agent_mode` | `""` | 设为 `"llm"` 启用 Claude 决策路径。 |
+| `llm_model` | `"claude-sonnet-4-5"` | Anthropic 模型 ID。可设 `claude-opus-4-7`(更强更贵)。 |
+| `llm_max_tokens` | `4096` | 单次 LLM 调用上限。 |
+| `llm_max_iterations` | `5` | 工具调用最大轮数(防止 LLM 无限 inspect)。 |
+| `llm_max_candidates` | `20` | 传给 LLM 的候选股数量上限(控 token)。 |
+| `llm_temperature` | `0.3` | 温度。0.3 偏确定性,需要点判断空间但不要太发散。 |
+
+### 6.7 LLM 模式接入步骤
+
+```bash
+# 1. 安装 anthropic SDK(可选依赖)
+pip install -e '.[llm]'
+
+# 2. 设环境变量
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# 3. 启用 LLM 模式
+quanti agent set-goal --target 0.25 --risk medium
+# 然后通过 API / MCP / SQL 改 params
+curl -X POST http://127.0.0.1:8000/api/goal \
+  -H 'Content-Type: application/json' \
+  -d '{"params": {"agent_mode": "llm", "ensemble_enabled": true, "industry_neutral": true}}'
+
+# 4. 跑一轮看效果
+quanti agent tick
+```
+
+**安全 invariant**(代码里硬约束,LLM 突破不了):
+
+- LLM 只能选**已经 vetted 的候选股**(ensemble 流程筛过的)
+- 单股 `size_pct ≤ 0.10`(单股仓位 10% 上限)
+- 单 tick 最多 5 单
+- 所有提议仍经 `RiskManager.check()` 二次校验
+- API key 缺失 / SDK 未装 / 网络挂掉 → 自动降级到 ensemble 路径,不会丢 tick
+
+LLM 决策日志查看:Web `/agent` 页面紫色卡片展示 Claude 的中文 `reasoning`;或 `quanti agent decisions --limit 20`。
+
+### 6.8 截面因子说明(Phase 2)
+
+`quanti/factors/cross_sectional.py` 内置 5 个 A 股有实证效力的因子(已横截面 z-score + 行业中性化):
+
+| 因子 | 计算 | 方向 |
+|---|---|---|
+| `momentum_3m` | t-63 到 t-21 累计收益(跳过最近 1 个月避反转污染) | 高=好 |
+| `momentum_6m` | t-126 到 t-21 累计收益 | 高=好 |
+| `reversal_1w` | -(t-5 到 t 累计收益) | 短期超涨 → 看空 |
+| `turnover_20d` | -20 日均换手率 | 高换手 → 看空(注意力陷阱) |
+| `realized_vol_20d` | -20 日年化波动率 | 低波 → 看多(低波 anomaly) |
+
+不要无脑信:这是 starter 集,在不同市场阶段(牛/熊/震荡)各因子贡献不同。可以通过自定义 `FactorConfig.weights` 调权,或加新因子(继续往 `cross_sectional.py` 加函数 + 注册)。
+
+### 6.9 回测真实性升级(Phase 1)
+
+#### 6.9.1 成交量加权滑点(默认开启)
+
+旧版固定 0.1% 滑点。新版用平方根冲击模型:
+
+```
+cost_bps = base_bps + impact_bps_per_pct × sqrt(participation_pct ^ alpha)
+```
+
+默认参数下:1% ADV 参与率 ≈ 10bps(匹配老默认),10% ≈ 16bps,100% ≈ 50bps,封顶 300bps。
+
+回测会自动计算每只票的 20 日 ADV,如果数据缺失(新股、停牌)优雅降级到 base bps。
+
+需要纯 flat 行为(对比老版):
+
+```python
+from quanti.backtest.slippage import FlatSlippage
+engine = BacktestEngine(provider=p, slippage=FlatSlippage(bps=10))
+```
+
+#### 6.9.2 波动率目标仓位(opt-in)
+
+`PaperBroker` 默认仍是老 sizing 逻辑(`signal.strength × cash`)。要启用 vol-targeting:
+
+```python
+from quanti.risk.sizer import VolTargetSizer
+broker = PaperBroker(db, provider, initial_cash=1_000_000,
+                     sizer=VolTargetSizer(target_portfolio_vol=0.18,
+                                          lookback_days=60,
+                                          n_target_positions=10))
+```
+
+效果:低波股加仓,高波股减仓,目标组合年化波动 18%。仍受 `RiskConfig.max_position_pct=0.10` 硬上限。
+
+启用 vol-targeting **不是开 ensemble/LLM 的前提**,可以独立用。
+
+### 6.10 怎么让 Agent 一直跑
 
 ```bash
 # 方式 1：CLI 启动，前台跑（关终端就停）
@@ -766,6 +903,8 @@ curl -X POST http://127.0.0.1:8000/api/backtest/run \
 
 回测引擎 (`BacktestEngine`) 和模拟盘 (`PaperBroker`) 共用同一个 `RiskManager`、同一个 `AShareCommission` 模型、同一套 T+1 规则。**回测出来什么样，模拟盘就大概率什么样**。
 
+2026-05 升级后,回测引擎默认启用**成交量加权滑点**(`VolumeImpactSlippage`),实盘 PaperBroker 仍是 flat 0.1%。要让回测更保守(更接近实盘 / 比实盘还差):用默认即可。要让回测更乐观(对比老版):传 `slippage=0.001`(自动包装成 FlatSlippage)。详见 §6.9.1。
+
 ---
 
 ## 12. 风控配置
@@ -799,6 +938,12 @@ app.state.broker = PaperBroker(
 ```
 
 或者新加一个 `--risk-config` 参数走 yaml 配置（小改造）。
+
+### 12.2 波动率目标仓位(opt-in,2026-05 升级)
+
+风控提供仓位**上限**(单股 10%、行业 30%、总仓 80%)。`VolTargetSizer` 提供仓位**目标**:让低波股拿到更大权重、高波股更小,组合年化波动接近某个目标值。详见 §6.9.2。
+
+二者不冲突:Sizer 给出的目标权重仍受 `RiskConfig.max_position_pct` 硬上限约束。Sizer 是 opt-in,默认 PaperBroker 行为不变。
 
 ---
 
@@ -871,7 +1016,7 @@ quanti up  # 会重新初始化
 .venv/bin/python -m pytest tests -v
 ```
 
-应该 59 passed。
+应该 137 passed(含 walk-forward / 因子 / ensemble / LLM stub 测试)。
 
 ### 13.6 日志
 
@@ -978,6 +1123,7 @@ sqlite3 data/quanti.db 'SELECT ts, kind, summary FROM agent_decisions ORDER BY i
 
 - [`README.md`](../README.md) — 项目总览
 - [`TODO-live-trading.md`](TODO-live-trading.md) — 接真实券商的 TODO 清单
+- [`plans/2026-05-25-smart-quant-upgrade.md`](plans/2026-05-25-smart-quant-upgrade.md) — Phase 1-3 升级的设计文档 + 红线 + 验收 gate
 - `docs/plans/` — 历史实现计划
 
 ### D. 反馈渠道
