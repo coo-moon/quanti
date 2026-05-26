@@ -116,9 +116,13 @@ class StrategySelector:
                                 initial_cash=self._initial_cash)
 
         results: list[StrategyEvaluation] = []
-        # Cap universe so this stays snappy; selection accuracy matters more
-        # than evaluating thousands of stocks every cycle.
-        capped = codes[:50]
+        # Cap universe so each Selector cycle stays bounded. Default raised
+        # from 50 → 100 in 2026-05 (P4): 50 was statistically too thin for
+        # walk-forward to discriminate strategies — many fold splits ended
+        # up with zero trades. 100 doubles backtest cost but gives the
+        # ranking real signal. Override via goal.params["selector_max_universe"].
+        max_universe = int(params.get("selector_max_universe", 100))
+        capped = codes[:max(20, max_universe)]
         for strat in candidates:
             try:
                 # In-sample baseline (always computed, cheap).

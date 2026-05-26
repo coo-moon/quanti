@@ -86,6 +86,11 @@ class AgentRuntime:
         # reuse the cached pick — saves running a 6-strategy backtest sweep
         # on every 4h tick (~9× faster ticks once cache is warm).
         self._selector_cache: tuple[float, str, list[dict]] | None = None
+        # Universe cache: (today, config_key, filtered_codes). Liquidity /
+        # age / name filters only change daily, so we cache the filtered
+        # list and reuse for ticks within the same trading day. See
+        # _cached_tradable_universe for details.
+        self._universe_cache: tuple[date, tuple, list[str]] | None = None
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
         self._status = AgentStatus()
@@ -184,15 +189,75 @@ class AgentRuntime:
 
     # ---------------------------------------------------- universe helpers
     def _resolve_universe(self, goal: Goal) -> list[str]:
+        """Build the candidate stock universe for this tick.
+
+        Three sources, in order:
+          1. `goal.universe_pool` — a user-curated pool. Trusted; used as-is.
+          2. All codes with quotes in DB (`provider.get_all_codes()`).
+          3. Optional liquidity filter (P4, 2026-05): when
+             `goal.params["liquidity_filter"]=True`, run UniverseBuilder
+             to drop ST / new IPOs / illiquid names. Result cached daily.
+        """
         if goal.universe_pool:
             codes = self._db.get_pool_codes(goal.universe_pool)
             if codes:
                 return codes
-        # Fall back to anything we already have quotes for.
+
         codes = self._provider.get_all_codes()
-        if codes:
+        if not codes:
+            return []
+
+        params = goal.params or {}
+        if not bool(params.get("liquidity_filter", False)):
             return codes
-        return []
+
+        return self._cached_tradable_universe(codes, params)
+
+    def _cached_tradable_universe(self, codes: list[str], params: dict) -> list[str]:
+        """Run UniverseBuilder, cache the result for the current trading day.
+
+        Liquidity / age / name filters only change daily — running them on
+        every 4h tick is wasteful. Key on `(today, config-hash)`. If the
+        builder filtered everything out (config too strict), fall back to
+        the unfiltered list so the agent doesn't deadlock.
+        """
+        from quanti.agent.universe import UniverseBuilder, UniverseConfig
+
+        cfg = UniverseConfig(
+            min_adv20_yuan=float(params.get("universe_min_adv20",
+                                             UniverseConfig.min_adv20_yuan)),
+            min_active_days_60=int(params.get("universe_min_active_days",
+                                              UniverseConfig.min_active_days_60)),
+            min_age_days=int(params.get("universe_min_age_days",
+                                        UniverseConfig.min_age_days)),
+        )
+        today = date.today()
+        cfg_key = (cfg.min_adv20_yuan, cfg.min_active_days_60, cfg.min_age_days,
+                   len(codes))
+        if (self._universe_cache is not None
+                and self._universe_cache[0] == today
+                and self._universe_cache[1] == cfg_key):
+            return self._universe_cache[2]
+
+        builder = UniverseBuilder(self._db, self._provider, cfg)
+        filtered, result = builder.build(candidates=codes, return_details=True)
+
+        if not filtered:
+            logger.warning(
+                f"Liquidity filter dropped all {len(codes)} codes — "
+                f"falling back to unfiltered. result={result.as_dict()}")
+            return codes
+
+        self._db.log_decision(
+            "universe_filter",
+            f"流动性宇宙清洗: {result.initial} → {result.final and len(result.final)} 只",
+            details={"result": result.as_dict(), "config": {
+                "min_adv20_yuan": cfg.min_adv20_yuan,
+                "min_active_days_60": cfg.min_active_days_60,
+                "min_age_days": cfg.min_age_days,
+            }})
+        self._universe_cache = (today, cfg_key, filtered)
+        return filtered
 
     def _ensure_recent_data(self, codes: list[str], lookback_days: int = 200) -> None:
         """Trigger an AkShare sync for any code missing recent bars. Bounded.
@@ -261,7 +326,12 @@ class AgentRuntime:
             except Exception:
                 pass
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [c for c, _ in scored[:20]]  # top-20 candidates
+        # Default raised from 20 → 50 in 2026-05 (P4). The 20-cap was so
+        # tight that mid-quality stocks couldn't reach the factor / strategy
+        # layers downstream. Override via goal.params["screener_top_n"].
+        params = goal.params or {}
+        top_n = int(params.get("screener_top_n", 50))
+        return [c for c, _ in scored[:top_n]]
 
     # --------------------------------------------------- signal generators
     def _single_strategy_signals(self, strategy, candidates: list[str]) -> list[Signal]:
@@ -440,7 +510,16 @@ class AgentRuntime:
         self._ensure_recent_data(universe)
         candidates = self._run_screener(goal, universe)
         if not candidates:
-            candidates = universe[:30]
+            # No screener (or screener returned nothing): take the top N by
+            # 20-day ADV instead of `universe[:30]`. The old slice was
+            # *dictionary order*, which biased every no-screener run toward
+            # the codes that happened to sort first (000001, 000002, ...).
+            # Sort-by-ADV at least gives "the N most liquid" — a defensible
+            # default. Override via goal.params["no_screener_take"].
+            params_local = goal.params or {}
+            take = int(params_local.get("no_screener_take", 100))
+            from quanti.agent.universe import sort_by_adv20
+            candidates = sort_by_adv20(self._provider, universe)[:take]
 
         # Decide path among three options:
         #   * "llm":      ensemble candidates → Claude judgment (P3).

@@ -80,7 +80,7 @@ cd ..
 
 # 验证安装
 quanti --help
-pytest -q              # 应该 137 passed(含 walk-forward / 因子 / ensemble / LLM 测试)
+pytest -q              # 应该 159 passed(含 walk-forward / 因子 / ensemble / LLM 测试)
 ```
 
 ### 2.3 目录结构
@@ -128,6 +128,7 @@ quanti/
 | **Ensemble(2026-05)** | Selector 选 Top-K 策略按 OOS Sharpe softmax 加权,信号融合 + 因子覆盖 |
 | **VolTargetSizer(2026-05)** | 反波动率仓位:低波加仓、高波减仓,目标组合年化波动 18%。opt-in |
 | **LLM Agent(2026-05)** | Claude 看完候选股 + 持仓 + 历史决策,通过 `propose_orders` 工具最终落子。需要 ANTHROPIC_API_KEY |
+| **UniverseBuilder(2026-05 P4)** | 流动性 + ST + 新股名称 + 上市天数过滤,把 5000 只 A 股清洗到 ~1000 只可投资股票。日缓存。opt-in |
 
 数据流：
 
@@ -421,6 +422,18 @@ Selector 默认从 IS 评分改为 OOS 评分,杜绝过拟合。
 | `llm_max_candidates` | `20` | 传给 LLM 的候选股数量上限(控 token)。 |
 | `llm_temperature` | `0.3` | 温度。0.3 偏确定性,需要点判断空间但不要太发散。 |
 
+#### 6.6.4 候选池 + 流动性清洗(Phase 4)
+
+| key | 默认 | 说明 |
+|---|---|---|
+| `liquidity_filter` | `False` | 启用 `UniverseBuilder` 清洗(5000→~1000)。日缓存。 |
+| `universe_min_adv20` | `5e7`(5000万) | ADV20 阈值。1e8 = 仅中证 800 量级,1e7 = 含微盘 |
+| `universe_min_active_days` | `40` | 近 60 日有效交易日下限 |
+| `universe_min_age_days` | `90` | 上市天数下限 |
+| `screener_top_n` | `50` | screener 评分后留几只(之前硬编码 20) |
+| `no_screener_take` | `100` | 没 screener 时按 ADV20 排序取几只(之前硬编码 30 字典序) |
+| `selector_max_universe` | `100` | Selector WF 内部 cap(之前硬编码 50);硬下限 20 |
+
 ### 6.7 LLM 模式接入步骤
 
 ```bash
@@ -502,7 +515,79 @@ broker = PaperBroker(db, provider, initial_cash=1_000_000,
 
 启用 vol-targeting **不是开 ensemble/LLM 的前提**,可以独立用。
 
-### 6.10 怎么让 Agent 一直跑
+### 6.10 流动性宇宙清洗 + 候选池配置(2026-05 P4)
+
+**问题**:之前 universe → 候选股的流水线有三个硬编码截断,加起来导致系统真正"看"过的只有 20-30 只(而且 no-screener 路径还是字典序硬切前 30 只 = 000001 平安银行 ~ 000030 这些)。
+
+**修复**:全部改成 `goal.params` 配置 + 加一层流动性清洗。
+
+#### 6.10.1 三个候选池截断的新默认值
+
+| key | 之前 | 现在 | 在哪一步 |
+|---|---|---|---|
+| `screener_top_n` | 硬编码 20 | **50** | screener 评分后留 top-N |
+| `no_screener_take` | 硬编码 30(字典序!) | **100**(按 ADV20 排序) | 没 screener 时的 fallback |
+| `selector_max_universe` | 硬编码 50 | **100** | Selector 跑 walk-forward 时的 cap |
+
+`no_screener_take` 的副作用修复:之前是 `universe[:30]` 字典序硬切,现在按 20 日 ADV 降序排再切 → 不再偏向"代码靠前"的股票。
+
+#### 6.10.2 流动性宇宙清洗(opt-in)
+
+启用 `params["liquidity_filter"]=True` 时,在 `_resolve_universe` 阶段先把全 A 股 5000 只过一遍 `UniverseBuilder`,过滤掉:
+
+| 维度 | 默认阈值 | param key |
+|---|---|---|
+| ADV20(20 日平均成交额) | ≥ 5000 万元 | `universe_min_adv20` |
+| 近 60 日有效交易日 | ≥ 40 天 | `universe_min_active_days` |
+| 上市天数 | ≥ 90 天 | `universe_min_age_days` |
+| 名称黑名单 | 含 "ST" / "退" 自动剔除 | (固定) |
+
+**结果**:5000 → ~1000 只可投资股票。**每日缓存**,4h tick 之间不重算。
+
+**降级保护**:如果你设的阈值太严过滤掉所有股票,系统**自动 fallback** 到未过滤列表,不会让 Agent 死等。同时往决策日志写一条 `universe_filter` 类型,带过滤前后的数字。
+
+#### 6.10.3 完整推荐配置(给 LLM 模式)
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/goal \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "params": {
+      "agent_mode": "llm",
+      "ensemble_enabled": true,
+      "industry_neutral": true,
+      "liquidity_filter": true,
+      "screener_top_n": 50,
+      "no_screener_take": 100,
+      "selector_max_universe": 100,
+      "universe_min_adv20": 50000000,
+      "wf_enabled": true,
+      "wf_n_folds": 3
+    }
+  }'
+```
+
+这套参数下,流水线表现:
+
+```
+5000 全 A 股
+  → ~1000 (流动性清洗,每日缓存)
+  → ≤ 50 / ≤ 100 (screener / 无 screener fallback,每 tick)
+  → ≤ 100 (Selector 内部,但 WF 缓存中)
+  → fused_candidates ~30 (因子打分 + 阈值过滤)
+  → LLM 看到 top 20,挑 ≤ 5 单
+```
+
+Selector 缓存 24h,流动性清洗缓存 1 天,所以**绝大多数 tick 只跑因子 + 信号生成 + LLM 一次调用**,真实开销 5-15 秒。
+
+#### 6.10.4 怎么调
+
+- 想让 LLM 看到更"主流"的股票 → 拉高 `universe_min_adv20`(比如 1 亿,只留中证 800 量级)
+- 想包含微盘股测试 → 设 `universe_min_adv20=10000000`(1000 万 ADV)
+- 想关流动性清洗看老行为 → `liquidity_filter=False`(默认)
+- 想看每日清洗了多少 → 查 `list_decisions(kind="universe_filter")`
+
+### 6.11 怎么让 Agent 一直跑
 
 ```bash
 # 方式 1：CLI 启动，前台跑（关终端就停）
@@ -1016,7 +1101,7 @@ quanti up  # 会重新初始化
 .venv/bin/python -m pytest tests -v
 ```
 
-应该 137 passed(含 walk-forward / 因子 / ensemble / LLM stub 测试)。
+应该 159 passed(含 walk-forward / 因子 / ensemble / LLM stub 测试)。
 
 ### 13.6 日志
 
