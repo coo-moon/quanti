@@ -2,7 +2,7 @@
 
 > 面向 A 股的 AI 自治量化交易系统。设定目标，剩下交给 Agent。
 
-适用版本：Quanti 0.3.0(2026-05 升级:walk-forward 验证、截面因子、Top-K ensemble、Claude LLM agent 接入)。当前所有交易走 PaperBroker 模拟盘,未接真实券商(参见 [`TODO-live-trading.md`](TODO-live-trading.md))。
+适用版本:Quanti 0.3.0(2026-05 升级:walk-forward 验证、截面因子、Top-K ensemble、Claude LLM agent 接入、流动性宇宙清洗)。当前所有交易走 PaperBroker 模拟盘,未接真实券商(参见 [`TODO-live-trading.md`](TODO-live-trading.md))。
 
 ---
 
@@ -271,9 +271,10 @@ quanti backtest \
 **决策日志**：按颜色分类
 - 蓝色 = 成交（trade）
 - 黄色 = 风控拒绝（risk_reject）
-- 绿色 = 周期完成 / 策略挑选（cycle / strategy_pick）
-- 红色 = Agent 报错（agent_error）
-- 灰色 = 启停事件（agent_start / agent_stop）
+- 绿色 = 周期完成 / 策略挑选 / ensemble 选定(cycle / strategy_pick / strategy_ensemble)
+- **紫色 = LLM 决策(llm_cycle),含 Claude 的中文 reasoning,展开看推理理由**
+- 红色 = Agent 报错(agent_error)
+- 灰色 = 启停事件 + 宇宙过滤(agent_start / agent_stop / universe_filter)
 
 页面每 15 秒自动刷新。
 
@@ -658,7 +659,7 @@ OpenClaw / Claude Desktop / Cursor 的配置文件加：
 }
 ```
 
-### 7.2 可调用的 MCP 工具（18 个）
+### 7.2 可调用的 MCP 工具(19 个)
 
 | 工具 | 干什么 |
 |------|--------|
