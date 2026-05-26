@@ -9,6 +9,7 @@ import pandas as pd
 
 from quanti.backtest.commission import AShareCommission
 from quanti.backtest.metrics import compute_metrics
+from quanti.backtest.slippage import SlippageModel, VolumeImpactSlippage, coerce
 from quanti.data.provider import DataProvider
 from quanti.models import BarData, Direction, Order, OrderStatus, Portfolio, Position, Signal
 from quanti.risk.manager import RiskManager
@@ -48,14 +49,27 @@ class BacktestEngine:
         provider: DataProvider,
         initial_cash: float = 1_000_000.0,
         commission: AShareCommission | None = None,
-        slippage: float = 0.001,  # 0.1%
+        slippage: SlippageModel | float | None = None,
         risk_manager: RiskManager | None = None,
     ):
+        """Args:
+            slippage: A `SlippageModel` (FlatSlippage / VolumeImpactSlippage),
+                or a float for backward-compat (interpreted as flat fraction
+                — e.g. 0.001 == 10 bps). Default: `VolumeImpactSlippage()`,
+                which calibrates to ~10 bps at 1% participation — equivalent
+                to the old 0.1% flat for small orders, but penalizes the
+                kind of large orders that lie about real fills in backtest.
+        """
         self._provider = provider
         self._initial_cash = initial_cash
         self._commission = commission or AShareCommission()
-        self._slippage = slippage
+        if slippage is None:
+            self._slippage: SlippageModel = VolumeImpactSlippage()
+        else:
+            self._slippage = coerce(slippage)
         self._risk = risk_manager
+        # ADV20 cache (per-run); populated at the top of run().
+        self._adv20: dict[str, dict[date, float]] = {}
 
     def run(
         self,
@@ -82,6 +96,19 @@ class BacktestEngine:
                 all_dates.add(bar.date)
 
         sorted_dates = sorted(all_dates)
+
+        # Precompute rolling 20-bar ADV (average daily turnover, in 元) per
+        # (code, date). The slippage model uses this to scale impact with the
+        # order's participation rate. Missing/zero turnover → adv20 stays 0
+        # and the slippage model gracefully degrades to base bps.
+        adv20: dict[str, dict[date, float]] = {}
+        for code, bars in all_bars.items():
+            amounts = [float(b.amount or 0) for b in bars]
+            adv20[code] = {}
+            for i, bar in enumerate(bars):
+                window = amounts[max(0, i - 19): i + 1]
+                adv20[code][bar.date] = sum(window) / len(window) if window else 0.0
+        self._adv20 = adv20
 
         for current_date in sorted_dates:
             bought_today.clear()
@@ -179,24 +206,47 @@ class BacktestEngine:
         bought_today: set[str],
         strategy_name: str,
     ) -> bool:
-        # Apply slippage
-        price = bar.close * (1 + self._slippage)
+        adv = self._adv20.get(code, {}).get(current_date, 0.0)
 
-        # Calculate affordable quantity (round down to 100)
+        # Two-pass slippage: estimate qty under base slippage, then re-compute
+        # the actual fill price at that qty. The volume-impact model has a
+        # tiny self-consistency loop (bigger qty → bigger slippage → smaller
+        # affordable qty) — one iteration of fixed-point is close enough for
+        # backtest purposes.
+        est_frac = self._slippage.adjust(
+            code=code, price=bar.close, qty=100,
+            direction=Direction.BUY, adv20=adv)
+        price_est = bar.close * (1 + est_frac)
+
         max_spend = portfolio.cash * 0.95  # Keep 5% cash buffer
-        commission_est = self._commission.calculate(price, 100, Direction.BUY)
-        affordable = int(max_spend / (price * 100 + commission_est)) * 100
+        commission_est = self._commission.calculate(price_est, 100, Direction.BUY)
+        affordable = int(max_spend / (price_est * 100 + commission_est)) * 100
 
         if affordable < 100:
             return False  # Not enough cash
 
         quantity = min(affordable, 10000)  # Cap at 10000 shares per trade
+
+        # Now apply the real slippage at the actual quantity.
+        real_frac = self._slippage.adjust(
+            code=code, price=bar.close, qty=quantity,
+            direction=Direction.BUY, adv20=adv)
+        price = bar.close * (1 + real_frac)
         cost = price * quantity
         commission = self._commission.calculate(price, quantity, Direction.BUY)
         total_cost = cost + commission
 
+        # Final affordability check (real slippage may push us over).
         if total_cost > portfolio.cash:
-            return False
+            # Shrink qty to fit. Conservative: drop 100-share lots one at a
+            # time until we're back under cash. Costs at most a few iterations.
+            while quantity >= 100 and total_cost > portfolio.cash:
+                quantity -= 100
+                cost = price * quantity
+                commission = self._commission.calculate(price, quantity, Direction.BUY)
+                total_cost = cost + commission
+            if quantity < 100:
+                return False
 
         portfolio.cash -= total_cost
         bought_today.add(code)
@@ -242,7 +292,11 @@ class BacktestEngine:
 
         pos = portfolio.positions[code]
         quantity = pos.quantity
-        price = bar.close * (1 - self._slippage)
+        adv = self._adv20.get(code, {}).get(current_date, 0.0)
+        slip_frac = self._slippage.adjust(
+            code=code, price=bar.close, qty=quantity,
+            direction=Direction.SELL, adv20=adv)
+        price = bar.close * (1 - slip_frac)
 
         revenue = price * quantity
         commission = self._commission.calculate(price, quantity, Direction.SELL)

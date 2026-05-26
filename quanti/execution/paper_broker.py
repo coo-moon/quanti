@@ -16,8 +16,9 @@ from datetime import date, datetime, timedelta
 from quanti.backtest.commission import AShareCommission
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
-from quanti.models import Direction, PriceType, Signal
+from quanti.models import BarData, Direction, PriceType, Signal
 from quanti.risk.manager import RiskConfig, RiskManager
+from quanti.risk.sizer import Sizer
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +46,32 @@ class PaperBroker:
         commission: AShareCommission | None = None,
         slippage: float = 0.001,
         risk_config: RiskConfig | None = None,
+        sizer: Sizer | None = None,
     ) -> None:
+        """Args:
+            sizer: Optional position sizer. When supplied, the broker uses
+                `sizer.target_weight()` to compute the target portfolio
+                fraction for each buy. When None (default), keeps the
+                legacy strength-as-cash-fraction logic for backward compat.
+        """
         self._db = db
         self._provider = provider
         self._commission = commission or AShareCommission()
         self._slippage = slippage
         self._risk = RiskManager(risk_config)
+        self._sizer = sizer
         # Idempotent — only writes if no row exists.
         self._db.ensure_portfolio(initial_cash)
+
+    def _recent_bars(self, code: str, days: int = 90) -> list[BarData]:
+        """Fetch the most recent `days` of bars for vol-targeting / impact.
+
+        Slightly more history than `_latest_close` so a vol-target sizer
+        has 60+ bars to estimate σ. Cheap because the DB is local.
+        """
+        end = date.today()
+        start = end - timedelta(days=days)
+        return self._provider.get_daily_bars(code, start, end)
 
     # ------------------------------------------------------------------ price
     def _latest_close(self, code: str) -> tuple[float, date] | None:
@@ -199,8 +218,22 @@ class PaperBroker:
         total_value = cash + sum(p["quantity"] * (p["current_price"] or p["avg_cost"])
                                  for p in self._db.list_positions())
         size_cap = total_value * max_position_pct
-        cash_cap = cash * 0.95 * max(min(signal.strength, 1.0), 0.1)
-        target_value = min(cash_cap, size_cap)
+        if self._sizer is not None:
+            # Sizer-driven path: convert target portfolio weight to a notional
+            # cap. The single-stock RiskManager cap still applies on top so
+            # the sizer can't push past risk limits.
+            recent = self._recent_bars(signal.stock_code)
+            target_w = self._sizer.target_weight(
+                code=signal.stock_code,
+                signal_strength=signal.strength,
+                recent_bars=recent,
+                portfolio_total_value=total_value,
+            )
+            sizer_value = total_value * target_w
+            target_value = min(sizer_value, size_cap, cash * 0.95)
+        else:
+            cash_cap = cash * 0.95 * max(min(signal.strength, 1.0), 0.1)
+            target_value = min(cash_cap, size_cap)
         commission_est = self._commission.calculate(price, 100, Direction.BUY)
         affordable_lots = int(target_value / (price * 100 + commission_est))
         if affordable_lots < 1:

@@ -191,6 +191,14 @@
             <span class="ts">{{ formatTs(d.ts) }}</span>
           </div>
           <div class="decision-body">{{ d.summary }}</div>
+          <!-- LLM cycle: surface Claude's reasoning so users can see WHY it chose what it did. -->
+          <div
+            v-if="d.kind === 'llm_cycle' && (d.details as any)?.reasoning"
+            class="decision-reasoning"
+          >
+            <span class="reasoning-label">理由</span>
+            {{ (d.details as any).reasoning }}
+          </div>
         </div>
       </div>
     </div>
@@ -295,7 +303,8 @@ function kindClass(kind: string) {
   if (kind === "risk_reject") return "kind-warn";
   if (kind === "cycle") return "kind-info";
   if (kind === "agent_start" || kind === "agent_stop") return "kind-meta";
-  if (kind === "strategy_pick") return "kind-info";
+  if (kind === "strategy_pick" || kind === "strategy_ensemble") return "kind-info";
+  if (kind === "llm_cycle") return "kind-llm";
   if (kind === "agent_error") return "kind-error";
   return "";
 }
@@ -635,5 +644,24 @@ onUnmounted(() => {
 }
 .decision.kind-meta {
   background: rgba(0, 0, 0, 0.03);
+}
+.decision.kind-llm {
+  background: rgba(139, 92, 246, 0.07);  /* purple tint distinguishes LLM-driven cycles */
+  border-left: 3px solid rgba(139, 92, 246, 0.6);
+  padding-left: 10px;
+}
+.decision-reasoning {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: rgba(139, 92, 246, 0.04);
+  border-radius: 6px;
+  font-size: 13px;
+  color: #4c1d95;
+  line-height: 1.5;
+}
+.reasoning-label {
+  font-weight: 600;
+  margin-right: 6px;
+  color: #6d28d9;
 }
 </style>

@@ -30,9 +30,16 @@ from typing import Optional
 
 from quanti.agent.goal import Goal, load_goal, save_goal
 from quanti.agent.selector import StrategySelector
+from quanti.agent.signal_pipeline import (
+    collect_signals_per_strategy,
+    filter_by_threshold,
+    fuse_buy_signals,
+    industry_cap,
+)
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.paper_broker import PaperBroker
+from quanti.factors.cross_sectional import FactorConfig, compute_factor_panel
 from quanti.models import BarData, Direction, Signal
 from quanti.screener.loader import ScreenerLoader
 from quanti.strategy.loader import StrategyLoader
@@ -256,6 +263,166 @@ class AgentRuntime:
         scored.sort(key=lambda x: x[1], reverse=True)
         return [c for c, _ in scored[:20]]  # top-20 candidates
 
+    # --------------------------------------------------- signal generators
+    def _single_strategy_signals(self, strategy, candidates: list[str]) -> list[Signal]:
+        """Run a single strategy over the candidate universe and return its
+        recent (last 3 trading days) signals, deduplicated per (code, direction).
+
+        Extracted from `_run_one_cycle` so both the pin and select-one paths
+        share it without duplication. Older history bars still get fed in so
+        the strategy's internal state (MA buffers, MACD lines, etc.) is fully
+        warmed up before today's bar produces a signal.
+        """
+        end = date.today()
+        start = end - timedelta(days=365)
+        recent_cutoff = end - timedelta(days=3)
+        latest: dict[tuple[str, str], tuple[date, Signal]] = {}
+        for code in candidates:
+            bars = self._provider.get_daily_bars(code, start, end)
+            for bar in bars:
+                if bar.date < recent_cutoff:
+                    strategy.on_bar(bar)
+                    continue
+                produced = strategy.on_bar(bar)
+                for sig in produced:
+                    key = (sig.stock_code, sig.direction.value)
+                    prior = latest.get(key)
+                    if prior is None or bar.date >= prior[0]:
+                        latest[key] = (bar.date, sig)
+        return [v[1] for v in latest.values()]
+
+    def _compute_fused_candidates(
+        self, goal: Goal, candidates: list[str],
+    ) -> tuple[list, list[dict], dict[str, float]]:
+        """Run top-K Selector + factor pipeline → FusedCandidate list.
+
+        Shared between the rule-ensemble and LLM paths. Returns
+        (fused_candidates, evaluations, strategy_weights). Empty list
+        means "no actionable candidates this cycle".
+
+        Logs a `strategy_ensemble` decision as a side-effect — this is the
+        only place we have full attribution and weights, and the audit
+        trail wants it regardless of which downstream path consumes them.
+        """
+        params = goal.params or {}
+        k = int(params.get("top_k_strategies", 3))
+        threshold = float(params.get("signal_threshold", 0.30))
+        factor_blend = float(params.get("factor_blend", 0.5))
+        industry_neutral = bool(params.get("industry_neutral", False))
+        n_per_industry = int(params.get("n_per_industry", 2))
+
+        selector = StrategySelector(self._db, self._provider,
+                                    self._strategies_dir)
+        pairs, ranking = selector.pick_topk(goal, candidates, k=k)
+        evaluations = [e.as_dict() for e in ranking]
+        if not pairs:
+            return [], evaluations, {}
+
+        prepared: list[tuple] = []
+        for strat, weight in pairs:
+            strat.init(dict(params))
+            prepared.append((strat, weight))
+
+        per_strategy, weights = collect_signals_per_strategy(
+            prepared, candidates, self._provider)
+
+        panel = compute_factor_panel(
+            self._provider, self._db, candidates,
+            config=FactorConfig(industry_neutralize=industry_neutral))
+
+        fused = fuse_buy_signals(per_strategy, weights,
+                                 factor_panel=panel,
+                                 factor_blend=factor_blend)
+
+        if industry_neutral:
+            fused = industry_cap(fused, n_per_industry=n_per_industry)
+        fused = filter_by_threshold(fused, threshold=threshold)
+
+        contributing = sorted({s for c in fused for s in c.contributing_strategies})
+        self._db.log_decision(
+            "strategy_ensemble",
+            f"ensemble 选定 {len(pairs)} 个策略: {', '.join(s.name for s, _ in pairs)}",
+            details={
+                "evaluations": evaluations,
+                "weights": {name: round(w, 3) for name, w in weights.items()},
+                "fused_candidates": len(fused),
+                "contributing": contributing,
+                "industry_neutral": industry_neutral,
+            })
+        return fused, evaluations, weights
+
+    def _ensemble_path(self, goal: Goal, candidates: list[str],
+                       ) -> tuple[list[Signal], str, list[dict]]:
+        """Rule-driven ensemble: candidates → signals (no LLM)."""
+        fused, evaluations, _weights = self._compute_fused_candidates(
+            goal, candidates)
+        signals = [c.to_signal() for c in fused]
+        return signals, "ensemble", evaluations
+
+    def _llm_path(self, goal: Goal, candidates: list[str]) -> dict:
+        """LLM-driven path. Uses ensemble for candidate generation, then
+        hands the candidates to Claude for the final pick/sizing decision.
+
+        Returns the cycle result dict directly (this short-circuits the
+        rest of `_run_one_cycle`'s execution + logging — LLM path has its
+        own log entry kind `llm_cycle`).
+
+        If LLM is unavailable (missing API key, anthropic not installed,
+        upstream failure), gracefully falls back to the rule-ensemble path
+        for this tick. The next tick will retry.
+        """
+        from quanti.agent.llm_runtime import (
+            AnthropicLLMClient,
+            LLMConfig,
+            run_llm_decision,
+        )
+
+        fused, evaluations, _weights = self._compute_fused_candidates(
+            goal, candidates)
+        if not fused:
+            self._db.log_decision(
+                "cycle_skip", "LLM 模式: 无候选股",
+                details={"evaluations": evaluations})
+            return {"ok": False, "reason": "LLM 模式: 无候选股",
+                    "evaluations": evaluations}
+
+        params = goal.params or {}
+        cfg = LLMConfig(
+            model=str(params.get("llm_model", "claude-sonnet-4-5")),
+            max_tokens=int(params.get("llm_max_tokens", 4096)),
+            max_tool_iterations=int(params.get("llm_max_iterations", 5)),
+            max_candidates_in_context=int(params.get("llm_max_candidates", 20)),
+            temperature=float(params.get("llm_temperature", 0.3)),
+        )
+
+        # Allow tests / advanced users to inject a custom client via the
+        # runtime attribute. Default to the Anthropic SDK; if its import
+        # fails (no [llm] extra installed), fall back to ensemble path.
+        client = getattr(self, "_llm_client", None)
+        if client is None:
+            try:
+                client = AnthropicLLMClient()
+            except ImportError as e:
+                logger.warning(f"LLM unavailable, falling back to ensemble: {e}")
+                self._db.log_decision(
+                    "llm_unavailable",
+                    "LLM 未安装,降级到 ensemble 路径",
+                    details={"error": str(e)})
+                signals = [c.to_signal() for c in fused]
+                sl = self._broker.check_stop_loss()
+                result = self._broker.execute_signals(signals, "ensemble_fallback")
+                snap = self._broker.snapshot_portfolio()
+                return {"ok": True, "signals": len(signals),
+                        "filled": result.filled, "rejected": result.rejected,
+                        "stop_loss_filled": sl, "snapshot": snap,
+                        "evaluations": evaluations,
+                        "strategy": "ensemble_fallback"}
+
+        return run_llm_decision(
+            db=self._db, broker=self._broker, goal=goal,
+            candidates=fused, llm_client=client, cfg=cfg,
+        ) | {"evaluations": evaluations, "strategy": "llm"}
+
     # ----------------------------------------------------- the actual cycle
     def _run_one_cycle(self) -> dict:
         ts = datetime.now().isoformat()
@@ -275,9 +442,44 @@ class AgentRuntime:
         if not candidates:
             candidates = universe[:30]
 
-        # Pick strategy
+        # Decide path among three options:
+        #   * "llm":      ensemble candidates → Claude judgment (P3).
+        #   * ensemble:   ensemble candidates → direct execute (P2).
+        #   * single:     pin or auto-select one strategy (legacy).
+        # A pinned strategy ALWAYS wins — it's the user's explicit override.
+        params = goal.params or {}
+        agent_mode = str(params.get("agent_mode", "")).lower()
+        if agent_mode == "llm" and not goal.strategy_name:
+            llm_result = self._llm_path(goal, candidates)
+            # Maintain the cycle-end status snapshot so the UI stays fresh.
+            with self._lock:
+                self._status.last_tick_at = ts
+                self._status.last_tick_summary = (
+                    f"LLM 决策: {llm_result.get('filled', 0)} 成交, "
+                    f"{llm_result.get('rejected', 0)} 拒绝")
+                self._status.last_strategy = llm_result.get("strategy", "llm")
+                self._status.last_evaluations = llm_result.get("evaluations", [])
+                snap = llm_result.get("snapshot") or self._broker.snapshot_portfolio()
+                self._status.total_value = snap.get("total_value", 0)
+                self._status.pnl_pct = snap.get("pnl_pct", 0)
+            return llm_result
+
+        ensemble_enabled = (bool(params.get("ensemble_enabled", False))
+                            and not goal.strategy_name)
+
         evaluations: list[dict] = []
-        if goal.strategy_name:
+        signals: list[Signal] = []
+        strategy_name: str = ""
+
+        if ensemble_enabled:
+            signals, strategy_name, evaluations = self._ensemble_path(
+                goal, candidates)
+            if signals is None:
+                summary = "ensemble 模式未能产出信号"
+                self._db.log_decision("cycle_skip", summary,
+                                      details={"evaluations": evaluations})
+                return {"ok": False, "reason": summary}
+        elif goal.strategy_name:
             loader = StrategyLoader()
             strategies = loader.load_directory(self._strategies_dir)
             strategy = next((s for s in strategies
@@ -287,10 +489,12 @@ class AgentRuntime:
                 self._db.log_decision("cycle_skip", summary)
                 return {"ok": False, "reason": summary}
             strategy.init(goal.params or {})
+            strategy_name = strategy.name
             self._db.log_decision(
                 "strategy_pin",
                 f"使用钉选策略：{strategy.name}",
                 details={"strategy": strategy.name, "params": goal.params or {}})
+            signals = self._single_strategy_signals(strategy, candidates)
         else:
             # Re-pick at most once per _reselect_interval. In between, the
             # cached winner is re-loaded as a fresh instance so its internal
@@ -330,31 +534,8 @@ class AgentRuntime:
                     self._selector_cache = None
                     return self._run_one_cycle()
                 strategy.init(goal.params or {})
-
-        # Generate signals — feed each candidate's full history; the strategy
-        # decides if it has enough state to act today.
-        end = date.today()
-        start = end - timedelta(days=365)
-        # (code, direction) → (bar_date, signal). When a strategy emits the
-        # same direction for the same code multiple times in the recent
-        # window we keep only the most recent — otherwise one tick can
-        # produce duplicate buys for the same stock.
-        latest: dict[tuple[str, str], tuple[date, Signal]] = {}
-        for code in candidates:
-            bars = self._provider.get_daily_bars(code, start, end)
-            for bar in bars:
-                if bar.date < end - timedelta(days=3):
-                    # Still feed the bar so the strategy can warm up state,
-                    # but don't act on signals from outside the recent window.
-                    strategy.on_bar(bar)
-                    continue
-                produced = strategy.on_bar(bar)
-                for sig in produced:
-                    key = (sig.stock_code, sig.direction.value)
-                    prior = latest.get(key)
-                    if prior is None or bar.date >= prior[0]:
-                        latest[key] = (bar.date, sig)
-        signals = [v[1] for v in latest.values()]
+            strategy_name = strategy.name
+            signals = self._single_strategy_signals(strategy, candidates)
 
         # Filter SELL signals for codes we don't actually hold — strategies
         # maintain their own state during historical replay and may emit
@@ -369,16 +550,16 @@ class AgentRuntime:
         sl_count = self._broker.check_stop_loss()
 
         # Execute
-        result = self._broker.execute_signals(signals, strategy_name=strategy.name)
+        result = self._broker.execute_signals(signals, strategy_name=strategy_name)
         snap = self._broker.snapshot_portfolio()
 
-        summary = (f"策略 {strategy.name}: 信号 {len(signals)}, 成交 {result.filled}, "
+        summary = (f"策略 {strategy_name}: 信号 {len(signals)}, 成交 {result.filled}, "
                    f"拒绝 {result.rejected}, 止损 {sl_count}, 净值 ¥{snap['total_value']:,.0f} "
                    f"({snap['pnl_pct']:+.2%})")
         self._db.log_decision(
             "cycle", summary,
             details={
-                "strategy": strategy.name, "signals": len(signals),
+                "strategy": strategy_name, "signals": len(signals),
                 "filled": result.filled, "rejected": result.rejected,
                 "stop_loss_filled": sl_count,
                 "total_value": snap["total_value"],
@@ -400,13 +581,13 @@ class AgentRuntime:
         with self._lock:
             self._status.last_tick_at = ts
             self._status.last_tick_summary = summary
-            self._status.last_strategy = strategy.name
+            self._status.last_strategy = strategy_name
             self._status.last_evaluations = evaluations
             self._status.total_value = snap["total_value"]
             self._status.pnl_pct = snap["pnl_pct"]
         return {
             "ok": True, "summary": summary,
-            "strategy": strategy.name, "signals": len(signals),
+            "strategy": strategy_name, "signals": len(signals),
             "filled": result.filled, "rejected": result.rejected,
             "stop_loss_filled": sl_count,
             "snapshot": snap, "evaluations": evaluations,
