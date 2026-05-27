@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from quanti.agent.runtime import AgentRuntime
+from quanti.data.background_sync import BackgroundQuoteSyncer
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.paper_broker import PaperBroker
@@ -27,6 +28,7 @@ def create_app(
     screeners_dir: str | None = "screeners",
     initial_cash: float = 1_000_000.0,
     autostart_agent: bool = False,
+    autostart_background_sync: bool = True,
 ) -> FastAPI:
     if db is None:
         db = Database()
@@ -37,6 +39,11 @@ def create_app(
         db=db, provider=provider, broker=broker,
         strategies_dir=strategies_dir or "strategies",
         screeners_dir=screeners_dir or "screeners")
+    # Independent daemon that keeps daily_quotes fresh, decoupled from the
+    # agent's 4h tick. Auto-starts by default so cold-start users don't
+    # have to know about it; tests pass autostart_background_sync=False
+    # to keep test runs hermetic.
+    bg_sync = BackgroundQuoteSyncer(db=db)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
@@ -47,12 +54,21 @@ def create_app(
                 agent.start()
         except Exception:
             pass
+        if autostart_background_sync:
+            try:
+                bg_sync.start()
+            except Exception:
+                pass
         yield
         # Process shutdown — halt the thread but do NOT flip the goal back
         # to disabled, otherwise the agent would never auto-resume across
         # server restarts. User-driven stop goes through agent.stop().
         try:
             agent.shutdown()
+        except Exception:
+            pass
+        try:
+            bg_sync.shutdown(timeout=3.0)
         except Exception:
             pass
 
@@ -71,6 +87,7 @@ def create_app(
     app.state.screeners_dir = screeners_dir
     app.state.broker = broker
     app.state.agent = agent
+    app.state.bg_sync = bg_sync
 
     from quanti.api.routes import router
 

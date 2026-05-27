@@ -205,6 +205,55 @@ async def health():
     return {"status": "ok"}
 
 
+@router.get("/sync/background/status")
+async def background_sync_status(request: Request):
+    """Read the live status of the BackgroundQuoteSyncer daemon.
+
+    Returns a JSON snapshot of where the syncer is (active / idle / paused),
+    how much of the universe it's already pulled this session, what code
+    it's working on right now, and the most recent error if any. The
+    frontend Dashboard polls this every ~10s.
+    """
+    bg = getattr(request.app.state, "bg_sync", None)
+    if bg is None:
+        return {"enabled": False, "running": False, "state": "disabled"}
+    s = bg.status()
+    return {
+        "enabled": s.enabled,
+        "running": s.running,
+        "state": s.state,
+        "started_at": s.started_at,
+        "last_loop_at": s.last_loop_at,
+        "current_code": s.current_code,
+        "queue_remaining": s.queue_remaining,
+        "synced_session": s.synced_session,
+        "failed_session": s.failed_session,
+        "last_full_scan_at": s.last_full_scan_at,
+        "last_error": s.last_error,
+        "config": s.config,
+    }
+
+
+@router.post("/sync/background/pause")
+async def background_sync_pause(request: Request):
+    """Pause the background syncer (e.g. to free up bandwidth during
+    a one-off bulk sync). Survives until /sync/background/resume."""
+    bg = getattr(request.app.state, "bg_sync", None)
+    if bg is None:
+        return {"ok": False, "reason": "background syncer not initialized"}
+    bg.pause()
+    return {"ok": True, "state": bg.status().state}
+
+
+@router.post("/sync/background/resume")
+async def background_sync_resume(request: Request):
+    bg = getattr(request.app.state, "bg_sync", None)
+    if bg is None:
+        return {"ok": False, "reason": "background syncer not initialized"}
+    bg.resume()
+    return {"ok": True, "state": bg.status().state}
+
+
 @router.post("/sync/stocks")
 async def sync_stock_list(request: Request):
     """Sync the full A-share stock list (name, industry, exchange, list_date)."""

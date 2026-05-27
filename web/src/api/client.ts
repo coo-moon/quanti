@@ -79,6 +79,28 @@ export const fetchQuotesSyncStatus = (jobId: string) =>
 export const syncStockList = () =>
   api.post<{ synced: number; message: string }>("/sync/stocks");
 
+// --- Background quote syncer (continuous daemon, decoupled from agent tick) ---
+export interface BackgroundSyncStatus {
+  enabled: boolean;
+  running: boolean;
+  state: "stopped" | "active" | "idle" | "paused" | "disabled";
+  started_at: string | null;
+  last_loop_at: string | null;
+  current_code: string | null;
+  queue_remaining: number;
+  synced_session: number;
+  failed_session: number;
+  last_full_scan_at: string | null;
+  last_error: string | null;
+  config: Record<string, number>;
+}
+export const fetchBackgroundSyncStatus = () =>
+  api.get<BackgroundSyncStatus>("/sync/background/status");
+export const pauseBackgroundSync = () =>
+  api.post<{ ok: boolean; state: string }>("/sync/background/pause");
+export const resumeBackgroundSync = () =>
+  api.post<{ ok: boolean; state: string }>("/sync/background/resume");
+
 export const runBacktest = (req: BacktestRequest) =>
   api.post<BacktestResult>("/backtest/run", req);
 

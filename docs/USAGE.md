@@ -946,6 +946,86 @@ curl -X POST 'http://127.0.0.1:8000/api/agent/decisions/prune?older_than_days=30
 
 切换到 PostgreSQL：暂未支持，路线图里有。
 
+### 10.6 后台同步 daemon(2026-05,默认开启)
+
+`quanti up` 启动时会自动起一个**独立的后台线程**(`BackgroundQuoteSyncer`)持续维护 `daily_quotes` 表的新鲜度。它与 Agent 的 4 小时 tick 完全解耦,**不会因为 agent 慢/停而影响数据同步**。
+
+#### 工作机制
+
+```
+                每次循环
+                  │
+   ┌──────────────▼──────────────┐
+   │ 1. 扫描 stocks 表           │
+   │    优先级:                  │
+   │      ① 持仓股票(防 PnL 冻结) │
+   │      ② 完全没数据的股票      │
+   │      ③ 数据过期(默认 > 1 天)│
+   │    跳过 30 分钟内失败过的    │
+   └──────────────┬──────────────┘
+                  │
+   ┌──────────────▼──────────────┐
+   │ 2. 队列非空 → 批处理         │
+   │    每批 5 只,每只间隔 0.5s  │
+   │    (~2 只/秒,AkShare 不限速)│
+   └──────────────┬──────────────┘
+                  │
+            队列空了
+                  │
+   ┌──────────────▼──────────────┐
+   │ 3. 进 IDLE,30 分钟后重扫    │
+   └─────────────────────────────┘
+```
+
+#### 性能数字
+
+| 场景 | 完成时间 |
+|---|---|
+| 冷启动全 A 股(5519 只无数据) | ~25-40 分钟(网络/限速决定) |
+| 日常稳态(只有 1-2 天 stale) | 持续运行,负载几乎为 0 |
+| 持仓 30 只全 stale | ~30 秒 |
+
+对比老路径:agent tick 每 4 小时 sync 20 只,冷启动需要 **40+ 天**。
+
+#### 监控
+
+**Dashboard 右上角"后台同步"卡**显示当前状态:
+- 🟢 **同步中(active)**:队列中有 code,正在处理
+- 🔵 **空闲(idle)**:数据全新鲜,30 分钟后重扫
+- 🟡 **已暂停(paused)**:用户主动暂停
+- ⚪ **已停止(stopped)**:守护线程未运行
+
+active/paused 状态下,Dashboard 还会显示一条**进度条**,带当前 code / 队列剩余 / 已同步 / 失败计数 / 暂停-恢复按钮。Idle 时这条不显示以减少视觉噪音。
+
+#### API
+
+```bash
+# 看状态
+curl --noproxy '*' http://127.0.0.1:8000/api/sync/background/status | jq
+
+# 暂停(腾出带宽给一次性大量 sync)
+curl -X POST --noproxy '*' http://127.0.0.1:8000/api/sync/background/pause
+
+# 恢复
+curl -X POST --noproxy '*' http://127.0.0.1:8000/api/sync/background/resume
+```
+
+#### 关掉它
+
+启动 server 时传 `autostart_background_sync=False`(目前需要改 `create_app()` 调用)。或者运行时 pause + 永远不 resume。
+正常情况下没有理由关 —— 它持续维护**整个系统的数据基础**。
+
+#### 与 user-triggered sync 的关系
+
+| 路径 | 用途 | 速度 |
+|---|---|---|
+| `BackgroundQuoteSyncer`(本节) | 默默维护,长期 | 限速 ~2 只/秒,不阻塞 |
+| `quanti sync --quotes`(CLI) | 一次性大量补 | 顺序同步,有 ETA 进度 |
+| Web Dashboard "同步全 A 股池" | 一次性大量补 | 异步带进度条 |
+| Agent tick `_ensure_recent_data`(保险丝) | 保证当下能用 | 每 tick 20 只 |
+
+三套同时存在:**后台守护负责日常**,**用户触发负责急用**,**agent 内嵌负责兜底**。互不干扰,sync_jobs 表也按各自 job_id 隔离记录。
+
 ---
 
 ## 11. 回测

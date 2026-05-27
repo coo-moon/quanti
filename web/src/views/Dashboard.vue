@@ -42,6 +42,44 @@
           <span class="stat-value stat-value-sm">{{ lastUpdate }}</span>
         </div>
       </div>
+      <!-- Background syncer status card -->
+      <div class="stat-card" :class="bgSyncCardClass" :title="bgSyncTooltip">
+        <div class="stat-icon" :class="bgSyncIconClass">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+            <path d="M16 4v4h-4M4 16v-4h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+            <path d="M16 8a6 6 0 00-11.5-2M4 12a6 6 0 0011.5 2" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </div>
+        <div class="stat-info">
+          <span class="stat-label">后台同步</span>
+          <span class="stat-value stat-value-sm">{{ bgSyncStateLabel }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Background syncer progress (only when active or paused, to avoid noise when idle) -->
+    <div
+      v-if="bgSync && bgSync.state !== 'idle' && bgSync.state !== 'stopped'"
+      class="bg-sync-bar"
+      :class="`bg-sync-${bgSync.state}`"
+    >
+      <div class="bg-sync-row">
+        <span class="bg-sync-label">
+          后台同步 ·
+          <strong>{{ bgSyncStateLabel }}</strong>
+          <span v-if="bgSync.current_code"> · 当前 {{ bgSync.current_code }}</span>
+        </span>
+        <span class="bg-sync-stats">
+          已同步 {{ bgSync.synced_session }} · 失败 {{ bgSync.failed_session }} · 队列剩余 {{ bgSync.queue_remaining }}
+        </span>
+        <button
+          v-if="bgSync.state === 'active'"
+          class="btn-link"
+          @click="pauseSync"
+        >暂停</button>
+        <button v-else-if="bgSync.state === 'paused'" class="btn-link" @click="resumeSync">恢复</button>
+      </div>
+      <div v-if="bgSync.last_error" class="bg-sync-error">最近错误: {{ bgSync.last_error }}</div>
     </div>
 
     <!-- Add Stock -->
@@ -142,8 +180,22 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from "vue";
-import { fetchStocks, fetchStockStats, syncQuotes, syncStockList, syncQuotesAsync, fetchQuotesSyncStatus, type StockInfo, type StockPoolStats, type SyncStatus } from "../api/client";
+import { ref, reactive, computed, onMounted, onUnmounted } from "vue";
+import {
+  fetchStocks,
+  fetchStockStats,
+  syncQuotes,
+  syncStockList,
+  syncQuotesAsync,
+  fetchQuotesSyncStatus,
+  fetchBackgroundSyncStatus,
+  pauseBackgroundSync,
+  resumeBackgroundSync,
+  type StockInfo,
+  type StockPoolStats,
+  type SyncStatus,
+  type BackgroundSyncStatus,
+} from "../api/client";
 
 const stocks = ref<StockInfo[]>([]);
 const poolStats = ref<StockPoolStats | null>(null);
@@ -158,12 +210,85 @@ const syncJobId = ref<string | null>(null);
 const syncProgress = ref<SyncStatus>({ job_id: "", current: 0, total: 0, status: "", errors: {}, message: "", eta_seconds: null });
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+// Background syncer state (polled every 10s while the page is open).
+const bgSync = ref<BackgroundSyncStatus | null>(null);
+let bgSyncTimer: ReturnType<typeof setInterval> | null = null;
+
 const lastUpdate = computed(() => {
   return new Date().toLocaleDateString("zh-CN");
 });
 
+const bgSyncStateLabel = computed(() => {
+  if (!bgSync.value) return "未连接";
+  const s = bgSync.value.state;
+  if (s === "active") return "同步中";
+  if (s === "idle") return "空闲(已最新)";
+  if (s === "paused") return "已暂停";
+  if (s === "stopped") return "已停止";
+  if (s === "disabled") return "未启用";
+  return s;
+});
+
+const bgSyncCardClass = computed(() => {
+  if (!bgSync.value) return "";
+  return `bg-${bgSync.value.state}`;
+});
+
+const bgSyncIconClass = computed(() => {
+  if (!bgSync.value) return "blue";
+  const s = bgSync.value.state;
+  if (s === "active") return "green";
+  if (s === "idle") return "blue";
+  if (s === "paused") return "amber";
+  return "muted";
+});
+
+const bgSyncTooltip = computed(() => {
+  if (!bgSync.value) return "后台同步未连接";
+  const s = bgSync.value;
+  const parts = [
+    `状态: ${bgSyncStateLabel.value}`,
+    `本次会话已同步: ${s.synced_session}`,
+    `失败: ${s.failed_session}`,
+    `队列剩余: ${s.queue_remaining}`,
+  ];
+  if (s.current_code) parts.push(`当前: ${s.current_code}`);
+  if (s.last_full_scan_at) parts.push(`上次扫描: ${s.last_full_scan_at}`);
+  return parts.join(" · ");
+});
+
+async function refreshBgSync() {
+  try {
+    const r = await fetchBackgroundSyncStatus();
+    bgSync.value = r.data;
+  } catch (e) {
+    // Silently swallow — endpoint may not exist on older deploys.
+  }
+}
+
+async function pauseSync() {
+  await pauseBackgroundSync();
+  await refreshBgSync();
+}
+
+async function resumeSync() {
+  await resumeBackgroundSync();
+  await refreshBgSync();
+}
+
 onMounted(async () => {
   await loadStocks();
+  await refreshBgSync();
+  // Poll background sync every 10s — fast enough to feel live without
+  // hammering the API.
+  bgSyncTimer = setInterval(refreshBgSync, 10_000);
+});
+
+onUnmounted(() => {
+  if (bgSyncTimer) {
+    clearInterval(bgSyncTimer);
+    bgSyncTimer = null;
+  }
 });
 
 async function loadStocks() {
@@ -715,5 +840,58 @@ tbody tr:last-child td {
 .exchange-tag.sz {
   background: rgba(175, 82, 222, 0.08);
   color: #af52de;
+}
+
+/* Background syncer stat card: subtle state coloring on the card itself */
+.stat-card.bg-active {
+  background: linear-gradient(180deg, rgba(22, 163, 74, 0.05), transparent);
+}
+.stat-card.bg-paused {
+  background: linear-gradient(180deg, rgba(245, 158, 11, 0.06), transparent);
+}
+.stat-card.bg-stopped,
+.stat-card.bg-disabled {
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.03), transparent);
+}
+.stat-icon.amber {
+  background: rgba(245, 158, 11, 0.12);
+  color: #d97706;
+}
+.stat-icon.muted {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--color-text-secondary);
+}
+
+/* Detailed progress strip — only shown when active or paused, to avoid
+   permanent noise once the syncer reaches idle steady-state. */
+.bg-sync-bar {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(22, 163, 74, 0.06);
+  border-left: 3px solid rgba(22, 163, 74, 0.5);
+  font-size: 13px;
+}
+.bg-sync-bar.bg-sync-paused {
+  background: rgba(245, 158, 11, 0.07);
+  border-left-color: rgba(245, 158, 11, 0.6);
+}
+.bg-sync-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.bg-sync-row .bg-sync-label {
+  flex: 1 1 auto;
+}
+.bg-sync-row .bg-sync-stats {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+.bg-sync-error {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #b91c1c;
 }
 </style>
