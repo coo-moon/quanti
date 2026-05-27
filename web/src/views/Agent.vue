@@ -31,6 +31,12 @@
           <span class="stat-value stat-value-sm">{{ agentStatusStr }}</span>
         </div>
       </div>
+      <div class="stat-card" :class="modeClass">
+        <div class="stat-info">
+          <span class="stat-label">运行模式</span>
+          <span class="stat-value stat-value-sm">{{ modeLabel }}</span>
+        </div>
+      </div>
     </div>
 
     <!-- Goal editor -->
@@ -88,6 +94,72 @@
       <div v-if="message" class="sync-msg" :class="messageError ? 'error' : 'success'">
         {{ message }}
       </div>
+    </div>
+
+    <!-- Agent mode + upgrades (P1-P4) -->
+    <div class="card">
+      <div class="card-header">
+        <h2>Agent 模式</h2>
+        <span class="muted">钉死策略时模式无效 — 钉选优先</span>
+      </div>
+      <div class="mode-presets">
+        <button
+          type="button"
+          class="mode-pill"
+          :class="{ 'mode-active mode-rule-active': advParams.agent_mode === 'rule' }"
+          @click="applyPreset('rule')"
+        >
+          <div class="mode-title">经典 (rule)</div>
+          <div class="mode-desc">单策略 · Selector 24h cache · 不开因子/LLM</div>
+        </button>
+        <button
+          type="button"
+          class="mode-pill"
+          :class="{ 'mode-active mode-ensemble-active': advParams.agent_mode === 'ensemble' }"
+          @click="applyPreset('ensemble')"
+        >
+          <div class="mode-title">集成 (ensemble)</div>
+          <div class="mode-desc">Top-K 策略加权 + 截面因子 + 流动性清洗 + 行业中性</div>
+        </button>
+        <button
+          type="button"
+          class="mode-pill"
+          :class="{ 'mode-active mode-llm-active': advParams.agent_mode === 'llm' }"
+          @click="applyPreset('llm')"
+        >
+          <div class="mode-title">LLM 决策</div>
+          <div class="mode-desc">ensemble 候选 → Claude 拍板 · 需 ANTHROPIC_API_KEY</div>
+        </button>
+      </div>
+      <details class="advanced">
+        <summary>高级开关(单独细调,会覆盖预设)</summary>
+        <div class="adv-grid">
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.ensemble_enabled" />
+            <span>ensemble_enabled</span>
+            <em>Top-K 策略融合;关闭则走单策略</em>
+          </label>
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.industry_neutral" />
+            <span>industry_neutral</span>
+            <em>每行业最多 2 个候选,避免行业过度集中</em>
+          </label>
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.liquidity_filter" />
+            <span>liquidity_filter</span>
+            <em>排除停牌/新股/低流动性,从全市场筛到 ~1000 只</em>
+          </label>
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.wf_enabled" />
+            <span>wf_enabled</span>
+            <em>walk-forward 滚动验证,杜绝单窗 IS 过拟合</em>
+          </label>
+        </div>
+        <div class="adv-note">
+          预设按钮会重置这四项;手动改完后下方保存目标按钮才会落库。LLM 模式额外需要
+          <code>pip install -e '.[llm]'</code> 和 <code>ANTHROPIC_API_KEY</code>。
+        </div>
+      </details>
     </div>
 
     <!-- Portfolio + positions -->
@@ -240,6 +312,63 @@ const goalDraft = reactive<Goal>({
   enabled: false,
 });
 
+// Agent mode + P1-P4 upgrade switches. Mirrors a subset of goalDraft.params
+// for direct UI binding. Synced both directions: loadAll() pulls server →
+// advParams via syncAdvFromParams; saveGoal() pushes advParams → goalDraft.params
+// via syncParamsFromAdv right before sending.
+type AgentMode = "rule" | "ensemble" | "llm";
+const advParams = reactive({
+  agent_mode: "rule" as AgentMode,
+  ensemble_enabled: false,
+  industry_neutral: false,
+  liquidity_filter: false,
+  wf_enabled: true, // default-on
+});
+
+function syncAdvFromParams() {
+  const p = (goalDraft.params || {}) as Record<string, unknown>;
+  const ensemble = !!p.ensemble_enabled;
+  const isLLM = p.agent_mode === "llm";
+  advParams.agent_mode = isLLM ? "llm" : ensemble ? "ensemble" : "rule";
+  advParams.ensemble_enabled = ensemble || isLLM;
+  advParams.industry_neutral = !!p.industry_neutral;
+  advParams.liquidity_filter = !!p.liquidity_filter;
+  advParams.wf_enabled = p.wf_enabled !== false; // default true if absent
+}
+
+function syncParamsFromAdv() {
+  // Preserve any unknown keys the user may have set via API/MCP.
+  const existing = (goalDraft.params || {}) as Record<string, unknown>;
+  goalDraft.params = {
+    ...existing,
+    agent_mode: advParams.agent_mode === "llm" ? "llm" : "",
+    ensemble_enabled:
+      advParams.ensemble_enabled ||
+      advParams.agent_mode === "ensemble" ||
+      advParams.agent_mode === "llm",
+    industry_neutral: advParams.industry_neutral,
+    liquidity_filter: advParams.liquidity_filter,
+    wf_enabled: advParams.wf_enabled,
+  };
+}
+
+function applyPreset(mode: AgentMode) {
+  advParams.agent_mode = mode;
+  if (mode === "rule") {
+    advParams.ensemble_enabled = false;
+    advParams.industry_neutral = false;
+    advParams.liquidity_filter = false;
+    advParams.wf_enabled = true;
+  } else {
+    // ensemble and llm share the same selection-side configuration; LLM
+    // just adds the Claude decision layer on top of those candidates.
+    advParams.ensemble_enabled = true;
+    advParams.industry_neutral = true;
+    advParams.liquidity_filter = true;
+    advParams.wf_enabled = true;
+  }
+}
+
 const portfolio = ref<Portfolio | null>(null);
 const agent = ref<AgentStatus | null>(null);
 const decisions = ref<DecisionRecord[]>([]);
@@ -298,6 +427,23 @@ const agentStatusClass = computed(() => {
   return agent.value.running ? "up" : "muted-card";
 });
 
+// Mode badge derived from the live (post-save) advParams state.
+// If the user pinned a strategy, all params are inert — show "钉死策略"
+// so they're not confused by a mode badge that does nothing.
+const modeLabel = computed(() => {
+  if (goalDraft.strategy_name) return `钉死: ${goalDraft.strategy_name}`;
+  if (advParams.agent_mode === "llm") return "LLM 决策";
+  if (advParams.agent_mode === "ensemble") return "集成 (ensemble)";
+  return "经典 (rule)";
+});
+
+const modeClass = computed(() => {
+  if (goalDraft.strategy_name) return "mode-pinned";
+  if (advParams.agent_mode === "llm") return "mode-llm";
+  if (advParams.agent_mode === "ensemble") return "mode-ensemble";
+  return "mode-rule";
+});
+
 function kindClass(kind: string) {
   if (kind === "trade") return "kind-trade";
   if (kind === "risk_reject") return "kind-warn";
@@ -319,6 +465,7 @@ async function loadAll() {
     fetchScreeners(),
   ]);
   Object.assign(goalDraft, g.data);
+  syncAdvFromParams();
   portfolio.value = p.data;
   agent.value = a.data;
   decisions.value = d.data;
@@ -334,6 +481,8 @@ async function loadDecisions() {
 async function saveGoal() {
   saving.value = true;
   try {
+    // Push the mode/upgrade switches into goalDraft.params right before sending.
+    syncParamsFromAdv();
     await updateGoal(goalDraft);
     setMessage("目标已保存");
   } catch (e: any) {
@@ -663,5 +812,119 @@ onUnmounted(() => {
   font-weight: 600;
   margin-right: 6px;
   color: #6d28d9;
+}
+
+/* Mode badge: surfaces which agent path will run on the next tick. */
+.stat-card.mode-rule {
+  background: rgba(107, 114, 128, 0.08);
+}
+.stat-card.mode-ensemble {
+  background: rgba(22, 163, 74, 0.08);
+}
+.stat-card.mode-llm {
+  background: rgba(139, 92, 246, 0.10);
+  border: 1px solid rgba(139, 92, 246, 0.25);
+}
+.stat-card.mode-pinned {
+  background: rgba(245, 158, 11, 0.10);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+}
+
+/* Mode picker pills: three radio-like clickable cards. */
+.mode-presets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.mode-pill {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 12px 14px;
+  background: rgba(0, 0, 0, 0.02);
+  border: 1.5px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: left;
+}
+.mode-pill:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+.mode-pill .mode-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.mode-pill .mode-desc {
+  font-size: 11.5px;
+  color: var(--color-text-secondary);
+  line-height: 1.45;
+}
+.mode-pill.mode-active {
+  background: rgba(0, 113, 227, 0.05);
+}
+.mode-pill.mode-rule-active {
+  border-color: rgba(107, 114, 128, 0.5);
+  background: rgba(107, 114, 128, 0.08);
+}
+.mode-pill.mode-ensemble-active {
+  border-color: rgba(22, 163, 74, 0.5);
+  background: rgba(22, 163, 74, 0.08);
+}
+.mode-pill.mode-llm-active {
+  border-color: rgba(139, 92, 246, 0.5);
+  background: rgba(139, 92, 246, 0.10);
+}
+
+/* Advanced switches (folded by default). */
+.advanced {
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.advanced summary {
+  cursor: pointer;
+  font-weight: 600;
+  user-select: none;
+}
+.adv-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px 16px;
+  margin-top: 10px;
+}
+.adv-check {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 6px 8px;
+  padding: 4px 0;
+}
+.adv-check span {
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 12.5px;
+  color: #1e3a8a;
+}
+.adv-check em {
+  grid-column: 2;
+  font-style: normal;
+  color: var(--color-text-secondary);
+  font-size: 11.5px;
+}
+.adv-note {
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+.adv-note code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
 }
 </style>
