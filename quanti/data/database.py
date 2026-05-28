@@ -11,27 +11,99 @@ import pandas as pd
 from quanti.models import StockInfo
 
 
+import threading
+
+
+class _LockedConnection:
+    """sqlite3.Connection wrapper that serializes all execute/commit/etc
+    operations behind a shared lock.
+
+    Reason for existing: the original Database held a single sqlite3.Connection
+    with check_same_thread=False but no synchronization. As of 2026-05-28
+    we have multiple writer threads (AgentRuntime, BackgroundQuoteSyncer,
+    user-triggered API syncs) hitting the same connection concurrently,
+    which produces SQLite "bad parameter or other API misuse" errors
+    because the connection's internal cursor/transaction state corrupts.
+
+    The fix is to serialize everything through one re-entrant lock.
+    SQLite is fundamentally single-writer anyway — serializing in Python
+    just stops us from corrupting the API.
+
+    Why a thin wrapper instead of `with db._lock` everywhere: the codebase
+    has ~80 call sites of `self.conn.execute(...)` / `pd.read_sql_query(...,
+    self.conn)`. Wrapping the connection itself touches one file.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._conn = conn
+        self._lock = lock
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            return self._conn.execute(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._lock:
+            return self._conn.executescript(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._lock:
+            return self._conn.executemany(*args, **kwargs)
+
+    def commit(self):
+        with self._lock:
+            return self._conn.commit()
+
+    def rollback(self):
+        with self._lock:
+            return self._conn.rollback()
+
+    def cursor(self):
+        # Cursors are caller-managed; the lock should be held by the caller
+        # while iterating. In this codebase cursors are only used briefly
+        # and we don't have a documented pattern for them, so this is
+        # best-effort — wrap individual cursor operations.
+        with self._lock:
+            return self._conn.cursor()
+
+    def close(self):
+        with self._lock:
+            return self._conn.close()
+
+    # pandas.read_sql_query passes the connection through DBAPI cursor
+    # introspection. Expose the lock-acquiring proxy attributes it needs.
+    def __getattr__(self, name):
+        # Anything we didn't wrap (e.g. row_factory, in_transaction) falls
+        # through. These don't mutate the cursor state so are safe to
+        # access without the lock; pandas only reads them.
+        return getattr(self._conn, name)
+
+
 class Database:
     """SQLite-based storage for market data."""
 
     def __init__(self, db_path: str = "data/quanti.db"):
         self._db_path = db_path
-        self._conn: sqlite3.Connection | None = None
+        self._raw_conn: sqlite3.Connection | None = None
+        self._conn: _LockedConnection | None = None
+        self._db_lock = threading.RLock()
 
     def initialize(self) -> None:
         """Create database and tables."""
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._raw_conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._raw_conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = _LockedConnection(self._raw_conn, self._db_lock)
         self._create_tables()
 
     def close(self) -> None:
         if self._conn:
             self._conn.close()
             self._conn = None
+            self._raw_conn = None
 
     @property
-    def conn(self) -> sqlite3.Connection:
+    def conn(self):
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         return self._conn
@@ -270,17 +342,26 @@ class Database:
     def get_daily_quotes(
         self, code: str, start: date, end: date
     ) -> pd.DataFrame:
-        """Get daily quotes for a stock within date range."""
-        df = pd.read_sql_query(
-            """
-            SELECT code, date, open, high, low, close, volume, amount, turnover
-            FROM daily_quotes
-            WHERE code=? AND date>=? AND date<=?
-            ORDER BY date
-            """,
-            self.conn,
-            params=(code, start.isoformat(), end.isoformat()),
-        )
+        """Get daily quotes for a stock within date range.
+
+        pandas.read_sql_query iterates a cursor internally — our
+        _LockedConnection wrapper only locks each method call, not the
+        whole multi-step iteration. So we hold the DB lock manually
+        around the read to prevent it racing with the BackgroundQuoteSyncer
+        writer thread. SQLite's "bad parameter or other API misuse" was
+        the symptom of that race.
+        """
+        with self._db_lock:
+            df = pd.read_sql_query(
+                """
+                SELECT code, date, open, high, low, close, volume, amount, turnover
+                FROM daily_quotes
+                WHERE code=? AND date>=? AND date<=?
+                ORDER BY date
+                """,
+                self._raw_conn,
+                params=(code, start.isoformat(), end.isoformat()),
+            )
         if not df.empty:
             df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
