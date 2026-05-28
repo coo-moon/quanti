@@ -154,14 +154,16 @@ class TestNoScreenerFallback:
         save_goal(filtered_db, Goal(target_annual_return=0.20))
         # Pre-resolve universe with no liquidity filter.
         codes = agent._resolve_universe(Goal())
-        # Run with no screener → fallback path. Need to invoke the cycle path
-        # logic; we'll directly test by checking what _run_screener does on
-        # an empty-screener Goal then verify sort.
+        # No-screener path should return [] from `_run_screener` so the
+        # caller knows to fall back to ADV-ranked top-N selection. Old
+        # behavior was `return codes` which silently shipped the entire
+        # universe into the ensemble path, producing thousands of signals.
         screened = agent._run_screener(Goal(), codes)
-        # No screener → returns codes unchanged.
-        assert screened == codes
-        # The fallback sorting happens AFTER screener returns nothing useful;
-        # exercise it via sort_by_adv20 directly to confirm ordering.
+        assert screened == [], (
+            f"empty screener should return [] to trigger ADV fallback, "
+            f"got {len(screened)} codes")
+        # The fallback sorting happens in the runtime cycle; exercise it
+        # directly to confirm ordering.
         from quanti.agent.universe import sort_by_adv20
         sorted_codes = sort_by_adv20(provider, codes)
         # First three should be the 2e8 ADV liquids; illiquids (8e6 / 9e6)
@@ -172,6 +174,36 @@ class TestNoScreenerFallback:
             f"top 3 by ADV should be liquids, got {top3}"
         assert bottom2 == {"000040", "000050"}, \
             f"bottom 2 by ADV should be illiquids, got {bottom2}"
+
+    def test_no_screener_take_actually_caps_candidates(self, filtered_db):
+        """End-to-end regression for the 2026-05-28 bug: when no screener
+        was configured AND the universe was big (e.g. 4000+ after the P4
+        liquidity filter started letting more codes through as data fills
+        in), the runtime shipped the entire universe to the ensemble path,
+        which then produced one BUY signal per code (1144+ in production)
+        instead of being capped to `no_screener_take` (default 100).
+
+        The fix routed empty-screener returns through the `if not candidates`
+        fallback. This test pins that behavior."""
+        from quanti.agent.universe import sort_by_adv20
+
+        provider = DataProvider(filtered_db)
+        broker = PaperBroker(filtered_db, provider, initial_cash=1_000_000)
+        agent = AgentRuntime(filtered_db, provider, broker,
+                             strategies_dir="strategies",
+                             screeners_dir="screeners")
+        # Use a tight cap so the test stays fast and unambiguous.
+        save_goal(filtered_db, Goal(
+            target_annual_return=0.20,
+            params={"no_screener_take": 3}))
+        # Manually replay what _run_one_cycle does up to candidate selection.
+        universe = agent._resolve_universe(Goal())
+        candidates = agent._run_screener(Goal(), universe)
+        if not candidates:
+            take = 3
+            candidates = sort_by_adv20(provider, universe)[:take]
+        assert len(candidates) == 3, (
+            f"no_screener_take=3 should cap candidates to 3, got {len(candidates)}")
 
 
 class TestConfigurableSelectorCap:

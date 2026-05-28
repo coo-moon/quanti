@@ -304,8 +304,13 @@ class AgentRuntime:
                 logger.warning(f"Agent data refresh failed for {c}: {e}")
 
     def _run_screener(self, goal: Goal, codes: list[str]) -> list[str]:
+        # No screener configured → return [] so the caller falls back to
+        # the ADV-ranked top-N selection. The old `return codes` shortcut
+        # accidentally pushed the full universe (4000+ codes after the P4
+        # liquidity filter) through to the ensemble path, producing
+        # thousands of signals per tick that the broker couldn't handle.
         if not goal.screener_name:
-            return codes
+            return []
         loader = ScreenerLoader()
         screeners = loader.load_directory(self._screeners_dir)
         screener = next((s for s in screeners if s.name == goal.screener_name), None)
