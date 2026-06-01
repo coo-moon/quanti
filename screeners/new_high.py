@@ -8,7 +8,8 @@ class NewHighScreener(BaseScreener):
     """Select stocks breaking N-day highs (momentum)."""
 
     name = "new_high"
-    description = "创新高选股：筛选创N日新高的强势股票"
+    name_zh = "创新高"
+    description = "筛选创 N 日(默认 60 日)新高的强势股票(动量突破)"
 
     def init(self, config: dict) -> None:
         self.period = config.get("period", 60)

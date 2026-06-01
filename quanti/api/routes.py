@@ -500,7 +500,14 @@ async def list_screeners(request: Request):
         loader = ScreenerLoader()
         all_screeners = loader.load_directory(screeners_dir)
 
-    return [{"name": s.name, "description": s.description} for s in all_screeners]
+    return [
+        {
+            "name": s.name,
+            "name_zh": getattr(s, "name_zh", "") or s.name,
+            "description": s.description,
+        }
+        for s in all_screeners
+    ]
 
 
 @router.post("/screen/run")
@@ -767,7 +774,14 @@ async def list_strategies(request: Request):
     if not strategies_dir:
         return []
     loader = StrategyLoader()
-    return [{"name": s.name} for s in loader.load_directory(strategies_dir)]
+    return [
+        {
+            "name": s.name,
+            "name_zh": getattr(s, "name_zh", "") or s.name,
+            "description": getattr(s, "description", "") or "",
+        }
+        for s in loader.load_directory(strategies_dir)
+    ]
 
 
 @router.post("/backtest/run")

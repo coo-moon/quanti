@@ -8,6 +8,8 @@ class MACDCrossStrategy(BaseStrategy):
     """Buy on MACD golden cross (DIF crosses above DEA), sell on death cross."""
 
     name = "macd_cross"
+    name_zh = "MACD 金叉"
+    description = "MACD 金叉(DIF 上穿 DEA)买入,死叉(DIF 下穿 DEA)卖出"
 
     def init(self, config: dict) -> None:
         self.fast = config.get("fast", 12)

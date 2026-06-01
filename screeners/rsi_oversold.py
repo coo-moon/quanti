@@ -10,7 +10,8 @@ class RSIOversoldScreener(BaseScreener):
     """Select stocks with RSI below oversold threshold (potential bounce)."""
 
     name = "rsi_oversold"
-    description = "RSI超卖选股：筛选RSI低于阈值的超卖股票"
+    name_zh = "RSI 超卖"
+    description = "筛选 RSI 低于阈值的超卖股票(反弹候选)"
 
     def init(self, config: dict) -> None:
         self.period = config.get("period", 14)

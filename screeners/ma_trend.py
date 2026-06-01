@@ -8,7 +8,8 @@ class MATrendScreener(BaseScreener):
     """Select stocks where short MA > medium MA > long MA (bullish alignment)."""
 
     name = "ma_trend"
-    description = "均线多头选股：筛选短期>中期>长期均线多头排列的股票"
+    name_zh = "均线多头排列"
+    description = "筛选短期 > 中期 > 长期均线多头排列的股票(趋势确认)"
 
     def init(self, config: dict) -> None:
         self.short_period = config.get("short_period", 5)

@@ -9,6 +9,8 @@ class MACrossStrategy(BaseStrategy):
     """Buy when short MA crosses above long MA, sell when it crosses below."""
 
     name = "ma_cross"
+    name_zh = "均线交叉"
+    description = "短期 MA 上穿长期 MA → 金叉买入;短期 MA 下穿长期 MA → 死叉卖出"
 
     def init(self, config: dict) -> None:
         self.short_period = config.get("short_period", 5)

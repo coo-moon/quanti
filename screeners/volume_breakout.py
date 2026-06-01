@@ -8,7 +8,8 @@ class VolumeBreakoutScreener(BaseScreener):
     """Select stocks with volume significantly above average (potential breakout)."""
 
     name = "volume_breakout"
-    description = "放量突破选股：筛选成交量显著放大的股票"
+    name_zh = "放量突破"
+    description = "筛选成交量较 N 日均量放大若干倍的股票(异动)"
 
     def init(self, config: dict) -> None:
         self.vol_period = config.get("vol_period", 20)

@@ -108,6 +108,7 @@ export const runBacktest = (req: BacktestRequest) =>
 
 export interface ScreenerInfo {
   name: string;
+  name_zh?: string;
   description: string;
 }
 
@@ -264,6 +265,8 @@ export interface DecisionRecord {
 
 export interface StrategyInfo {
   name: string;
+  name_zh?: string;
+  description?: string;
 }
 
 export const fetchGoal = () => api.get<Goal>("/goal");

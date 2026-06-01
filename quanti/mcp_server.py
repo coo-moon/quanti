@@ -237,11 +237,24 @@ def _tool_specs() -> list[dict]:
 def _handle_tool_call(ctx: QuantiContext, name: str, args: dict[str, Any]) -> Any:
     if name == "list_strategies":
         loader = StrategyLoader()
-        return [{"name": s.name} for s in loader.load_directory(ctx.strategies_dir)]
+        return [
+            {
+                "name": s.name,
+                "name_zh": getattr(s, "name_zh", "") or s.name,
+                "description": getattr(s, "description", "") or "",
+            }
+            for s in loader.load_directory(ctx.strategies_dir)
+        ]
     if name == "list_screeners":
         loader = ScreenerLoader()
-        return [{"name": s.name, "description": s.description}
-                for s in loader.load_directory(ctx.screeners_dir)]
+        return [
+            {
+                "name": s.name,
+                "name_zh": getattr(s, "name_zh", "") or s.name,
+                "description": s.description,
+            }
+            for s in loader.load_directory(ctx.screeners_dir)
+        ]
     if name == "list_pools":
         return ctx.db.list_pools()
     if name == "get_goal":

@@ -67,14 +67,18 @@
           <span>选股器（可选）</span>
           <select v-model="goalDraft.screener_name">
             <option value="">不使用</option>
-            <option v-for="s in screeners" :key="s.name" :value="s.name">{{ s.name }}</option>
+            <option v-for="s in screeners" :key="s.name" :value="s.name" :title="s.description">
+              {{ s.name_zh || s.name }}
+            </option>
           </select>
         </label>
         <label>
           <span>策略（留空 = Agent 自动挑选）</span>
           <select v-model="goalDraft.strategy_name">
             <option value="">由 Agent 自动挑选</option>
-            <option v-for="s in strategies" :key="s.name" :value="s.name">{{ s.name }}</option>
+            <option v-for="s in strategies" :key="s.name" :value="s.name" :title="s.description || ''">
+              {{ s.name_zh || s.name }}
+            </option>
           </select>
         </label>
       </div>
@@ -224,7 +228,7 @@
     <div class="card" v-if="agent && agent.last_evaluations.length > 0">
       <div class="card-header">
         <h2>最近策略评估</h2>
-        <div class="muted">选定：<b>{{ agent.last_strategy }}</b></div>
+        <div class="muted">选定:<b>{{ displayStrategy(agent.last_strategy) }}</b></div>
       </div>
       <table class="data-table">
         <thead>
@@ -239,7 +243,10 @@
         </thead>
         <tbody>
           <tr v-for="e in agent.last_evaluations" :key="e.strategy_name">
-            <td><b v-if="e.strategy_name === agent.last_strategy">{{ e.strategy_name }}</b><span v-else>{{ e.strategy_name }}</span></td>
+            <td>
+              <b v-if="e.strategy_name === agent.last_strategy">{{ displayStrategy(e.strategy_name) }}</b>
+              <span v-else>{{ displayStrategy(e.strategy_name) }}</span>
+            </td>
             <td :class="e.annual_return >= 0 ? 'up' : 'down'">{{ formatPct(e.annual_return) }}</td>
             <td class="down">{{ formatPct(e.max_drawdown) }}</td>
             <td>{{ e.sharpe.toFixed(2) }}</td>
@@ -427,11 +434,28 @@ const agentStatusClass = computed(() => {
   return agent.value.running ? "up" : "muted-card";
 });
 
+// Lookup table: stable name → display label. Built reactively from the
+// loaded strategy/screener lists. Falls back to the stable name if the
+// list hasn't loaded yet or the lookup misses (e.g. user-removed plugin).
+const strategyNameMap = computed(() => {
+  const m = new Map<string, string>();
+  for (const s of strategies.value) {
+    if (s.name_zh) m.set(s.name, s.name_zh);
+  }
+  return m;
+});
+function displayStrategy(name: string): string {
+  if (!name) return "";
+  if (name === "ensemble") return "ensemble";  // synthetic, not in the list
+  if (name === "llm") return "LLM";
+  return strategyNameMap.value.get(name) || name;
+}
+
 // Mode badge derived from the live (post-save) advParams state.
 // If the user pinned a strategy, all params are inert — show "钉死策略"
 // so they're not confused by a mode badge that does nothing.
 const modeLabel = computed(() => {
-  if (goalDraft.strategy_name) return `钉死: ${goalDraft.strategy_name}`;
+  if (goalDraft.strategy_name) return `钉死: ${displayStrategy(goalDraft.strategy_name)}`;
   if (advParams.agent_mode === "llm") return "LLM 决策";
   if (advParams.agent_mode === "ensemble") return "集成 (ensemble)";
   return "经典 (rule)";

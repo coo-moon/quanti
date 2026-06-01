@@ -8,6 +8,8 @@ class RSIOverboughtOversoldStrategy(BaseStrategy):
     """Buy when RSI drops below oversold threshold, sell when it rises above overbought."""
 
     name = "rsi_ob_os"
+    name_zh = "RSI 超买超卖"
+    description = "RSI < 30 触发买入(超卖反弹),RSI > 70 触发卖出(超买回落)"
 
     def init(self, config: dict) -> None:
         self.period = config.get("period", 14)

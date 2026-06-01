@@ -8,9 +8,14 @@ from quanti.models import BarData
 
 
 class BaseScreener(ABC):
-    """Base class for all stock screeners."""
+    """Base class for all stock screeners.
+
+    `name` is the stable identifier (Goal field, MCP/CLI args). Don't rename.
+    `name_zh` and `description` are display-only and edit-safe.
+    """
 
     name: str = "unnamed"
+    name_zh: str = ""       # display label, optional but recommended
     description: str = ""
 
     @abstractmethod

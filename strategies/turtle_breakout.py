@@ -8,6 +8,8 @@ class TurtleBreakoutStrategy(BaseStrategy):
     """Buy on N-day high breakout, sell on N/2-day low breakdown (classic Turtle)."""
 
     name = "turtle_breakout"
+    name_zh = "海龟突破"
+    description = "突破 20 日新高买入,跌破 10 日新低卖出(经典海龟交易法则)"
 
     def init(self, config: dict) -> None:
         self.entry_period = config.get("entry_period", 20)  # Buy on 20-day high

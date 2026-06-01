@@ -8,6 +8,8 @@ class MAVolumeStrategy(BaseStrategy):
     """MA crossover confirmed by above-average volume to filter false breakouts."""
 
     name = "ma_volume"
+    name_zh = "量价确认均线"
+    description = "均线金叉同时成交量放大才确认买入,过滤假突破"
 
     def init(self, config: dict) -> None:
         self.short_period = config.get("short_period", 5)

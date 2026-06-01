@@ -8,6 +8,8 @@ class BollingerBandStrategy(BaseStrategy):
     """Buy when price touches lower band, sell when it touches upper band."""
 
     name = "bollinger_band"
+    name_zh = "布林带突破"
+    description = "价格触及布林带下轨(超卖)→ 买入,触及上轨(超买)→ 卖出"
 
     def init(self, config: dict) -> None:
         self.period = config.get("period", 20)
