@@ -215,6 +215,7 @@ export interface AgentStatus {
   }>;
   total_value: number;
   pnl_pct: number;
+  pending_orders?: number;
 }
 
 export interface PortfolioPosition {

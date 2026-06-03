@@ -37,6 +37,12 @@
           <span class="stat-value stat-value-sm">{{ modeLabel }}</span>
         </div>
       </div>
+      <div class="stat-card" :class="pendingCardClass" v-if="(agent?.pending_orders ?? 0) > 0">
+        <div class="stat-info">
+          <span class="stat-label">待成交订单</span>
+          <span class="stat-value">{{ agent?.pending_orders ?? 0 }}</span>
+        </div>
+      </div>
     </div>
 
     <!-- Goal editor -->
@@ -468,6 +474,13 @@ const modeClass = computed(() => {
   return "mode-rule";
 });
 
+const pendingCardClass = computed(() => {
+  const n = agent.value?.pending_orders ?? 0;
+  if (n > 10) return "pending-heavy";
+  if (n > 0) return "pending-active";
+  return "";
+});
+
 function kindClass(kind: string) {
   if (kind === "trade") return "kind-trade";
   if (kind === "risk_reject") return "kind-warn";
@@ -476,6 +489,9 @@ function kindClass(kind: string) {
   if (kind === "strategy_pick" || kind === "strategy_ensemble") return "kind-info";
   if (kind === "llm_cycle") return "kind-llm";
   if (kind === "agent_error") return "kind-error";
+  if (kind === "order_queued") return "kind-pending";
+  if (kind === "order_filled_pending") return "kind-trade";  // = real fill
+  if (kind === "order_expired_pending") return "kind-meta";
   return "";
 }
 
@@ -852,6 +868,19 @@ onUnmounted(() => {
 .stat-card.mode-pinned {
   background: rgba(245, 158, 11, 0.10);
   border: 1px solid rgba(245, 158, 11, 0.25);
+}
+.stat-card.pending-active {
+  background: rgba(245, 158, 11, 0.10);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+}
+.stat-card.pending-heavy {
+  background: rgba(192, 57, 43, 0.10);
+  border: 1px solid rgba(192, 57, 43, 0.30);
+}
+.decision.kind-pending {
+  background: rgba(245, 158, 11, 0.06);
+  border-left: 3px solid rgba(245, 158, 11, 0.5);
+  padding-left: 10px;
 }
 
 /* Mode picker pills: three radio-like clickable cards. */

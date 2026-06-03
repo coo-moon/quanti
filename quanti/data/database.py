@@ -636,13 +636,29 @@ class Database:
         )
         self.conn.commit()
 
-    def list_orders(self, limit: int = 200) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT order_id, code, direction, quantity, status, filled_price, "
-            "filled_quantity, strategy_name, reason, created_at, filled_at "
-            "FROM orders ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    def list_orders(self, limit: int = 200,
+                    status: str | None = None) -> list[dict]:
+        """List orders, optionally filtered by status (e.g. "pending").
+
+        When `status` is None (default), returns the most recent `limit`
+        orders of any status — matches legacy behavior. With a status
+        filter, callers (PaperBroker.try_fill_pending_orders) get a
+        bounded queue to walk without scanning the full table.
+        """
+        if status:
+            rows = self.conn.execute(
+                "SELECT order_id, code, direction, quantity, status, filled_price, "
+                "filled_quantity, strategy_name, reason, created_at, filled_at "
+                "FROM orders WHERE status=? ORDER BY created_at ASC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT order_id, code, direction, quantity, status, filled_price, "
+                "filled_quantity, strategy_name, reason, created_at, filled_at "
+                "FROM orders ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [
             {
                 "order_id": r[0], "code": r[1], "direction": r[2],
@@ -652,6 +668,25 @@ class Database:
             }
             for r in rows
         ]
+
+    def update_order_status(self, order_id: str, status: str,
+                            reason: str | None = None) -> None:
+        """Set an order's status (and optionally append a reason).
+
+        Used by PaperBroker to transition pending → cancelled / rejected
+        without going through update_order_filled (which assumes a fill).
+        """
+        if reason is not None:
+            self.conn.execute(
+                "UPDATE orders SET status=?, reason=? WHERE order_id=?",
+                (status, reason, order_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE orders SET status=? WHERE order_id=?",
+                (status, order_id),
+            )
+        self.conn.commit()
 
     def insert_trade(self, trade: dict) -> None:
         from datetime import datetime

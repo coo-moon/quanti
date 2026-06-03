@@ -502,9 +502,20 @@ class AgentRuntime:
     def _run_one_cycle(self) -> dict:
         ts = datetime.now().isoformat()
         goal = load_goal(self._db)
+
+        # FIRST: try to fill any pending orders from prior ticks. This must
+        # happen before new signal generation so today's fills update cash
+        # / positions before any new sizing decisions are made. Safe to call
+        # in immediate-fill mode too — returns 0-scanned and exits.
+        try:
+            pending_result = self._broker.try_fill_pending_orders()
+        except AttributeError:
+            # Broker without pending support (legacy / test stub).
+            pending_result = None
+
         universe = self._resolve_universe(goal)
         if not universe:
-            summary = "宇宙为空：请先 sync stocks 或选择一个非空 pool"
+            summary = "宇宙为空:请先 sync stocks 或选择一个非空 pool"
             self._db.log_decision("cycle_skip", summary,
                                   details={"goal": goal.to_db()})
             with self._lock:
@@ -637,15 +648,35 @@ class AgentRuntime:
         result = self._broker.execute_signals(signals, strategy_name=strategy_name)
         snap = self._broker.snapshot_portfolio()
 
-        summary = (f"策略 {strategy_name}: 信号 {len(signals)}, 成交 {result.filled}, "
-                   f"拒绝 {result.rejected}, 止损 {sl_count}, 净值 ¥{snap['total_value']:,.0f} "
-                   f"({snap['pnl_pct']:+.2%})")
+        # In pending mode, `result.filled` is 0 and `result.pending` is the
+        # count of queued signals. Surface both so users see the lifecycle.
+        # `pending_result` (from the start of this tick) shows what filled
+        # from PRIOR ticks' queue at today's open.
+        landed = result.filled + result.pending
+        landed_label = f"成交 {result.filled}" if result.filled else f"挂单 {result.pending}"
+        pre_filled = pending_result.filled if pending_result else 0
+        pre_pending = pending_result.still_pending if pending_result else 0
+        pre_expired = pending_result.expired if pending_result else 0
+
+        summary_parts = [f"策略 {strategy_name}", f"信号 {len(signals)}", landed_label,
+                         f"拒绝 {result.rejected}", f"止损 {sl_count}"]
+        if pending_result and pending_result.scanned > 0:
+            summary_parts.append(
+                f"昨日挂单成交 {pre_filled}/待 {pre_pending}/过期 {pre_expired}")
+        summary_parts.append(
+            f"净值 ¥{snap['total_value']:,.0f} ({snap['pnl_pct']:+.2%})")
+        summary = ", ".join(summary_parts)
+
         self._db.log_decision(
             "cycle", summary,
             details={
                 "strategy": strategy_name, "signals": len(signals),
-                "filled": result.filled, "rejected": result.rejected,
+                "filled": result.filled, "pending": result.pending,
+                "rejected": result.rejected,
                 "stop_loss_filled": sl_count,
+                "pending_pre_filled": pre_filled,
+                "pending_pre_still": pre_pending,
+                "pending_pre_expired": pre_expired,
                 "total_value": snap["total_value"],
                 "pnl_pct": snap["pnl_pct"],
                 "evaluations": evaluations,

@@ -743,12 +743,20 @@ async def agent_tick(request: Request):
 @router.get("/agent/status")
 async def agent_status(request: Request):
     s = request.app.state.agent.status()
+    # Pending-order count is cheap and we surface it here so the UI can
+    # show it next to the Agent state without an extra round trip.
+    try:
+        pending_count = len(
+            request.app.state.db.list_orders(status="pending", limit=1000))
+    except Exception:
+        pending_count = 0
     return {
         "enabled": s.enabled, "running": s.running,
         "last_tick_at": s.last_tick_at, "last_tick_summary": s.last_tick_summary,
         "last_strategy": s.last_strategy,
         "last_evaluations": s.last_evaluations,
         "total_value": s.total_value, "pnl_pct": s.pnl_pct,
+        "pending_orders": pending_count,
     }
 
 

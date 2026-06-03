@@ -34,7 +34,12 @@ def create_app(
         db = Database()
         db.initialize()
     provider = provider or DataProvider(db)
-    broker = PaperBroker(db=db, provider=provider, initial_cash=initial_cash)
+    # Production fill mode is "pending" — signals queue and fill at the
+    # next trading bar's open. See docs/plans/2026-06-01-order-lifecycle.md.
+    # Backtest engine + unit tests keep using the "immediate" default of
+    # PaperBroker so their assertions on synchronous fills still hold.
+    broker = PaperBroker(db=db, provider=provider, initial_cash=initial_cash,
+                         fill_mode="pending")
     agent = AgentRuntime(
         db=db, provider=provider, broker=broker,
         strategies_dir=strategies_dir or "strategies",
