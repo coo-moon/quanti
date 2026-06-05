@@ -91,7 +91,8 @@ def _tool_specs() -> list[dict]:
         },
         {
             "name": "set_goal",
-            "description": "设定/更新 Agent 目标（年化收益、最大回撤、风险偏好、策略/选股/股票池）",
+            "description": "设定/更新 Agent 目标（年化收益、最大回撤、风险偏好、策略/选股/"
+                           "股票池）。LLM 决策与多智能体增强开关都放在 params 里，见其说明。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -102,7 +103,36 @@ def _tool_specs() -> list[dict]:
                     "universe_pool": {"type": "string"},
                     "screener_name": {"type": "string"},
                     "strategy_name": {"type": "string"},
-                    "params": {"type": "object"},
+                    "params": {
+                        "type": "object",
+                        "description": (
+                            "策略调参与 LLM 增强开关；未列出的键原样透传。常用：\n"
+                            "  agent_mode: ''|'llm'（'llm' 启用 LLM 决策路）\n"
+                            "  ensemble_enabled: bool（Top-K 策略融合）\n"
+                            "  llm_provider: 'anthropic'|'deepseek'；llm_model: str\n"
+                            "    （DeepSeek 用 'deepseek-chat'，需 DEEPSEEK_API_KEY）\n"
+                            "  sentiment_enabled + sentiment_blend(0~1)：①新闻情绪 overlay\n"
+                            "  llm_debate + llm_debate_rounds：②多空辩论\n"
+                            "  llm_risk_debate：③风控三角（激进/中性/保守，只能缩仓/否决）\n"
+                            "  llm_reflection + llm_max_reflections：④历史经验（按相关度+已实现盈亏）"),
+                        "properties": {
+                            "agent_mode": {"type": "string", "enum": ["", "llm"]},
+                            "ensemble_enabled": {"type": "boolean"},
+                            "llm_provider": {"type": "string",
+                                             "enum": ["anthropic", "deepseek"]},
+                            "llm_model": {"type": "string"},
+                            "sentiment_enabled": {"type": "boolean"},
+                            "sentiment_blend": {"type": "number",
+                                                "minimum": 0, "maximum": 1},
+                            "sentiment_max_codes": {"type": "integer"},
+                            "llm_debate": {"type": "boolean"},
+                            "llm_debate_rounds": {"type": "integer"},
+                            "llm_risk_debate": {"type": "boolean"},
+                            "llm_reflection": {"type": "boolean"},
+                            "llm_max_reflections": {"type": "integer"},
+                        },
+                        "additionalProperties": True,
+                    },
                     "rebalance_freq": {"type": "string"},
                     "enabled": {"type": "boolean"},
                 },

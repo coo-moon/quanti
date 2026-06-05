@@ -166,8 +166,59 @@
           </label>
         </div>
         <div class="adv-note">
-          预设按钮会重置这四项;手动改完后下方保存目标按钮才会落库。LLM 模式额外需要
-          <code>pip install -e '.[llm]'</code> 和 <code>ANTHROPIC_API_KEY</code>。
+          预设按钮会重置这四项;手动改完后下方保存目标按钮才会落库。LLM 模式的供应商与
+          多智能体增强开关见下方「LLM 增强层」。
+        </div>
+      </details>
+
+      <details class="advanced">
+        <summary>LLM 增强层(情绪 / 多空辩论 / 风控三角 / 反思)</summary>
+        <div class="adv-llm-provider">
+          <label>
+            <span>供应商 llm_provider</span>
+            <select v-model="advParams.llm_provider">
+              <option value="anthropic">Anthropic claude(需 ANTHROPIC_API_KEY + pip install .[llm]）</option>
+              <option value="deepseek">DeepSeek deepseek-chat(需 DEEPSEEK_API_KEY，无需额外安装）</option>
+            </select>
+          </label>
+        </div>
+        <div class="adv-grid">
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.sentiment_enabled" />
+            <span>sentiment_enabled</span>
+            <em>① 新闻情绪 overlay(ensemble 与 LLM 模式都生效)</em>
+          </label>
+          <label class="adv-num">
+            <span>sentiment_blend</span>
+            <input type="number" step="0.05" min="0" max="1"
+                   v-model.number="advParams.sentiment_blend" />
+            <em>情绪在候选融合中的权重 0~1</em>
+          </label>
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.llm_debate" />
+            <span>llm_debate</span>
+            <em>② 多空辩论(仅 LLM 模式)</em>
+          </label>
+          <label class="adv-num">
+            <span>llm_debate_rounds</span>
+            <input type="number" step="1" min="1" max="3"
+                   v-model.number="advParams.llm_debate_rounds" />
+            <em>Bull→Bear 轮数</em>
+          </label>
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.llm_risk_debate" />
+            <span>llm_risk_debate</span>
+            <em>③ 风控三角(激进/中性/保守,只能缩仓或否决;仅 LLM 模式)</em>
+          </label>
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.llm_reflection" />
+            <span>llm_reflection</span>
+            <em>④ 历史经验(按相关度 + 已实现盈亏;仅 LLM 模式)</em>
+          </label>
+        </div>
+        <div class="adv-note">
+          ②③④ 仅在 <b>LLM 决策</b>模式生效;① 情绪在 ensemble 也生效。需配置对应供应商
+          API key;缺 key/SDK 时这些层自动 no-op,不影响其余流程。
         </div>
       </details>
     </div>
@@ -336,6 +387,15 @@ const advParams = reactive({
   industry_neutral: false,
   liquidity_filter: false,
   wf_enabled: true, // default-on
+  // LLM enhancement layer (all default-off; ②③④ only apply in LLM mode,
+  // ① sentiment also applies in ensemble mode).
+  llm_provider: "anthropic" as "anthropic" | "deepseek",
+  sentiment_enabled: false,
+  sentiment_blend: 0.2,
+  llm_debate: false,
+  llm_debate_rounds: 1,
+  llm_risk_debate: false,
+  llm_reflection: false,
 });
 
 function syncAdvFromParams() {
@@ -347,6 +407,15 @@ function syncAdvFromParams() {
   advParams.industry_neutral = !!p.industry_neutral;
   advParams.liquidity_filter = !!p.liquidity_filter;
   advParams.wf_enabled = p.wf_enabled !== false; // default true if absent
+  advParams.llm_provider = p.llm_provider === "deepseek" ? "deepseek" : "anthropic";
+  advParams.sentiment_enabled = !!p.sentiment_enabled;
+  advParams.sentiment_blend =
+    typeof p.sentiment_blend === "number" ? p.sentiment_blend : 0.2;
+  advParams.llm_debate = !!p.llm_debate;
+  advParams.llm_debate_rounds =
+    typeof p.llm_debate_rounds === "number" ? p.llm_debate_rounds : 1;
+  advParams.llm_risk_debate = !!p.llm_risk_debate;
+  advParams.llm_reflection = !!p.llm_reflection;
 }
 
 function syncParamsFromAdv() {
@@ -362,6 +431,13 @@ function syncParamsFromAdv() {
     industry_neutral: advParams.industry_neutral,
     liquidity_filter: advParams.liquidity_filter,
     wf_enabled: advParams.wf_enabled,
+    llm_provider: advParams.llm_provider,
+    sentiment_enabled: advParams.sentiment_enabled,
+    sentiment_blend: advParams.sentiment_blend,
+    llm_debate: advParams.llm_debate,
+    llm_debate_rounds: advParams.llm_debate_rounds,
+    llm_risk_debate: advParams.llm_risk_debate,
+    llm_reflection: advParams.llm_reflection,
   };
 }
 
@@ -979,5 +1055,40 @@ onUnmounted(() => {
   padding: 1px 4px;
   border-radius: 3px;
   font-size: 11px;
+}
+.adv-llm-provider {
+  margin-top: 10px;
+}
+.adv-llm-provider label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  max-width: 520px;
+}
+.adv-num {
+  display: grid;
+  grid-template-columns: 1fr 90px;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 4px 0;
+}
+.adv-num span {
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 12.5px;
+  color: #1e3a8a;
+}
+.adv-num em {
+  grid-column: 1 / -1;
+  font-style: normal;
+  color: var(--color-text-secondary);
+  font-size: 11.5px;
+}
+.advanced select,
+.advanced input[type="number"] {
+  padding: 6px 8px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 6px;
+  font-size: 13px;
 }
 </style>

@@ -240,6 +240,21 @@ class Database:
                 details_json TEXT DEFAULT '{}'
             );
 
+            -- News/sentiment overlay cache. One row per (code, as_of trading
+            -- date) so we never re-fetch news or re-score with the LLM more
+            -- than once per stock per day. `score` is the LLM's sentiment in
+            -- [-1, 1]; `n_news` records how many headlines fed the score.
+            CREATE TABLE IF NOT EXISTS news_sentiment (
+                code TEXT NOT NULL,
+                as_of TEXT NOT NULL,
+                score REAL NOT NULL,
+                reason TEXT DEFAULT '',
+                n_news INTEGER DEFAULT 0,
+                model TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (code, as_of)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_daily_quotes_code
                 ON daily_quotes(code);
             CREATE INDEX IF NOT EXISTS idx_daily_quotes_date
@@ -850,3 +865,34 @@ class Database:
              "summary": r[4], "details": json.loads(r[5] or "{}")}
             for r in rows
         ]
+
+    # ----- news sentiment cache -------------------------------------
+    def get_news_sentiment(self, code: str, as_of: str) -> dict | None:
+        """Return the cached sentiment row for (code, as_of), or None."""
+        row = self.conn.execute(
+            "SELECT code, as_of, score, reason, n_news, model "
+            "FROM news_sentiment WHERE code=? AND as_of=?",
+            (code, as_of),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"code": row[0], "as_of": row[1], "score": row[2],
+                "reason": row[3], "n_news": row[4], "model": row[5]}
+
+    def upsert_news_sentiment(self, code: str, as_of: str, score: float,
+                              reason: str = "", n_news: int = 0,
+                              model: str = "") -> None:
+        """Insert or update one (code, as_of) sentiment score."""
+        from datetime import datetime
+        self.conn.execute(
+            "INSERT INTO news_sentiment "
+            "(code, as_of, score, reason, n_news, model, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(code, as_of) DO UPDATE SET "
+            "score=excluded.score, reason=excluded.reason, "
+            "n_news=excluded.n_news, model=excluded.model, "
+            "created_at=excluded.created_at",
+            (code, as_of, float(score), reason, int(n_news), model,
+             datetime.now().isoformat()),
+        )
+        self.conn.commit()

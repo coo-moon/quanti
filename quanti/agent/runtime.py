@@ -385,6 +385,9 @@ class AgentRuntime:
         factor_blend = float(params.get("factor_blend", 0.5))
         industry_neutral = bool(params.get("industry_neutral", False))
         n_per_industry = int(params.get("n_per_industry", 2))
+        sentiment_enabled = bool(params.get("sentiment_enabled", False))
+        sentiment_blend = float(params.get("sentiment_blend", 0.0))
+        sentiment_max_codes = int(params.get("sentiment_max_codes", 30))
 
         selector = StrategySelector(self._db, self._provider,
                                     self._strategies_dir)
@@ -405,9 +408,17 @@ class AgentRuntime:
             self._provider, self._db, candidates,
             config=FactorConfig(industry_neutralize=industry_neutral))
 
+        sentiment_scores = None
+        if sentiment_enabled and sentiment_blend > 0:
+            sentiment_scores = self._compute_sentiment(
+                goal, panel, sentiment_max_codes)
+
         fused = fuse_buy_signals(per_strategy, weights,
                                  factor_panel=panel,
-                                 factor_blend=factor_blend)
+                                 factor_blend=factor_blend,
+                                 sentiment_scores=sentiment_scores,
+                                 sentiment_blend=(sentiment_blend
+                                                  if sentiment_scores else 0.0))
 
         if industry_neutral:
             fused = industry_cap(fused, n_per_industry=n_per_industry)
@@ -426,6 +437,50 @@ class AgentRuntime:
             })
         return fused, evaluations, weights
 
+    def _compute_sentiment(self, goal: Goal, panel, max_codes: int):
+        """News-sentiment overlay for the strongest candidates.
+
+        Returns { code → score ∈ [-1, 1] } or None to disable the overlay
+        (no candidates, no LLM available, or any failure). Scores only the
+        top-`max_codes` by factor composite to bound LLM cost, and logs a
+        `sentiment_overlay` decision for the audit trail. Never raises.
+        """
+        from quanti.agent.llm_runtime import DEFAULT_MODEL
+        from quanti.agent.sentiment import SentimentConfig, score_candidates
+        from quanti.factors.cross_sectional import rank_by_composite
+
+        if panel is None or panel.empty:
+            return None
+        top = [c for c, _ in rank_by_composite(panel, top_n=max_codes)]
+        if not top:
+            return None
+
+        client = getattr(self, "_llm_client", None)
+        if client is None:
+            try:
+                client = self._build_llm_client(goal.params or {})
+            except (ImportError, ValueError):
+                return None  # overlay is a no-op without an LLM
+
+        params = goal.params or {}
+        cfg = SentimentConfig(
+            model=str(params.get("sentiment_model",
+                                 params.get("llm_model", DEFAULT_MODEL))),
+            max_codes=max_codes,
+        )
+        try:
+            scores = score_candidates(self._db, top, client, cfg=cfg)
+        except Exception as e:
+            logger.warning(f"sentiment overlay failed, skipping: {e}")
+            return None
+
+        self._db.log_decision(
+            "sentiment_overlay",
+            f"新闻情绪: 评分 {len(scores)} 只候选",
+            details={"scores": {k: round(float(v), 3)
+                                for k, v in scores.items()}})
+        return scores or None
+
     def _ensemble_path(self, goal: Goal, candidates: list[str],
                        ) -> tuple[list[Signal], str, list[dict]]:
         """Rule-driven ensemble: candidates → signals (no LLM)."""
@@ -433,6 +488,21 @@ class AgentRuntime:
             goal, candidates)
         signals = [c.to_signal() for c in fused]
         return signals, "ensemble", evaluations
+
+    def _build_llm_client(self, params: dict):
+        """Construct an LLM client per goal.params['llm_provider'].
+
+        'deepseek' → OpenAI-compatible DeepSeek client (reads DEEPSEEK_API_KEY).
+        anything else → Anthropic SDK client (reads ANTHROPIC_API_KEY).
+        Raises ImportError/ValueError when the chosen provider isn't usable;
+        callers treat that as "LLM unavailable" and degrade gracefully.
+        """
+        provider = str(params.get("llm_provider", "anthropic")).lower()
+        if provider in ("deepseek", "openai_compat"):
+            from quanti.agent.openai_compat import DeepSeekLLMClient
+            return DeepSeekLLMClient()
+        from quanti.agent.llm_runtime import AnthropicLLMClient
+        return AnthropicLLMClient()
 
     def _llm_path(self, goal: Goal, candidates: list[str]) -> dict:
         """LLM-driven path. Uses ensemble for candidate generation, then
@@ -447,7 +517,6 @@ class AgentRuntime:
         for this tick. The next tick will retry.
         """
         from quanti.agent.llm_runtime import (
-            AnthropicLLMClient,
             LLMConfig,
             run_llm_decision,
         )
@@ -468,6 +537,11 @@ class AgentRuntime:
             max_tool_iterations=int(params.get("llm_max_iterations", 5)),
             max_candidates_in_context=int(params.get("llm_max_candidates", 20)),
             temperature=float(params.get("llm_temperature", 0.3)),
+            debate_enabled=bool(params.get("llm_debate", False)),
+            debate_rounds=int(params.get("llm_debate_rounds", 1)),
+            risk_debate_enabled=bool(params.get("llm_risk_debate", False)),
+            reflection_enabled=bool(params.get("llm_reflection", False)),
+            max_reflections=int(params.get("llm_max_reflections", 8)),
         )
 
         # Allow tests / advanced users to inject a custom client via the
@@ -476,8 +550,8 @@ class AgentRuntime:
         client = getattr(self, "_llm_client", None)
         if client is None:
             try:
-                client = AnthropicLLMClient()
-            except ImportError as e:
+                client = self._build_llm_client(params)
+            except (ImportError, ValueError) as e:
                 logger.warning(f"LLM unavailable, falling back to ensemble: {e}")
                 self._db.log_decision(
                     "llm_unavailable",
