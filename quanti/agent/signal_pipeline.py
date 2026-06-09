@@ -49,6 +49,7 @@ class FusedCandidate:
     strategy_score: float       # weighted strength across strategies, ∈ [0, 1]
     factor_score: float         # cross-sectional composite (z-units), often [-3, 3]
     final_score: float          # combined score used for ranking, ∈ [0, 1]
+    sentiment_score: float = 0.0  # LLM news sentiment ∈ [-1, 1]; 0 = neutral/none
     contributing_strategies: list[str] = field(default_factory=list)
     industry: str = ""
 
@@ -59,8 +60,10 @@ class FusedCandidate:
         FixedSizer or VolTargetSizer) can scale further by conviction.
         """
         contrib = ",".join(self.contributing_strategies)
+        sent_str = f" sent={self.sentiment_score:+.2f}" if self.sentiment_score else ""
         msg = reason or (f"ensemble[{contrib}] strat={self.strategy_score:.2f} "
-                         f"factor={self.factor_score:+.2f} final={self.final_score:.2f}")
+                         f"factor={self.factor_score:+.2f}{sent_str} "
+                         f"final={self.final_score:.2f}")
         return Signal(stock_code=self.code, direction=Direction.BUY,
                       strength=self.final_score, reason=msg)
 
@@ -94,6 +97,8 @@ def fuse_buy_signals(
     strategy_weights: dict[str, float],
     factor_panel: pd.DataFrame | None = None,
     factor_blend: float = 0.5,
+    sentiment_scores: dict[str, float] | None = None,
+    sentiment_blend: float = 0.0,
 ) -> list[FusedCandidate]:
     """Combine BUY signals across an ensemble into ranked candidates.
 
@@ -109,6 +114,12 @@ def fuse_buy_signals(
         factor_blend: weight on factor overlay vs pure strategy ensemble.
             0.0 = ignore factors; 1.0 = factor only. Default 0.5 balances
             "what the strategies vote" with "what the factor model says".
+        sentiment_scores: optional { code → news sentiment ∈ [-1, 1] } from
+            the news/sentiment analyst. Codes absent here are treated as
+            neutral. Only consulted when sentiment_blend > 0.
+        sentiment_blend: weight on the sentiment overlay, carved from the
+            strategy weight alongside factor_blend. Default 0.0 = off, which
+            makes this function behave exactly as the prior 2-way blend.
 
     Returns:
         list of FusedCandidate sorted descending by final_score.
@@ -126,6 +137,17 @@ def fuse_buy_signals(
             prev = by_code_per_strat[s.stock_code].get(strat_name, 0.0)
             by_code_per_strat[s.stock_code][strat_name] = max(prev, s.strength)
 
+    # Resolve blend weights once. factor_blend / sentiment_blend carve weight
+    # away from the strategy ensemble; if together they'd exceed 1.0 we scale
+    # them down so the strategy vote never goes negative. With the defaults
+    # (sentiment_blend=0) this reduces exactly to the prior 2-way blend.
+    fb = max(0.0, min(1.0, factor_blend))
+    sb = max(0.0, min(1.0, sentiment_blend))
+    if fb + sb > 1.0:
+        scale = 1.0 / (fb + sb)
+        fb, sb = fb * scale, sb * scale
+    strat_w = max(0.0, 1.0 - fb - sb)
+
     candidates: list[FusedCandidate] = []
     for code, per_strat in by_code_per_strat.items():
         # strategy_score: weighted sum, capped at 1.0
@@ -137,13 +159,19 @@ def fuse_buy_signals(
         # Map factor z (typically [-3, 3]) to [0, 1] via sigmoid.
         fs_norm = _sigmoid(fs, k=1.0)
 
-        # Blend. If factor_blend=0 we use strategy_score alone; =1 factor alone.
-        b = max(0.0, min(1.0, factor_blend))
-        final = (1.0 - b) * ss + b * fs_norm
+        # Sentiment ∈ [-1, 1] → [0, 1]; missing/neutral → 0.5 (no tilt). Only
+        # consulted when the blend actually weights it, so a candidate's
+        # recorded sentiment_score honestly reflects what moved its ranking.
+        sent = 0.0
+        if sb > 0 and sentiment_scores:
+            sent = max(-1.0, min(1.0, float(sentiment_scores.get(code, 0.0) or 0.0)))
+        sent_norm = 0.5 * (sent + 1.0)
+
+        final = strat_w * ss + fb * fs_norm + sb * sent_norm
 
         candidates.append(FusedCandidate(
             code=code, strategy_score=ss, factor_score=fs,
-            final_score=final,
+            sentiment_score=sent, final_score=final,
             contributing_strategies=sorted(per_strat.keys()),
             industry=_industry_for(factor_panel, code),
         ))

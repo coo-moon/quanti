@@ -79,6 +79,20 @@ That's a valid "wait" decision.
 Be terse. The dashboard renders your `reason` field directly to humans."""
 
 
+# Debate personas. Bull and Bear argue over the SAME candidate context; their
+# transcript is then handed to the judgment pass (SYSTEM_PROMPT above) which
+# acts as the research manager and makes the actual propose_orders call.
+BULL_SYSTEM = """你是 A 股交易台的【多头研究员】。系统已经给出一份经过走查选股 + \
+因子打分(可能含新闻情绪)筛过的候选买入清单,以及当前组合。请论证看多逻辑:\
+这些候选里哪些此刻最值得买入、理由是什么(动量、因子共振、利好新闻、分散化等)。\
+要点要具体、点名股票代码。最多 6 条要点,中文。你不做最终决策,只负责进攻性论证。"""
+
+BEAR_SYSTEM = """你是 A 股交易台的【空头研究员】。你看到同一份候选清单、当前组合,\
+以及多头的论点。请论证看空/回避逻辑:哪些候选应当回避或减小仓位,多头忽视了哪些风险\
+(追高、拥挤、利空、行业集中、因子弱、相对目标的回撤等),并针对多头论点逐条反驳。\
+最多 6 条要点,中文。你不做最终决策,只负责唱反调。"""
+
+
 @dataclass
 class LLMConfig:
     model: str = DEFAULT_MODEL
@@ -87,6 +101,11 @@ class LLMConfig:
     max_candidates_in_context: int = 20
     max_decisions_in_context: int = 5
     temperature: float = 0.3  # mild creativity, mostly deterministic
+    debate_enabled: bool = False     # run a Bull/Bear debate before judgment
+    debate_rounds: int = 1           # Bull→Bear exchanges before the manager decides
+    risk_debate_enabled: bool = False  # aggressive/neutral/conservative size review
+    reflection_enabled: bool = False   # inject outcome-keyed reflections into context
+    max_reflections: int = 8
 
 
 # ---------------------------------------------------------- LLM client
@@ -339,6 +358,191 @@ class LLMDecisionLoop:
         return proposed_orders, reasoning, debug
 
 
+# ------------------------------------------------------- bull/bear debate
+
+def _complete_text(llm: LLMClient, system_text: str, user_text: str,
+                   cfg: LLMConfig) -> str:
+    """Single text completion with a persona system prompt (no tools)."""
+    system = [{
+        "type": "text", "text": system_text,
+        "cache_control": {"type": "ephemeral"},
+    }]
+    resp = llm.create_message(
+        model=cfg.model, system=system,
+        messages=[{"role": "user", "content": user_text}],
+        tools=[], max_tokens=cfg.max_tokens, temperature=cfg.temperature,
+    )
+    parts = [b.get("text", "") for b in resp.get("content", []) or []
+             if b.get("type") == "text"]
+    return " ".join(p for p in parts if p).strip()
+
+
+def _debate_user(base_context: str, bull: str, bear: str, role: str) -> str:
+    parts = [base_context, ""]
+    if bull:
+        parts += ["# 已有多头观点(BULL)", bull, ""]
+    if bear:
+        parts += ["# 已有空头观点(BEAR)", bear, ""]
+    parts.append("请给出你的多头论点。" if role == "bull"
+                 else "请针对多头论点给出你的空头反驳。")
+    return "\n".join(parts)
+
+
+def _format_transcript(rounds: list[dict]) -> str:
+    out: list[str] = []
+    for r in rounds:
+        out.append(f"## 第 {r['round']} 轮")
+        out.append(f"多头: {r.get('bull', '')}")
+        out.append(f"空头: {r.get('bear', '')}")
+        out.append("")
+    return "\n".join(out).strip()
+
+
+def run_debate(llm: LLMClient, base_context: str,
+               cfg: LLMConfig) -> tuple[str, list[dict]]:
+    """Run `cfg.debate_rounds` Bull→Bear exchanges over the candidate context.
+
+    Returns (formatted_transcript, rounds). Each round adds two LLM calls
+    (still within the per-tick token budget the caller controls via cfg).
+    Degrades to ("", rounds_so_far) on any failure so the caller falls back
+    to direct judgment without the debate.
+    """
+    rounds: list[dict] = []
+    bull_prev = bear_prev = ""
+    try:
+        for r in range(max(1, cfg.debate_rounds)):
+            bull = _complete_text(
+                llm, BULL_SYSTEM,
+                _debate_user(base_context, bull_prev, bear_prev, "bull"), cfg)
+            bear = _complete_text(
+                llm, BEAR_SYSTEM,
+                _debate_user(base_context, bull, bear_prev, "bear"), cfg)
+            rounds.append({"round": r + 1, "bull": bull, "bear": bear})
+            bull_prev, bear_prev = bull, bear
+    except Exception as e:
+        logger.warning(f"debate failed, falling back to direct judgment: {e}")
+        return "", rounds
+    return _format_transcript(rounds), rounds
+
+
+# ------------------------------------------------- risk-debate triad
+
+RISK_AGGRESSIVE_SYSTEM = """你是交易台的【激进风控】。在守住底线风险的前提下,你倾向\
+尽量保留仓位、抓住机会。审阅经理提议的买入清单,对每个订单给出 keep_pct∈[0,1](保留\
+该订单提议仓位的比例)。仅当标的与现有持仓高度重叠、或组合已逼近回撤容忍线时才下调;\
+否则倾向 keep_pct=1.0。调用 submit_risk_review 一次。"""
+
+RISK_NEUTRAL_SYSTEM = """你是交易台的【中性风控】。你在机会与风险间求平衡。审阅经理提议\
+的买入清单,综合单票集中度、行业集中度、与目标回撤的距离,对每个订单给出 keep_pct∈\
+[0,1]。调用 submit_risk_review 一次。"""
+
+RISK_CONSERVATIVE_SYSTEM = """你是交易台的【保守风控】。你优先保护本金、压低回撤。对追高、\
+拥挤、与现有持仓/行业重叠、临近回撤容忍线的订单果断下调甚至否决(keep_pct=0)。对每个\
+订单给出 keep_pct∈[0,1]。调用 submit_risk_review 一次。"""
+
+RISK_TOOL: list[dict] = [{
+    "name": "submit_risk_review",
+    "description": "Return a keep_pct ∈ [0,1] per proposed order "
+                   "(fraction of the manager's size to keep; 0 = veto). "
+                   "Call exactly once.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "reviews": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string"},
+                        "keep_pct": {"type": "number",
+                                     "minimum": 0, "maximum": 1},
+                        "reason": {"type": "string", "maxLength": 60},
+                    },
+                    "required": ["code", "keep_pct"],
+                },
+            },
+        },
+        "required": ["reviews"],
+    },
+}]
+
+
+def _risk_review_one(llm: LLMClient, system_text: str, orders: list[dict],
+                     portfolio: dict, goal, cfg: LLMConfig) -> dict[str, float]:
+    """One risk persona reviews all orders → { code → keep_pct }."""
+    lines = ["经理提议的买入订单:"]
+    for o in orders:
+        lines.append(f"- {o.get('code')} size_pct={float(o.get('size_pct', 0)):.3f} "
+                     f"理由:{o.get('reason', '')}")
+    lines.append("")
+    lines.append(f"组合: 总资产 ¥{portfolio.get('total_value', 0):,.0f}, "
+                 f"现金 ¥{portfolio.get('cash', 0):,.0f}, "
+                 f"累计盈亏 {portfolio.get('pnl_pct', 0):+.1%}")
+    positions = portfolio.get("positions", []) or []
+    if positions:
+        held = ", ".join(f"{p.get('code')}({p.get('pnl_pct', 0):+.0%})"
+                         for p in positions)
+        lines.append(f"当前持仓: {held}")
+    rt = goal.risk_tolerance.value if hasattr(goal.risk_tolerance, "value") \
+        else goal.risk_tolerance
+    lines.append(f"目标: 年化 {goal.target_annual_return:.0%}, "
+                 f"最大回撤容忍 {goal.max_drawdown:.0%}, 风险偏好 {rt}")
+    lines.append("")
+    lines.append("对每个订单给出 keep_pct∈[0,1](保留经理提议仓位的比例,0=否决),"
+                 "调用 submit_risk_review 一次。")
+
+    system = [{"type": "text", "text": system_text,
+               "cache_control": {"type": "ephemeral"}}]
+    resp = llm.create_message(
+        model=cfg.model, system=system,
+        messages=[{"role": "user", "content": "\n".join(lines)}],
+        tools=RISK_TOOL, max_tokens=cfg.max_tokens, temperature=cfg.temperature,
+    )
+    out: dict[str, float] = {}
+    for block in resp.get("content", []) or []:
+        if block.get("type") == "tool_use" and block.get("name") == "submit_risk_review":
+            for r in (block.get("input", {}) or {}).get("reviews", []) or []:
+                code = str(r.get("code", "")).strip()
+                if not code:
+                    continue
+                try:
+                    kp = float(r.get("keep_pct", 1.0))
+                except (TypeError, ValueError):
+                    kp = 1.0
+                out[code] = max(0.0, min(1.0, kp))
+    return out
+
+
+def run_risk_debate(llm: LLMClient, orders: list[dict], portfolio: dict,
+                    goal, cfg: LLMConfig) -> dict[str, float]:
+    """Aggressive/Neutral/Conservative each review order sizes; aggregate to
+    one keep_pct per code by the goal's risk tolerance (low→min, medium→mean,
+    high→max). keep_pct ≤ 1 by construction, so this can only shrink/veto the
+    manager's sizes, never inflate them. Degrades to {} (no change) on error.
+    """
+    try:
+        agg = _risk_review_one(llm, RISK_AGGRESSIVE_SYSTEM, orders, portfolio, goal, cfg)
+        neu = _risk_review_one(llm, RISK_NEUTRAL_SYSTEM, orders, portfolio, goal, cfg)
+        con = _risk_review_one(llm, RISK_CONSERVATIVE_SYSTEM, orders, portfolio, goal, cfg)
+    except Exception as e:
+        logger.warning(f"risk debate failed, leaving sizes unchanged: {e}")
+        return {}
+    rt = (goal.risk_tolerance.value if hasattr(goal.risk_tolerance, "value")
+          else str(goal.risk_tolerance)).lower()
+    out: dict[str, float] = {}
+    for o in orders:
+        code = o.get("code", "")
+        vals = [d.get(code, 1.0) for d in (agg, neu, con)]
+        if rt == "low":
+            keep = min(vals)
+        elif rt == "high":
+            keep = max(vals)
+        else:
+            keep = sum(vals) / len(vals)
+        out[code] = max(0.0, min(1.0, keep))
+    return out
+
+
 # ------------------------------------------------------- context builder
 
 def build_context_message(
@@ -348,6 +552,7 @@ def build_context_message(
     recent_decisions: list[dict],
     max_candidates: int = 20,
     max_decisions: int = 5,
+    reflections: list[dict] | None = None,
 ) -> str:
     """Compact, deterministic textual context for the LLM.
 
@@ -382,9 +587,11 @@ def build_context_message(
 
     lines.append(f"# 候选股 (top {max_candidates}, 按 final_score 降序)")
     for c in candidates[:max_candidates]:
+        sent = (f" 情绪={c.sentiment_score:+.2f}"
+                if getattr(c, "sentiment_score", 0.0) else "")
         lines.append(
             f"- {c.code} | final={c.final_score:.2f} "
-            f"strat={c.strategy_score:.2f} factor={c.factor_score:+.2f} "
+            f"strat={c.strategy_score:.2f} factor={c.factor_score:+.2f}{sent} "
             f"行业={c.industry or '未知'} "
             f"策略={'+'.join(c.contributing_strategies) or '无'}"
         )
@@ -398,6 +605,13 @@ def build_context_message(
     if not recent_decisions:
         lines.append("- (无近期决策)")
     lines.append("")
+
+    if reflections:
+        lines.append("# 历史经验 (按相关度, 绑定已实现盈亏)")
+        for it in reflections:
+            lines.append(f"- {it.get('text', '')}")
+        lines.append("")
+
     lines.append("请基于以上信息调用 propose_orders。")
     return "\n".join(lines)
 
@@ -426,9 +640,31 @@ def run_llm_decision(
     portfolio = broker.snapshot_portfolio()
     recent = db.list_decisions(limit=cfg.max_decisions_in_context)
 
+    # Outcome-keyed reflections: relevant past round-trips bound to realized
+    # P&L, replacing pure "recent N" with "relevant N". Read-only, no LLM cost.
+    reflections: list[dict] = []
+    if cfg.reflection_enabled:
+        try:
+            from quanti.agent.reflection import build_reflections
+            reflections = build_reflections(db, candidates,
+                                             max_items=cfg.max_reflections)
+        except Exception as e:
+            logger.warning(f"reflection build failed, skipping: {e}")
+
     ctx = build_context_message(goal, portfolio, candidates, recent,
                                 max_candidates=cfg.max_candidates_in_context,
-                                max_decisions=cfg.max_decisions_in_context)
+                                max_decisions=cfg.max_decisions_in_context,
+                                reflections=reflections)
+
+    # Optional Bull/Bear debate. The transcript is appended to the context so
+    # the judgment loop below acts as the research manager weighing both sides.
+    debate_rounds: list[dict] = []
+    if cfg.debate_enabled:
+        transcript, debate_rounds = run_debate(llm_client, ctx, cfg)
+        if transcript:
+            ctx = (ctx + "\n\n# 多空辩论\n" + transcript +
+                   "\n\n以上为多空研究员的辩论。请作为研究主管,"
+                   "权衡双方观点后调用 propose_orders。")
 
     def dispatcher(name: str, inp: dict) -> str:
         if name == "inspect_position":
@@ -472,6 +708,26 @@ def run_llm_decision(
     # Cap at 5 orders even if LLM ignored its own instruction.
     valid_orders = valid_orders[:5]
 
+    # Optional risk-debate triad. Aggressive/Neutral/Conservative reviewers
+    # return a keep_pct ∈ [0, 1] per order; aggregation follows the goal's risk
+    # tolerance (low→min, medium→mean, high→max). They can only SHRINK or veto
+    # the manager's size — never exceed it — and the mechanical RiskManager
+    # still gates every resulting order downstream.
+    risk_review: dict[str, float] = {}
+    if cfg.risk_debate_enabled and valid_orders:
+        risk_review = run_risk_debate(llm_client, valid_orders, portfolio, goal, cfg)
+        if risk_review:
+            kept: list[dict] = []
+            for o in valid_orders:
+                keep = risk_review.get(o["code"], 1.0)
+                new_size = float(o.get("size_pct", 0)) * keep
+                if new_size >= 0.01:
+                    kept.append({**o, "size_pct": new_size})
+                else:
+                    rejection_reasons.append(
+                        f"risk triad cut {o['code']} below floor (keep={keep:.2f})")
+            valid_orders = kept
+
     # Convert to Signal objects. The broker's sizer (if configured) will
     # then turn size_pct into a notional. We use signal.strength = size_pct
     # so a FixedSizer with max_pct=0.10 will deploy exactly the LLM's request
@@ -499,6 +755,9 @@ def run_llm_decision(
         "stop_loss_filled": sl_count,
         "usage": debug.get("usage", {}),
         "iterations": debug.get("iterations", 0),
+        "debate_rounds": debate_rounds,
+        "risk_review": risk_review,
+        "n_reflections": len(reflections),
     }
     db.log_decision(
         "llm_cycle",
@@ -514,5 +773,8 @@ def run_llm_decision(
         "reasoning": reasoning,
         "llm_orders": valid_orders,
         "snapshot": snapshot,
+        "debate": debate_rounds,
+        "risk_review": risk_review,
+        "reflections": reflections,
         "debug": debug,
     }
