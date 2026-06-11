@@ -22,15 +22,14 @@ The "best" score blends:
 
 from __future__ import annotations
 
-import copy
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
 from quanti.agent.goal import Goal, RiskTolerance
-from quanti.agent.walk_forward import WalkForwardResult, run_walk_forward
+from quanti.agent.walk_forward import run_walk_forward
 from quanti.backtest.engine import BacktestEngine
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider

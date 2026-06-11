@@ -10,7 +10,6 @@ Vol-targeting is the substantive change here. Verify that:
 
 from __future__ import annotations
 
-import math
 from datetime import date
 
 import numpy as np

@@ -1,6 +1,6 @@
 """Tests for core domain models."""
 
-from datetime import date, datetime
+from datetime import date
 
 import pytest
 

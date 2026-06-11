@@ -11,7 +11,7 @@ from quanti.backtest.metrics import compute_metrics
 from quanti.backtest.engine import BacktestEngine
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
-from quanti.models import BarData, Direction, Signal
+from quanti.models import Direction, Signal
 from quanti.strategy.base import BaseStrategy
 
 
@@ -35,7 +35,6 @@ class TestAShareCommission:
 class TestMetrics:
     def test_compute_metrics(self):
         # Simulate a simple equity curve
-        dates = pd.date_range("2024-01-01", periods=252, freq="B")
         np.random.seed(42)
         returns = np.random.randn(252) * 0.01
         equity = 100_000 * (1 + pd.Series(returns)).cumprod()

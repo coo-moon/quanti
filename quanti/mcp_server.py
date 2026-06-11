@@ -26,7 +26,6 @@ import logging
 import sys
 import traceback
 from datetime import date, timedelta
-from pathlib import Path
 from typing import Any
 
 from quanti.agent.goal import Goal, RiskTolerance, load_goal, save_goal
@@ -416,7 +415,7 @@ def _handle_tool_call(ctx: QuantiContext, name: str, args: dict[str, Any]) -> An
         for c in args["codes"]:
             try:
                 out[c] = adapter.sync_daily_quotes(c, repair_gaps=False)
-            except Exception as e:
+            except Exception:
                 out[c] = 0
         return out
     return {"error": f"unknown tool: {name}"}

@@ -105,7 +105,7 @@ class TestLiquidityFilter:
                              strategies_dir="strategies",
                              screeners_dir="screeners")
         goal = Goal(params={"liquidity_filter": True})
-        first = agent._resolve_universe(goal)
+        agent._resolve_universe(goal)
         assert agent._universe_cache is not None
         # Plant a sentinel in the cached list — if cache is reused, second
         # call must return the same (mutated) object's content.
@@ -229,7 +229,6 @@ class TestConfigurableSelectorCap:
     def test_selector_max_universe_floor(self):
         """Selector should clamp very small max_universe values up to 20
         so a misconfiguration doesn't produce statistically useless caps."""
-        from quanti.agent.selector import StrategySelector
         # We don't need to run a real backtest — just check the floor logic
         # by reading what `capped = codes[:max(20, max_universe)]` does.
         # max_universe=5 → effective cap = 20.

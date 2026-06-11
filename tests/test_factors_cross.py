@@ -25,7 +25,6 @@ from quanti.factors.cross_sectional import (
     factor_momentum_6m,
     factor_realized_vol_20d,
     factor_reversal_1w,
-    factor_turnover_20d,
     rank_by_composite,
 )
 

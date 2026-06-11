@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import pytest
 
-from quanti.factors.registry import FactorRegistry, register_factor
+from quanti.factors.registry import FactorRegistry
 from quanti.factors.technical import compute_ma, compute_rsi, compute_macd
 
 

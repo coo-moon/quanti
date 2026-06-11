@@ -34,7 +34,6 @@ from quanti.risk.manager import RiskConfig, RiskManager
 from quanti.risk.sizer import Sizer
 from quanti.utils.market import (
     count_trading_days_between,
-    is_trading_day,
     next_trading_bar,
 )
 

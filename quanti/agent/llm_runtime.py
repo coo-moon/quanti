@@ -34,9 +34,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
 from quanti.agent.goal import Goal
 from quanti.agent.signal_pipeline import FusedCandidate

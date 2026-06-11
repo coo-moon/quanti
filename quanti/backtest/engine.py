@@ -11,7 +11,7 @@ from quanti.backtest.commission import AShareCommission
 from quanti.backtest.metrics import compute_metrics
 from quanti.backtest.slippage import SlippageModel, VolumeImpactSlippage, coerce
 from quanti.data.provider import DataProvider
-from quanti.models import BarData, Direction, Order, OrderStatus, Portfolio, Position, Signal
+from quanti.models import BarData, Direction, Portfolio, Position, Signal
 from quanti.risk.manager import RiskManager
 from quanti.strategy.base import BaseStrategy
 

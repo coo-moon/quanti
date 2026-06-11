@@ -40,7 +40,7 @@ from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.paper_broker import PaperBroker
 from quanti.factors.cross_sectional import FactorConfig, compute_factor_panel
-from quanti.models import BarData, Direction, Signal
+from quanti.models import Direction, Signal
 from quanti.screener.loader import ScreenerLoader
 from quanti.strategy.loader import StrategyLoader
 
@@ -740,7 +740,6 @@ class AgentRuntime:
         # count of queued signals. Surface both so users see the lifecycle.
         # `pending_result` (from the start of this tick) shows what filled
         # from PRIOR ticks' queue at today's open.
-        landed = result.filled + result.pending
         landed_label = f"成交 {result.filled}" if result.filled else f"挂单 {result.pending}"
         pre_filled = pending_result.filled if pending_result else 0
         pre_pending = pending_result.still_pending if pending_result else 0
