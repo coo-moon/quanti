@@ -62,3 +62,28 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     low_close = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
+
+
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average Directional Index (Wilder). Trend-STRENGTH, direction-agnostic.
+
+    ADX >= 25 → trending; < 20 → ranging/choppy; 20-25 transitional. Needs
+    high/low/close. Uses Wilder smoothing (RMA ≈ ewm alpha=1/period). Returns
+    a Series aligned to df; leading values are NaN until enough history.
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+
+    rma = lambda s: s.ewm(alpha=1.0 / period, adjust=False).mean()  # noqa: E731
+    atr = rma(tr).replace(0, np.nan)
+    plus_di = 100.0 * rma(plus_dm) / atr
+    minus_di = 100.0 * rma(minus_dm) / atr
+    denom = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / denom
+    return rma(dx)
