@@ -41,10 +41,32 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+#: A-share daily bars publish shortly after the 15:00 close; feeds are
+#: reliably serving them by this wall-clock boundary.
+MARKET_CLOSE_GRACE = dtime(15, 30)
+
+
+def expected_latest_bar(now: datetime) -> date:
+    """The most recent calendar date whose daily bar should exist upstream.
+
+    Before the post-close boundary we expect the previous trading day's bar
+    (today's doesn't exist yet); after it, today's. Weekends roll back to
+    Friday. Weekday fallback instead of trade_calendar because the calendar
+    table is typically unsynced — same convention as the paper broker. CN
+    holidays therefore look like one stale day: the whole universe gets one
+    no-new-data probe and lands in flat backoff, which is cheap and correct.
+    """
+    d = now.date()
+    if now.time() < MARKET_CLOSE_GRACE:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:  # Sat/Sun
+        d -= timedelta(days=1)
+    return d
 
 
 @dataclass
@@ -65,8 +87,11 @@ class BackgroundSyncConfig:
     daily-bar trading."""
 
     stale_after_days: int = 1
-    """A code is "stale" if its latest bar date is older than this many days.
-    1 = bars from before yesterday trigger a refresh."""
+    """A code is "stale" once its latest bar is more than (stale_after_days-1)
+    days behind the expected latest bar — today after the post-close grace
+    (15:30), the previous trading day before it. 1 = refresh as soon as the
+    newest expected bar is missing, i.e. one whole-universe incremental sweep
+    shortly after each close, quiet the rest of the day."""
 
     failure_backoff_sec: int = 30 * 60
     """Base backoff after a failed (or no-new-data) sync. Hard failures double
@@ -114,10 +139,12 @@ class BackgroundQuoteSyncer:
         db,  # Database (untyped to avoid circular import)
         adapter_factory=None,  # callable returning an AkShareAdapter; for tests
         config: BackgroundSyncConfig | None = None,
+        now_fn=None,  # () -> datetime; injectable clock for tests
     ) -> None:
         self._db = db
         self._cfg = config or BackgroundSyncConfig()
         self._adapter_factory = adapter_factory or self._default_adapter_factory
+        self._now = now_fn or datetime.now
 
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
@@ -269,8 +296,16 @@ class BackgroundQuoteSyncer:
         Result is bounded by `max_queue_size`. Backed-off codes are skipped.
         """
         try:
-            today = date.today()
-            stale_cutoff = today - timedelta(days=self._cfg.stale_after_days)
+            # Market-hours-aware freshness: compare against the bar that
+            # should exist NOW (today's after the post-close grace, the
+            # previous trading day's before it) — not a naive calendar
+            # offset. The old `today - stale_after_days` rule meant "yes-
+            # terday's bar is always fresh enough", so the day's bars were
+            # only pulled the NEXT day, and the agent's evening tick traded
+            # on stale closes.
+            expected = expected_latest_bar(self._now())
+            stale_cutoff = expected - timedelta(
+                days=self._cfg.stale_after_days - 1)
             now_ts = time.time()
 
             # Held first
@@ -327,7 +362,8 @@ class BackgroundQuoteSyncer:
             logger.info(
                 f"bg-sync scan: {len(all_codes)} known, "
                 f"queued {len(ordered)} (held={len(held_codes)}, "
-                f"missing={len(missing)}, stale={len(stale)})"
+                f"missing={len(missing)}, stale={len(stale)}, "
+                f"expected_bar={expected})"
             )
         except Exception as e:
             logger.exception(f"bg-sync scan failed: {e}")
