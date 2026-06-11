@@ -67,3 +67,20 @@ def test_garbage_quote_date_does_not_crash(tmp_path):
     db.conn.commit()
     assert db.get_latest_quote_date("000001") == date(2026, 6, 10)
     db.close()
+
+
+def test_global_latest_quote_date(tmp_path):
+    """Max bar date across all codes (feeds the dashboard 最近更新 card);
+    None on an empty table."""
+    db = Database(str(tmp_path / "gl.db"))
+    db.initialize()
+    assert db.get_global_latest_quote_date() is None
+
+    for code, d in (("000001", "2026-06-10"), ("920985", "2026-06-11")):
+        db.conn.execute(
+            "INSERT INTO daily_quotes (code, date, open, high, low, close,"
+            " volume, amount, turnover) VALUES (?,?,?,?,?,?,?,?,?)",
+            (code, d, 1, 1, 1, 1, 1, 1, 1))
+    db.conn.commit()
+    assert db.get_global_latest_quote_date() == date(2026, 6, 11)
+    db.close()

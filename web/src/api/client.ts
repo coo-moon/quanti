@@ -55,6 +55,7 @@ export interface StockPoolStats {
   with_quotes: number;
   exchange_sh: number;
   exchange_sz: number;
+  latest_quote_date: string | null;
 }
 
 export const fetchStockStats = () => api.get<StockPoolStats>("/stocks/stats");

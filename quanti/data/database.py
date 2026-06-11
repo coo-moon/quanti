@@ -399,13 +399,12 @@ class Database:
             df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
 
-    def get_latest_quote_date(self, code: str) -> date | None:
-        row = self.conn.execute(
-            "SELECT MAX(date) FROM daily_quotes WHERE code=?", (code,)
-        ).fetchone()
-        if row is None or row[0] is None:
+    @staticmethod
+    def _safe_quote_date(v) -> date | None:
+        """Tolerant parse of a stored quote date. Garbage → None ("no usable
+        data"), so the next sync cold-starts and overwrites the bad value."""
+        if v is None:
             return None
-        v = row[0]
         if isinstance(v, datetime):
             return v.date()
         if isinstance(v, date):
@@ -413,9 +412,18 @@ class Database:
         try:
             return date.fromisoformat(str(v)[:10])
         except (ValueError, TypeError):
-            # Garbage row → behave as "no usable data"; the next sync
-            # cold-starts the code and overwrites the bad value.
             return None
+
+    def get_latest_quote_date(self, code: str) -> date | None:
+        row = self.conn.execute(
+            "SELECT MAX(date) FROM daily_quotes WHERE code=?", (code,)
+        ).fetchone()
+        return self._safe_quote_date(row[0]) if row else None
+
+    def get_global_latest_quote_date(self) -> date | None:
+        """Newest bar date across the whole daily_quotes table (any code)."""
+        row = self.conn.execute("SELECT MAX(date) FROM daily_quotes").fetchone()
+        return self._safe_quote_date(row[0]) if row else None
 
     # --- Trade calendar ---
 
