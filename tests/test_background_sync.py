@@ -14,9 +14,8 @@ returns scripted outcomes. What we want to verify:
 from __future__ import annotations
 
 import time
-from datetime import date
+from datetime import date, timedelta
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -161,13 +160,24 @@ class TestQueueBuilding:
         syncer = BackgroundQuoteSyncer(
             db=db_with_stocks, adapter_factory=lambda: adapter,
             config=BackgroundSyncConfig(failure_backoff_sec=3600))
-        syncer._failed_backoff["BBB"] = time.time() + 3600
+        syncer._backoff_until["BBB"] = time.time() + 3600
         syncer._scan_and_enqueue()
         queued = list(syncer._queue)
         assert "BBB" not in queued, \
             f"BBB in backoff should be skipped, got {queued}"
         # CCC and AAA still go through
         assert "CCC" in queued
+
+    def test_held_code_respects_backoff(self, db_with_stocks):
+        """Held codes jump the queue but must still honor backoff — otherwise
+        a held halted stock (nothing new to fetch) is re-fetched every loop."""
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks,
+            adapter_factory=lambda: StubAdapter(db_with_stocks),
+            config=BackgroundSyncConfig(failure_backoff_sec=3600))
+        syncer._backoff_until["AAA"] = time.time() + 3600  # AAA is held
+        syncer._scan_and_enqueue()
+        assert "AAA" not in list(syncer._queue)
 
 
 class TestBatchProcessing:
@@ -203,7 +213,7 @@ class TestBatchProcessing:
         assert s.synced_session == 0
         assert s.failed_session == 1
         # And the code is in backoff.
-        assert "BBB" in syncer._failed_backoff
+        assert "BBB" in syncer._backoff_until
 
     def test_exception_counts_as_failure(self, db_with_stocks):
         adapter = StubAdapter(db_with_stocks,
@@ -217,8 +227,90 @@ class TestBatchProcessing:
         syncer._process_batch()
         s = syncer.status()
         assert s.failed_session == 1
-        assert "BBB" in syncer._failed_backoff
+        assert "BBB" in syncer._backoff_until
         assert s.last_error and "api down" in s.last_error
+
+    def test_no_new_bars_backs_off(self, db_with_stocks):
+        """A fetch that succeeds but yields nothing newer (halted stock
+        re-serving its old last bar) must enter backoff instead of being
+        re-queued every loop — this was an infinite ~20s re-sync cycle for
+        suspended ST stocks in production."""
+        adapter = StubAdapter(db_with_stocks)  # returns 1, writes nothing
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks, adapter_factory=lambda: adapter,
+            config=BackgroundSyncConfig(per_code_sleep_sec=0.0, batch_size=1,
+                                        failure_backoff_sec=1800))
+        syncer._queue.append("CCC")  # stale, has data
+        syncer._process_batch()
+        s = syncer.status()
+        assert s.synced_session == 1            # the fetch itself succeeded
+        assert s.failed_session == 0            # ...and is NOT a failure
+        assert "CCC" in syncer._backoff_until   # ...but won't retry at once
+        assert "CCC" not in syncer._fail_counts  # no failure streak started
+        # The next scan must skip it.
+        syncer._scan_and_enqueue()
+        assert "CCC" not in list(syncer._queue)
+
+    def test_new_bars_clear_backoff_and_streak(self, db_with_stocks):
+        """A sync that lands genuinely new bars resets both the failure
+        streak and any standing backoff."""
+        class WritingStub(StubAdapter):
+            def sync_daily_quotes(self, code, start=None, end=None,
+                                  repair_gaps=True):
+                today = pd.Timestamp.today().normalize()
+                self._db.save_daily_quotes(pd.DataFrame({
+                    "code": code, "date": [today.date()],
+                    "open": 10, "high": 10, "low": 10, "close": 10,
+                    "volume": 1e6, "amount": 1e7, "turnover": 1.0,
+                }))
+                return super().sync_daily_quotes(code, start, end, repair_gaps)
+
+        adapter = WritingStub(db_with_stocks)
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks, adapter_factory=lambda: adapter,
+            config=BackgroundSyncConfig(per_code_sleep_sec=0.0, batch_size=1))
+        syncer._fail_counts["CCC"] = 3
+        syncer._backoff_until["CCC"] = time.time() - 1  # expired entry
+        syncer._queue.append("CCC")
+        syncer._process_batch()
+        assert syncer.status().synced_session == 1
+        assert "CCC" not in syncer._fail_counts
+        assert "CCC" not in syncer._backoff_until
+
+    def test_hard_failure_backoff_is_exponential(self, db_with_stocks):
+        """Consecutive hard failures double the backoff window up to the
+        cap: base 100s → 200s → 400s(cap) → 400s."""
+        adapter = StubAdapter(db_with_stocks,
+                              results={"BBB": RuntimeError("x")})
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks, adapter_factory=lambda: adapter,
+            config=BackgroundSyncConfig(per_code_sleep_sec=0.0, batch_size=1,
+                                        failure_backoff_sec=100,
+                                        max_backoff_sec=400))
+        for want in (100, 200, 400, 400):
+            syncer._queue.append("BBB")
+            syncer._process_batch()
+            delay = syncer._backoff_until["BBB"] - time.time()
+            assert want - 5 < delay <= want, f"want ~{want}s got {delay:.0f}s"
+        assert syncer._fail_counts["BBB"] == 4
+
+    def test_incremental_start_for_existing_data(self, db_with_stocks):
+        """Codes with existing bars fetch incrementally (start=None → the
+        adapter resumes from their latest bar); only no-data codes pay the
+        bounded cold-start (today - lookback_days). Previously every code was
+        force-fed start=today-365, re-pulling a full year each loop."""
+        adapter = StubAdapter(db_with_stocks)
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks, adapter_factory=lambda: adapter,
+            config=BackgroundSyncConfig(per_code_sleep_sec=0.0, batch_size=3,
+                                        batch_idle_sec=0.0, lookback_days=365))
+        # CCC: stale-but-has-data, AAA: fresh-has-data, BBB: no data.
+        syncer._queue.extend(["CCC", "AAA", "BBB"])
+        syncer._process_batch()
+        starts = {c: start for c, start, _ in adapter.calls}
+        assert starts["CCC"] is None   # has data → incremental
+        assert starts["AAA"] is None   # has data → incremental
+        assert starts["BBB"] == date.today() - timedelta(days=365)  # cold-start
 
 
 class TestStatusSnapshot:

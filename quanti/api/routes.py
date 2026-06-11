@@ -228,6 +228,7 @@ async def background_sync_status(request: Request):
         "queue_remaining": s.queue_remaining,
         "synced_session": s.synced_session,
         "failed_session": s.failed_session,
+        "backoff_codes": s.backoff_codes,
         "last_full_scan_at": s.last_full_scan_at,
         "last_error": s.last_error,
         "config": s.config,
