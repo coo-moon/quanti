@@ -598,6 +598,20 @@ class AgentRuntime:
             return {"ok": False, "reason": summary}
 
         self._ensure_recent_data(universe)
+
+        # Observe-only regime detection (v1): logs a `regime` decision so we can
+        # eyeball whether it classifies trend/range/high-vol correctly. Does NOT
+        # change candidate generation or sizing. Gated; never raises.
+        if (goal.params or {}).get("regime_detect"):
+            try:
+                from quanti.agent.regime import detect_regime, last_regime_label
+                rs = detect_regime(self._provider, date.today(),
+                                   universe=universe,
+                                   prev_label=last_regime_label(self._db))
+                self._db.log_decision("regime", rs.summary(), details=rs.as_dict())
+            except Exception as e:
+                logger.warning(f"regime detect skipped: {e}")
+
         candidates = self._run_screener(goal, universe)
         if not candidates:
             # No screener (or screener returned nothing): take the top N by

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -292,6 +292,24 @@ class Database:
         )
         self.conn.commit()
 
+    @staticmethod
+    def _safe_list_date(v) -> date:
+        """Parse a stored list_date defensively.
+
+        A malformed/missing value must NEVER crash universe building — one bad
+        stock row (seen in the wild for quirky new-board names whose feed
+        returns a non-str/garbage list date) would otherwise kill the entire
+        agent tick via `_filter_metadata → get_stock`. Falls back to a very old
+        date so the stock is treated as long-listed rather than dropped;
+        downstream liquidity / ST / risk filters still apply.
+        """
+        if isinstance(v, date):
+            return v
+        try:
+            return date.fromisoformat(str(v)[:10])
+        except (ValueError, TypeError):
+            return date(1990, 1, 1)
+
     def get_stock(self, code: str) -> StockInfo | None:
         row = self.conn.execute(
             "SELECT code, name, exchange, list_date, industry FROM stocks WHERE code=?",
@@ -303,7 +321,7 @@ class Database:
             code=row[0],
             name=row[1],
             exchange=row[2],
-            list_date=date.fromisoformat(row[3]),
+            list_date=self._safe_list_date(row[3]),
             industry=row[4],
         )
 
@@ -316,7 +334,7 @@ class Database:
                 code=r[0],
                 name=r[1],
                 exchange=r[2],
-                list_date=date.fromisoformat(r[3]),
+                list_date=self._safe_list_date(r[3]),
                 industry=r[4],
             )
             for r in rows
@@ -387,7 +405,17 @@ class Database:
         ).fetchone()
         if row is None or row[0] is None:
             return None
-        return date.fromisoformat(row[0])
+        v = row[0]
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+        try:
+            return date.fromisoformat(str(v)[:10])
+        except (ValueError, TypeError):
+            # Garbage row → behave as "no usable data"; the next sync
+            # cold-starts the code and overwrites the bad value.
+            return None
 
     # --- Trade calendar ---
 
@@ -479,7 +507,7 @@ class Database:
             (pool_name,),
         ).fetchall()
         return [
-            StockInfo(code=r[0], name=r[1], exchange=r[2], list_date=date.fromisoformat(r[3]), industry=r[4])
+            StockInfo(code=r[0], name=r[1], exchange=r[2], list_date=self._safe_list_date(r[3]), industry=r[4])
             for r in rows
         ]
 

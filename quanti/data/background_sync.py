@@ -18,9 +18,13 @@ Design:
       IDLE    — queue drained; sleep `idle_interval_sec` (~30 min), rescan.
       PAUSED  — explicitly disabled via `pause()`; no work, just heartbeat.
   * Scan priority: held positions > codes with no bars > codes with stale bars.
-  * Per-code failure backoff: after one error, skip that code for
-    `failure_backoff_sec` (default 30 min) so a persistently-broken endpoint
-    doesn't burn through the entire universe.
+  * Per-code backoff (held codes included):
+      - hard failure (exception / 0 rows): exponential, `failure_backoff_sec`
+        doubling per consecutive failure up to `max_backoff_sec` — a feed that
+        simply lacks the code (e.g. 北交所 on Sina) settles at a few probes/day.
+      - synced but latest bar didn't advance (suspended/halted stock, or
+        today's bar not published yet): flat `failure_backoff_sec`. Without
+        this, a halted stock stays "stale" forever and re-syncs every loop.
   * Lockless reads of status (single-writer thread). Counters are session-
     scoped — they reset when the syncer starts, not at midnight.
 
@@ -65,8 +69,14 @@ class BackgroundSyncConfig:
     1 = bars from before yesterday trigger a refresh."""
 
     failure_backoff_sec: int = 30 * 60
-    """After a failed sync, skip this code for this long. Prevents one bad
-    code (delisted, removed from feed) from being retried every loop."""
+    """Base backoff after a failed (or no-new-data) sync. Hard failures double
+    this per consecutive failure, capped at `max_backoff_sec`. Prevents one
+    bad code (delisted, removed from feed) from being retried every loop."""
+
+    max_backoff_sec: int = 4 * 3600
+    """Ceiling for the exponential failure backoff (default 4h). A code the
+    feed will never serve still gets re-probed a few times a day, so it heals
+    on its own if the feed starts covering it."""
 
     lookback_days: int = 365
     """How much history to request when filling in a missing code. The
@@ -90,6 +100,7 @@ class BackgroundSyncStatus:
     queue_remaining: int = 0
     synced_session: int = 0
     failed_session: int = 0
+    backoff_codes: int = 0
     last_full_scan_at: Optional[str] = None
     last_error: Optional[str] = None
     config: dict = field(default_factory=dict)
@@ -118,7 +129,8 @@ class BackgroundQuoteSyncer:
         self._state: str = "stopped"
         self._current_code: str | None = None
         self._queue: deque[str] = deque()
-        self._failed_backoff: dict[str, float] = {}  # code → unix ts to retry
+        self._backoff_until: dict[str, float] = {}  # code → unix ts to retry
+        self._fail_counts: dict[str, int] = {}  # code → consecutive hard fails
         self._synced_session = 0
         self._failed_session = 0
         self._started_at: str | None = None
@@ -195,6 +207,8 @@ class BackgroundQuoteSyncer:
                 queue_remaining=len(self._queue),
                 synced_session=self._synced_session,
                 failed_session=self._failed_session,
+                backoff_codes=sum(
+                    1 for ts in self._backoff_until.values() if ts > time.time()),
                 last_full_scan_at=self._last_full_scan_at,
                 last_error=self._last_error,
                 config={
@@ -203,6 +217,7 @@ class BackgroundQuoteSyncer:
                     "stale_after_days": cfg.stale_after_days,
                     "idle_interval_sec": cfg.idle_interval_sec,
                     "failure_backoff_sec": cfg.failure_backoff_sec,
+                    "max_backoff_sec": cfg.max_backoff_sec,
                 },
             )
 
@@ -277,12 +292,19 @@ class BackgroundQuoteSyncer:
             # Compute "latest quote date" per code in one DB pass if possible.
             latest_map = self._fetch_latest_quote_dates(all_codes)
 
+            def backed_off(code: str) -> bool:
+                return self._backoff_until.get(code, 0) > now_ts
+
+            # Backoff applies to held codes too — without it, a held stock
+            # whose feed has nothing new (halted, or today's bar not out yet)
+            # would be re-fetched every single loop instead of every backoff
+            # window. Held still jumps the queue whenever it IS eligible.
+            held_codes = [c for c in held_codes if not backed_off(c)]
+
             missing: list[str] = []
             stale: list[str] = []
             for code in all_codes:
-                # Failure backoff
-                retry_at = self._failed_backoff.get(code, 0)
-                if retry_at > now_ts:
+                if backed_off(code):
                     continue
                 latest = latest_map.get(code)
                 if latest is None:
@@ -355,7 +377,7 @@ class BackgroundQuoteSyncer:
         cfg = self._cfg
         adapter = None
         end_d = date.today()
-        start_d = end_d - timedelta(days=cfg.lookback_days)
+        cold_start = end_d - timedelta(days=cfg.lookback_days)
 
         for _ in range(cfg.batch_size):
             if self._stop_flag.is_set() or self._pause_flag.is_set():
@@ -366,6 +388,18 @@ class BackgroundQuoteSyncer:
                 code = self._queue.popleft()
                 self._current_code = code
 
+            # Incremental fetch: codes that already have bars pass start=None so
+            # the adapter fetches only from their latest bar forward (its built-in
+            # incremental path). Only no-data codes pay the bounded cold-start
+            # cost. Passing an explicit start=today-365 (as before) defeated the
+            # adapter's incrementalism and re-pulled a full year over the network
+            # for every code, every loop.
+            try:
+                latest_before = self._db.get_latest_quote_date(code)
+            except Exception:
+                latest_before = None
+            start_d = None if latest_before is not None else cold_start
+
             try:
                 if adapter is None:
                     adapter = self._adapter_factory()
@@ -373,26 +407,53 @@ class BackgroundQuoteSyncer:
                 # over completeness; user-triggered sync still does gap repair.
                 count = adapter.sync_daily_quotes(
                     code, start=start_d, end=end_d, repair_gaps=False)
+                try:
+                    latest_after = self._db.get_latest_quote_date(code)
+                except Exception:
+                    latest_after = None
                 with self._lock:
                     if count == 0:
-                        # No data is a soft failure (delisted? halted?) —
-                        # treat as failure for backoff purposes so we don't
-                        # spam-retry the same dead code.
+                        # No data at all (delisted, feed doesn't carry the
+                        # code) — hard failure, exponential backoff.
                         self._failed_session += 1
-                        self._failed_backoff[code] = (
-                            time.time() + cfg.failure_backoff_sec)
+                        self._apply_backoff(code, hard=True)
                     else:
                         self._synced_session += 1
+                        self._fail_counts.pop(code, None)  # streak broken
+                        if latest_after == latest_before:
+                            # Fetch worked but produced nothing NEW (halted
+                            # stock re-serving its old last bar, or today's
+                            # bar not published yet). Flat backoff so the
+                            # scan doesn't re-queue it every loop.
+                            self._apply_backoff(code, hard=False)
+                        else:
+                            self._backoff_until.pop(code, None)
             except Exception as e:
                 logger.warning(f"bg-sync failed for {code}: {e}")
                 with self._lock:
                     self._failed_session += 1
                     self._last_error = f"{code}: {e}"
-                    self._failed_backoff[code] = (
-                        time.time() + cfg.failure_backoff_sec)
+                    self._apply_backoff(code, hard=True)
 
             # Per-code throttle.
             self._sleep_responsive(cfg.per_code_sleep_sec)
 
         with self._lock:
             self._current_code = None
+
+    def _apply_backoff(self, code: str, *, hard: bool) -> None:
+        """Schedule the next retry for `code`. Caller holds `_lock`.
+
+        Hard outcomes (exception / zero rows) escalate exponentially per
+        consecutive failure, capped at `max_backoff_sec`; soft no-new-data
+        outcomes use the flat base window and leave the streak untouched.
+        """
+        cfg = self._cfg
+        if hard:
+            n = self._fail_counts.get(code, 0) + 1
+            self._fail_counts[code] = n
+            delay = min(cfg.failure_backoff_sec * (2 ** (n - 1)),
+                        cfg.max_backoff_sec)
+        else:
+            delay = cfg.failure_backoff_sec
+        self._backoff_until[code] = time.time() + delay
