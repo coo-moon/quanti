@@ -10,7 +10,7 @@ Two things we want to guarantee:
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -19,7 +19,6 @@ import pytest
 from quanti.agent.goal import Goal, RiskTolerance
 from quanti.agent.selector import StrategyEvaluation, StrategySelector
 from quanti.agent.walk_forward import (
-    Fold,
     WalkForwardResult,
     make_folds,
     run_walk_forward,

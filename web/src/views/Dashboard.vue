@@ -214,8 +214,10 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
 const bgSync = ref<BackgroundSyncStatus | null>(null);
 let bgSyncTimer: ReturnType<typeof setInterval> | null = null;
 
+// Newest bar date in the DB — NOT the wall clock. Showing `new Date()`
+// here (as before) claimed the data was current even when it wasn't.
 const lastUpdate = computed(() => {
-  return new Date().toLocaleDateString("zh-CN");
+  return poolStats.value?.latest_quote_date ?? "-";
 });
 
 const bgSyncStateLabel = computed(() => {

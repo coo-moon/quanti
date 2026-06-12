@@ -102,7 +102,7 @@ def cmd_up(args):
     """One-command boot: ensure DB+stocks, set goal if needed, run server + agent."""
     import uvicorn
 
-    from quanti.agent.goal import Goal, RiskTolerance, load_goal, save_goal
+    from quanti.agent.goal import RiskTolerance, load_goal, save_goal
     from quanti.api.app import create_app
     from quanti.data.akshare_adapter import AkShareAdapter
     from quanti.data.database import Database
@@ -162,7 +162,7 @@ def cmd_up(args):
 
 def cmd_agent(args):
     """Inspect or trigger the agent without a server."""
-    from quanti.agent.goal import Goal, RiskTolerance, load_goal, save_goal
+    from quanti.agent.goal import RiskTolerance, load_goal, save_goal
     from quanti.agent.runtime import AgentRuntime
     from quanti.data.database import Database
     from quanti.data.provider import DataProvider

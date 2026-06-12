@@ -276,7 +276,8 @@ class TestAgentRuntime:
 
     def test_prune_decisions(self, tmp_path):
         """prune_decisions should drop rows older than the retention window."""
-        db = Database(str(tmp_path / "prune.db")); db.initialize()
+        db = Database(str(tmp_path / "prune.db"))
+        db.initialize()
         # Insert a fresh row + an artificially old row.
         db.log_decision("trade", "fresh")
         from datetime import datetime, timedelta

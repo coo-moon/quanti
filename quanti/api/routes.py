@@ -60,6 +60,7 @@ class StockPoolStats(BaseModel):
     with_quotes: int  # stocks that have quote data
     exchange_sh: int
     exchange_sz: int
+    latest_quote_date: str | None = None  # newest bar date across all codes
 
 
 class ScreenRequest(BaseModel):
@@ -113,8 +114,6 @@ async def sync_quotes(body: SyncRequest, request: Request):
 @router.post("/sync/quotes/async")
 async def sync_quotes_async(body: SyncRequest, request: Request):
     """Start async sync for given stock codes. Returns job_id immediately."""
-    from datetime import date, timedelta
-    from quanti.data.akshare_adapter import AkShareAdapter
 
     db = request.app.state.db
     codes = body.codes
@@ -272,11 +271,13 @@ async def stock_pool_stats(request: Request):
     db = request.app.state.db
     all_stocks = db.list_stocks()
     with_quotes = request.app.state.provider.get_all_codes()
+    latest = db.get_global_latest_quote_date()
     return StockPoolStats(
         total=len(all_stocks),
         with_quotes=len(with_quotes),
         exchange_sh=sum(1 for s in all_stocks if s.exchange.upper() in ("SH", "SHANGHAI")),
         exchange_sz=sum(1 for s in all_stocks if s.exchange.upper() in ("SZ", "SHENZHEN")),
+        latest_quote_date=latest.isoformat() if latest else None,
     )
 
 
@@ -371,8 +372,6 @@ async def remove_pool_stocks(name: str, body: PoolAddStocksRequest, request: Req
 @router.post("/pools/{name}/sync")
 async def sync_pool_stocks(name: str, request: Request):
     """Start async sync for pool stocks. Returns job_id immediately."""
-    from datetime import timedelta
-    from quanti.data.akshare_adapter import AkShareAdapter
 
     db = request.app.state.db
     if not db.pool_exists(name):

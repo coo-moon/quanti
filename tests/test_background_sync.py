@@ -14,7 +14,7 @@ returns scripted outcomes. What we want to verify:
 from __future__ import annotations
 
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pytest
@@ -22,6 +22,7 @@ import pytest
 from quanti.data.background_sync import (
     BackgroundQuoteSyncer,
     BackgroundSyncConfig,
+    expected_latest_bar,
 )
 from quanti.data.database import Database
 
@@ -334,3 +335,81 @@ class TestStatusSnapshot:
         # completed before we read; both are valid.
         assert s.state in ("active", "idle")
         syncer.shutdown(timeout=2.0)
+
+
+class TestExpectedLatestBar:
+    """2026-06-11 is a Thursday; 06-13/14 the weekend; 06-15 Monday."""
+
+    def test_intraday_expects_previous_day(self):
+        assert expected_latest_bar(
+            datetime(2026, 6, 11, 10, 0)) == date(2026, 6, 10)
+
+    def test_after_close_expects_same_day(self):
+        assert expected_latest_bar(
+            datetime(2026, 6, 11, 15, 30)) == date(2026, 6, 11)
+        assert expected_latest_bar(
+            datetime(2026, 6, 11, 19, 52)) == date(2026, 6, 11)
+
+    def test_weekend_rolls_back_to_friday(self):
+        assert expected_latest_bar(
+            datetime(2026, 6, 13, 12, 0)) == date(2026, 6, 12)
+        assert expected_latest_bar(
+            datetime(2026, 6, 14, 20, 0)) == date(2026, 6, 12)
+
+    def test_monday_morning_expects_friday(self):
+        assert expected_latest_bar(
+            datetime(2026, 6, 15, 9, 0)) == date(2026, 6, 12)
+
+    def test_monday_after_close_expects_monday(self):
+        assert expected_latest_bar(
+            datetime(2026, 6, 15, 16, 0)) == date(2026, 6, 15)
+
+
+class TestMarketHoursStaleness:
+    """Scan freshness must follow the trading clock, not the calendar."""
+
+    def _db_one_stock(self, tmp_path, latest: date) -> Database:
+        db = Database(str(tmp_path / "clock.db"))
+        db.initialize()
+        db.upsert_stock("DDD", "d", "SZ", date(2000, 1, 1), "t")
+        db.save_daily_quotes(pd.DataFrame({
+            "code": "DDD",
+            "date": [latest - timedelta(days=i) for i in range(3)],
+            "open": 10, "high": 10, "low": 10, "close": 10,
+            "volume": 1e6, "amount": 1e7, "turnover": 1.0,
+        }))
+        return db
+
+    def _syncer(self, db, now: datetime) -> BackgroundQuoteSyncer:
+        return BackgroundQuoteSyncer(
+            db=db, adapter_factory=lambda: StubAdapter(db),
+            config=BackgroundSyncConfig(), now_fn=lambda: now)
+
+    def test_yesterdays_bar_goes_stale_only_after_close(self, tmp_path):
+        """The production complaint: at 19:52 on Thu 06-11 the whole
+        universe sat on 06-10 bars and the syncer reported idle (the old
+        rule said yesterday's bar is always fresh). After the post-close
+        grace, yesterday's bar must count as stale; intraday it must not
+        (no pointless churn before today's bar can exist)."""
+        db = self._db_one_stock(tmp_path, date(2026, 6, 10))
+        s = self._syncer(db, datetime(2026, 6, 11, 19, 52))
+        s._scan_and_enqueue()
+        assert "DDD" in list(s._queue)
+
+        s2 = self._syncer(db, datetime(2026, 6, 11, 10, 0))
+        s2._scan_and_enqueue()
+        assert "DDD" not in list(s2._queue)
+        db.close()
+
+    def test_friday_bar_fresh_until_monday_close(self, tmp_path):
+        db = self._db_one_stock(tmp_path, date(2026, 6, 12))  # Friday
+        for now in (datetime(2026, 6, 13, 12, 0),   # Saturday
+                    datetime(2026, 6, 15, 9, 0)):   # Monday pre-open
+            s = self._syncer(db, now)
+            s._scan_and_enqueue()
+            assert list(s._queue) == [], f"unexpected queue at {now}"
+
+        s = self._syncer(db, datetime(2026, 6, 15, 16, 0))  # Mon post-close
+        s._scan_and_enqueue()
+        assert "DDD" in list(s._queue)
+        db.close()

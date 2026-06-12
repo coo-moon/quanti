@@ -28,7 +28,6 @@ import pandas as pd
 
 from quanti.backtest.engine import BacktestEngine
 from quanti.backtest.metrics import compute_metrics
-from quanti.strategy.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 

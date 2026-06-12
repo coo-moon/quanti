@@ -29,13 +29,11 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Iterable
 
 import pandas as pd
 
-from quanti.data.database import Database
 from quanti.data.provider import DataProvider
-from quanti.models import BarData, Direction, Signal
+from quanti.models import Direction, Signal
 from quanti.strategy.base import BaseStrategy
 
 logger = logging.getLogger(__name__)

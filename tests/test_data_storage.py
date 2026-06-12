@@ -1,8 +1,6 @@
 """Tests for database storage layer."""
 
-import tempfile
 from datetime import date
-from pathlib import Path
 
 import pytest
 
