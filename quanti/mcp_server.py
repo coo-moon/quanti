@@ -110,7 +110,7 @@ def _tool_specs() -> list[dict]:
                             "  agent_mode: ''|'llm'（'llm' 启用 LLM 决策路）\n"
                             "  ensemble_enabled: bool（Top-K 策略融合）\n"
                             "  llm_provider: 'anthropic'|'deepseek'；llm_model: str\n"
-                            "    （DeepSeek 用 'deepseek-chat'，需 DEEPSEEK_API_KEY）\n"
+                            "    （DeepSeek 默认 'deepseek-v4-pro'，需 DEEPSEEK_API_KEY）\n"
                             "  sentiment_enabled + sentiment_blend(0~1)：①新闻情绪 overlay\n"
                             "  llm_debate + llm_debate_rounds：②多空辩论\n"
                             "  llm_risk_debate：③风控三角（激进/中性/保守，只能缩仓/否决）\n"

@@ -44,8 +44,8 @@ def make_client():
     """Pick a provider from whichever API key is present. Returns
     (client, model_override or None)."""
     if os.environ.get("DEEPSEEK_API_KEY"):
-        from quanti.agent.openai_compat import DeepSeekLLMClient
-        return DeepSeekLLMClient(), "deepseek-chat"
+        from quanti.agent.openai_compat import DEEPSEEK_DEFAULT_MODEL, DeepSeekLLMClient
+        return DeepSeekLLMClient(), DEEPSEEK_DEFAULT_MODEL
     if os.environ.get("ANTHROPIC_API_KEY"):
         from quanti.agent.llm_runtime import AnthropicLLMClient
         return AnthropicLLMClient(), None  # use SentimentConfig's default model
