@@ -30,7 +30,16 @@ import httpx
 logger = logging.getLogger(__name__)
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"  # V3; supports function calling
+DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro"  # full function-calling support
+
+
+def _thinking_on_by_default(model: str) -> bool:
+    """DeepSeek's explicit v4 ids (deepseek-v4-pro / deepseek-v4-flash) run
+    in "thinking" mode unless told otherwise; the legacy `deepseek-chat`
+    alias (currently served by v4-flash) does not. Verified live 2026-06-11:
+    thinking mode rejects a *forced* tool_choice with HTTP 400, while both
+    tool_choice="auto" and thinking={"type": "disabled"} work fine."""
+    return model.startswith("deepseek-v4")
 
 _FINISH_TO_STOP = {
     "tool_calls": "tool_use",
@@ -196,6 +205,11 @@ class OpenAICompatLLMClient:
             return self._default_model
         return str(model)
 
+    def resolved_model(self, model: str | None) -> str:
+        """The model id actually sent for a requested (possibly Anthropic)
+        name — lets callers log ground truth instead of the alias."""
+        return self._resolve_model(model)
+
     def create_message(self, *, model, system, messages, tools,
                         max_tokens, temperature) -> dict:
         payload: dict = {
@@ -215,6 +229,12 @@ class OpenAICompatLLMClient:
                     "type": "function",
                     "function": {"name": oai_tools[0]["function"]["name"]},
                 }
+                # v4 thinking mode 400s on a forced tool_choice, and pure
+                # structured-output calls gain nothing from CoT — turn it
+                # off for this request only. Free-text and multi-tool calls
+                # keep thinking (that's what v4-pro is for).
+                if _thinking_on_by_default(payload["model"]):
+                    payload["thinking"] = {"type": "disabled"}
         resp = self._client.post(self._url, headers=self._headers, json=payload)
         resp.raise_for_status()
         return from_openai_response(resp.json())

@@ -127,23 +127,37 @@ class TestCreateMessage:
         client, cap = _client_capturing(
             _oai_tool_resp("submit_sentiment", {"scores": [{"code": "600519", "score": 0.5}]}))
         resp = client.create_message(
-            model="claude-sonnet-4-5",  # should remap to deepseek-chat
+            model="claude-sonnet-4-5",  # should remap to the v4 default
             system=[{"type": "text", "text": "SYS", "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": "score it"}],
             tools=ONE_TOOL, max_tokens=256, temperature=0.0)
 
         p = cap["payload"]
-        assert p["model"] == "deepseek-chat"          # claude id remapped
+        assert p["model"] == "deepseek-v4-pro"        # claude id remapped
         assert p["messages"][0] == {"role": "system", "content": "SYS"}
         assert p["messages"][1] == {"role": "user", "content": "score it"}
         assert p["tools"][0]["function"]["name"] == "submit_sentiment"
         # single tool → forced
         assert p["tool_choice"]["function"]["name"] == "submit_sentiment"
+        # v4 thinking mode rejects a forced tool_choice → must be disabled
+        # for this request (and only this kind of request).
+        assert p["thinking"] == {"type": "disabled"}
         assert cap["url"].endswith("/v1/chat/completions")
         assert cap["auth"] == "Bearer test-key"
         # response translated
         assert resp["stop_reason"] == "tool_use"
         assert resp["content"][0]["input"] == {"scores": [{"code": "600519", "score": 0.5}]}
+
+    def test_forced_tool_on_nonthinking_model_sends_no_thinking_key(self):
+        client, cap = _client_capturing(
+            _oai_tool_resp("submit_sentiment", {"scores": []}))
+        client.create_message(
+            model="deepseek-chat",  # legacy alias: thinking off by default
+            system="S", messages=[{"role": "user", "content": "x"}],
+            tools=ONE_TOOL, max_tokens=64, temperature=0.0)
+        p = cap["payload"]
+        assert p["tool_choice"]["function"]["name"] == "submit_sentiment"
+        assert "thinking" not in p
 
     def test_no_tools_means_no_tool_choice(self):
         client, cap = _client_capturing(_oai_text_resp("看多"))
@@ -155,12 +169,42 @@ class TestCreateMessage:
         assert "tool_choice" not in cap["payload"]
         assert resp["content"][0]["text"] == "看多"
 
+    def test_free_text_on_v4_keeps_thinking(self):
+        """Debates / risk personas are free-text calls — v4's thinking mode
+        must stay ON there (that's the point of running v4-pro)."""
+        client, cap = _client_capturing(_oai_text_resp("看多"))
+        client.create_message(
+            model="deepseek-v4-pro", system="S",
+            messages=[{"role": "user", "content": "argue"}],
+            tools=[], max_tokens=128, temperature=0.3)
+        assert "thinking" not in cap["payload"]
+
     def test_model_passthrough_for_non_claude(self):
         client, cap = _client_capturing(_oai_text_resp("ok"))
-        client.create_message(model="deepseek-reasoner", system=None,
+        client.create_message(model="deepseek-v4-flash", system=None,
                               messages=[{"role": "user", "content": "x"}],
                               tools=None, max_tokens=10, temperature=0.0)
-        assert cap["payload"]["model"] == "deepseek-reasoner"
+        assert cap["payload"]["model"] == "deepseek-v4-flash"
+
+    def test_resolved_model_is_public(self):
+        client, _ = _client_capturing(_oai_text_resp("ok"))
+        assert client.resolved_model("claude-sonnet-4-5") == "deepseek-v4-pro"
+        assert client.resolved_model(None) == "deepseek-v4-pro"
+        assert client.resolved_model("deepseek-chat") == "deepseek-chat"
+
+    def test_reasoning_content_is_ignored(self):
+        """Thinking responses carry CoT in `reasoning_content`; only the
+        final `content` (and tool calls) must surface — CoT never leaks
+        into decision logs or downstream context."""
+        data = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant",
+                                     "reasoning_content": "长篇思考过程……",
+                                     "content": "最终答案"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 9},
+        }
+        out = from_openai_response(data)
+        assert out["content"] == [{"type": "text", "text": "最终答案"}]
 
     def test_missing_key_raises(self, monkeypatch):
         monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)

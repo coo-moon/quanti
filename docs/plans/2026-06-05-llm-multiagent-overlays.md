@@ -52,6 +52,7 @@ quanti 已是 rules-first 系统:走查选股 + 截面因子 + ensemble 融合 +
 - **实现**: `quanti/agent/openai_compat.py`(新)用 httpx 实现 `LLMClient` 协议,双向翻译 Anthropic↔OpenAI(system / 多轮 tool_use·tool_result / tools→functions / finish_reason→stop_reason / usage)。单工具调用自动 `tool_choice` 强制;`claude-*` 模型名自动重映射为 `deepseek-chat`。
 - **落点**: `runtime._build_llm_client(params)` 按 `llm_provider` 选;四个层全走同一客户端。
 - **注意**: 工具流程用 `deepseek-chat`(V3);`deepseek-reasoner`(R1)function calling 支持差。
+- **2026-06-11 更新**: DeepSeek 默认模型切换为 `deepseek-v4-pro`(V4 发布后实测:思考模式拒绝强制 `tool_choice`,客户端对单工具强制调用自动附 `thinking: {"type": "disabled"}`;自由文本(辩论/风险角色)保留思考模式)。`deepseek-chat` 别名现由 v4-flash 服务,仍可经 `llm_model` 显式指定。
 
 ---
 
