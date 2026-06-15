@@ -697,6 +697,14 @@ async def list_orders(request: Request, limit: int = 200):
     return request.app.state.db.list_orders(limit=limit)
 
 
+@router.get("/orders/pending")
+async def list_pending_orders(request: Request):
+    """Pending orders enriched with their fill timeline (queued time,
+    expected fill date, whether the bar is available, TTL). Drives the
+    Agent page's 待成交订单 detail."""
+    return request.app.state.broker.pending_orders_detail()
+
+
 @router.get("/trades")
 async def list_trades(request: Request, limit: int = 200):
     return request.app.state.db.list_trades(limit=limit)

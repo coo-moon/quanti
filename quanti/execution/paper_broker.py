@@ -35,6 +35,7 @@ from quanti.risk.sizer import Sizer
 from quanti.utils.market import (
     count_trading_days_between,
     next_trading_bar,
+    next_trading_day,
 )
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,10 @@ class PaperBroker:
                 **pos,
                 "name": stock.name if stock else pos["code"],
                 "current_price": price,
+                # Market date the current_price reflects (the bar we marked
+                # to), NOT the DB row's updated_at. None when we have no bar
+                # on disk and fell back to avg_cost.
+                "price_date": quote[1].isoformat() if quote else None,
                 "market_value": mv,
                 "pnl": (price - pos["avg_cost"]) * pos["quantity"],
                 "pnl_pct": (price - pos["avg_cost"]) / pos["avg_cost"]
@@ -364,6 +369,54 @@ class PaperBroker:
                 # _fill_pending sets the status to rejected itself on cash/T+1
                 # failure. Count as rejected here.
                 out.rejected += 1
+        return out
+
+    def pending_orders_detail(self) -> list[dict]:
+        """Enrich each pending order with its fill timeline, for the UI.
+
+        Per order we report when it was queued, the trading day its fill
+        bar belongs to (T+1 open by construction), whether that bar is
+        already on disk (so it fills on the next tick) or we're still
+        waiting on the data feed, how many trading days it has waited, and
+        the TTL after which it auto-cancels. Read-only — no state change.
+        """
+        today = date.today()
+        out: list[dict] = []
+        for o in self._db.list_orders(limit=1000, status="pending"):
+            created_at = o.get("created_at", "")
+            try:
+                created_date = datetime.fromisoformat(created_at).date()
+            except (ValueError, TypeError):
+                created_date = None
+
+            expected_fill_date: str | None = None
+            bar_available = False
+            days_pending: int | None = None
+            if created_date is not None:
+                bar = next_trading_bar(self._provider, o["code"], created_date)
+                if bar is not None:
+                    expected_fill_date = bar.date.isoformat()
+                    bar_available = True
+                else:
+                    # Data feed hasn't caught up; estimate the next session.
+                    expected_fill_date = next_trading_day(created_date).isoformat()
+                days_pending = count_trading_days_between(created_date, today)
+
+            stock = self._db.get_stock(o["code"])
+            out.append({
+                "order_id": o["order_id"],
+                "code": o["code"],
+                "name": stock.name if stock else o["code"],
+                "direction": o["direction"],
+                "quantity": o["quantity"],
+                "reason": o.get("reason", "") or "",
+                "created_at": created_at,
+                "expected_fill_date": expected_fill_date,
+                "fill_price_basis": self._fill_basis,  # "open" → 次日开盘价
+                "bar_available": bar_available,
+                "trading_days_pending": days_pending,
+                "ttl_trading_days": self._pending_ttl_days,
+            })
         return out
 
     def _fill_pending(self, signal: Signal, ref_price: float,

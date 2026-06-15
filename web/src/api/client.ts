@@ -225,6 +225,7 @@ export interface PortfolioPosition {
   quantity: number;
   avg_cost: number;
   current_price: number;
+  price_date: string | null;
   market_value: number;
   pnl: number;
   pnl_pct: number;
@@ -256,6 +257,21 @@ export interface OrderRecord {
   filled_at: string | null;
 }
 
+export interface PendingOrderDetail {
+  order_id: string;
+  code: string;
+  name: string;
+  direction: string;
+  quantity: number;
+  reason: string;
+  created_at: string;
+  expected_fill_date: string | null;
+  fill_price_basis: string; // "open" → 次日开盘价
+  bar_available: boolean;
+  trading_days_pending: number | null;
+  ttl_trading_days: number;
+}
+
 export interface DecisionRecord {
   id: number;
   ts: string;
@@ -282,6 +298,8 @@ export const fetchPortfolioSnapshots = () =>
   );
 export const fetchOrders = (limit = 100) =>
   api.get<OrderRecord[]>("/orders", { params: { limit } });
+export const fetchPendingOrders = () =>
+  api.get<PendingOrderDetail[]>("/orders/pending");
 export const fetchTrades = (limit = 100) => api.get<unknown[]>("/trades", { params: { limit } });
 export const manualOrder = (data: { code: string; direction: "buy" | "sell"; strength?: number; reason?: string }) =>
   api.post<{ filled: boolean; snapshot: Portfolio }>("/orders/manual", data);

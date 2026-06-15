@@ -272,3 +272,67 @@ class TestImmediateMode:
         assert len(db.list_trades()) == 1
         # No pending orders
         assert len(db.list_orders(status="pending")) == 0
+
+
+# --- pending-order detail (UI) -------------------------------------------
+
+class TestPendingDetail:
+    def test_detail_waiting_on_data(self, seeded_pending):
+        """A freshly queued order whose next bar isn't on disk yet reports
+        bar_available=False and still estimates an expected fill date."""
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending", pending_ttl_trading_days=3)
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY,
+                   strength=0.5, reason="排队测试"), "test")
+        detail = broker.pending_orders_detail()
+        assert len(detail) == 1
+        d = detail[0]
+        assert d["code"] == "AAA"
+        assert d["name"] == "alpha"          # resolved from stocks table
+        assert d["direction"] == "buy"
+        assert d["reason"] == "排队测试"
+        assert d["bar_available"] is False   # today's bar not in DB
+        assert d["expected_fill_date"]       # still estimated, not None
+        assert d["fill_price_basis"] == "open"
+        assert d["ttl_trading_days"] == 3
+        assert d["created_at"]               # queued timestamp surfaced
+
+    def test_detail_bar_available_after_new_bar(self, seeded_pending):
+        """Once the next trading bar lands, detail flips to bar_available
+        and points expected_fill_date at that bar's date."""
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending")
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY,
+                   strength=0.5, reason="q"), "test")
+        # Backdate to yesterday, then append today's bar → it's now "next".
+        db.conn.execute(
+            "UPDATE orders SET created_at=? WHERE code='AAA' AND status='pending'",
+            ((datetime.now() - timedelta(days=1)).isoformat(),))
+        db.conn.commit()
+        _append_new_bar(db, "AAA", days_from_today_back=0,
+                        open_price=11.0, close_price=11.1)
+        today = pd.Timestamp.today().normalize().date()
+        d = broker.pending_orders_detail()[0]
+        assert d["bar_available"] is True
+        assert d["expected_fill_date"] == today.isoformat()
+        assert d["trading_days_pending"] >= 1
+
+
+def test_snapshot_position_has_price_date(seeded_pending):
+    """snapshot_portfolio marks each position to the latest bar and reports
+    the bar's date as price_date (not the DB row's updated_at)."""
+    db, provider = seeded_pending
+    broker = PaperBroker(db, provider, initial_cash=200_000,
+                         fill_mode="immediate")
+    broker.execute_signal(
+        Signal(stock_code="AAA", direction=Direction.BUY,
+               strength=0.5, reason="buy"), "test")
+    snap = broker.snapshot_portfolio()
+    pos = next(p for p in snap["positions"] if p["code"] == "AAA")
+    # AAA's latest bar is today-1 (per fixture); price_date reflects it.
+    expected = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
+    assert pos["price_date"] == expected.isoformat()
