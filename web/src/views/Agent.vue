@@ -234,7 +234,8 @@
           <span v-if="portfolio?.snapshot_date" class="asof">· 净值截至 {{ portfolio.snapshot_date }}</span>
         </div>
       </div>
-      <table class="data-table" v-if="portfolio && portfolio.positions.length > 0">
+      <div class="table-wrap" v-if="portfolio && portfolio.positions.length > 0">
+        <table class="data-table">
         <thead>
           <tr>
             <th>代码</th>
@@ -265,7 +266,8 @@
             </td>
           </tr>
         </tbody>
-      </table>
+        </table>
+      </div>
       <div v-else class="empty">暂无持仓</div>
     </div>
 
@@ -275,7 +277,8 @@
         <h2>待成交订单 <span class="count-badge">{{ pendingOrders.length }}</span></h2>
         <div class="muted">挂单按 T+1 规则，于预计成交日的{{ fillBasisLabel }}成交</div>
       </div>
-      <table class="data-table">
+      <div class="table-wrap">
+        <table class="data-table">
         <thead>
           <tr>
             <th>代码</th>
@@ -309,7 +312,8 @@
             <td class="reason-cell" :title="o.reason">{{ o.reason || "—" }}</td>
           </tr>
         </tbody>
-      </table>
+        </table>
+      </div>
     </div>
 
     <!-- Manual order -->
@@ -333,7 +337,8 @@
         <h2>最近策略评估</h2>
         <div class="muted">选定:<b>{{ displayStrategy(agent.last_strategy) }}</b></div>
       </div>
-      <table class="data-table">
+      <div class="table-wrap">
+        <table class="data-table">
         <thead>
           <tr>
             <th>策略</th>
@@ -357,7 +362,8 @@
             <td>{{ e.score.toFixed(3) }}</td>
           </tr>
         </tbody>
-      </table>
+        </table>
+      </div>
     </div>
 
     <!-- Decision log -->
@@ -913,6 +919,14 @@ onUnmounted(() => {
   background: rgba(192, 57, 43, 0.1);
   color: #c0392b;
 }
+/* Horizontal scroll on narrow screens — matches the .table-wrap convention
+   already used by Dashboard/Backtest/Screener/Pool. Without it the wide
+   tables (10-col holdings, pending orders) wrap Chinese text char-by-char
+   on mobile. Desktop is unaffected (table fits, nothing to scroll). */
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
 .data-table {
   width: 100%;
   border-collapse: collapse;
@@ -923,6 +937,10 @@ onUnmounted(() => {
   text-align: left;
   padding: 8px 10px;
   border-bottom: 0.5px solid rgba(0, 0, 0, 0.06);
+  /* Keep each cell on one line so the table grows to its natural width and
+     scrolls inside .table-wrap on mobile, instead of wrapping Chinese names
+     char-by-char. .reason-cell overrides with its own ellipsis clamp. */
+  white-space: nowrap;
 }
 .data-table th {
   background: rgba(0, 0, 0, 0.02);
