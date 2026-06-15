@@ -138,7 +138,7 @@
           @click="applyPreset('llm')"
         >
           <div class="mode-title">LLM 决策</div>
-          <div class="mode-desc">ensemble 候选 → Claude 拍板 · 需 ANTHROPIC_API_KEY</div>
+          <div class="mode-desc">ensemble 候选 → LLM 拍板 · 默认 DeepSeek，可切 Anthropic</div>
         </button>
       </div>
       <details class="advanced">
