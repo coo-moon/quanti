@@ -58,7 +58,8 @@ class QuantiContext:
         self.provider = DataProvider(self.db)
         self.strategies_dir = strategies_dir
         self.screeners_dir = screeners_dir
-        self.broker = PaperBroker(self.db, self.provider, initial_cash=initial_cash)
+        self.broker = PaperBroker(self.db, self.provider, initial_cash=initial_cash,
+                                  strategies_dir=strategies_dir)
         self.agent = AgentRuntime(
             self.db, self.provider, self.broker,
             strategies_dir=strategies_dir, screeners_dir=screeners_dir,

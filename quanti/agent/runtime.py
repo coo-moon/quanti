@@ -558,7 +558,7 @@ class AgentRuntime:
                     "LLM 未安装,降级到 ensemble 路径",
                     details={"error": str(e)})
                 signals = [c.to_signal() for c in fused]
-                sl = self._broker.check_stop_loss()
+                sl = self._broker.check_exits()
                 result = self._broker.execute_signals(signals, "ensemble_fallback")
                 snap = self._broker.snapshot_portfolio()
                 return {"ok": True, "signals": len(signals),
@@ -729,8 +729,9 @@ class AgentRuntime:
         signals = [s for s in signals
                    if not (s.direction == Direction.SELL and s.stock_code not in held)]
 
-        # Risk stop-loss first (so we free cash before new buys)
-        sl_count = self._broker.check_stop_loss()
+        # Risk exits first (stop-loss / strategy / take-profit) so we free
+        # cash before new buys.
+        sl_count = self._broker.check_exits()
 
         # Execute
         result = self._broker.execute_signals(signals, strategy_name=strategy_name)
@@ -746,7 +747,7 @@ class AgentRuntime:
         pre_expired = pending_result.expired if pending_result else 0
 
         summary_parts = [f"策略 {strategy_name}", f"信号 {len(signals)}", landed_label,
-                         f"拒绝 {result.rejected}", f"止损 {sl_count}"]
+                         f"拒绝 {result.rejected}", f"离场 {sl_count}"]
         if pending_result and pending_result.scanned > 0:
             summary_parts.append(
                 f"昨日挂单成交 {pre_filled}/待 {pre_pending}/过期 {pre_expired}")

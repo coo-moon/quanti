@@ -84,6 +84,10 @@ class BacktestEngine:
         equity_values: dict[date, float] = {}
         # Track T+1: stocks bought today cannot be sold today
         bought_today: set[str] = set()
+        # Post-entry peak (highest high since entry) per held code, for the
+        # trailing take-profit in RiskManager.check_exits. Updated each day a
+        # position is held, dropped when it's closed.
+        peaks: dict[str, float] = {}
         skipped_signals = 0
 
         # Load all data upfront
@@ -121,20 +125,31 @@ class BacktestEngine:
                         today_bars[code] = bar
                         break
 
-            # Update position prices
+            # Update position prices + post-entry peaks (use today's HIGH).
             for code, bar in today_bars.items():
                 if code in portfolio.positions:
                     portfolio.positions[code].current_price = bar.close
+                    peaks[code] = max(peaks.get(code, 0.0), bar.high)
+            # Drop peaks for codes we no longer hold.
+            for code in list(peaks):
+                if code not in portfolio.positions:
+                    peaks.pop(code, None)
 
-            # Risk-driven sells first (stop-loss) so cash frees up before buys
+            # Risk-driven exits first (stop-loss + trailing take-profit) so
+            # cash frees up before buys. The strategy's OWN sells still flow
+            # through on_bar below, so strategy_sell_codes is left empty here
+            # to avoid double-counting — the backtest already replays the
+            # strategy in full.
             if self._risk is not None:
                 self._risk.reset_daily()
-                for sl in self._risk.check_stop_loss(portfolio):
+                for sl in self._risk.check_exits(portfolio, peaks=peaks):
                     sl_bar = today_bars.get(sl.stock_code)
                     if sl_bar is None:
                         continue
-                    self._process_signal(sl, sl_bar, portfolio, trades,
-                                         current_date, bought_today, "risk_stop_loss")
+                    if self._process_signal(sl, sl_bar, portfolio, trades,
+                                            current_date, bought_today,
+                                            "risk_exit"):
+                        peaks.pop(sl.stock_code, None)
 
             # Generate signals from strategy
             for code, bar in today_bars.items():

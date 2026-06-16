@@ -49,6 +49,7 @@ class FusedCandidate:
     final_score: float          # combined score used for ranking, ∈ [0, 1]
     sentiment_score: float = 0.0  # LLM news sentiment ∈ [-1, 1]; 0 = neutral/none
     contributing_strategies: list[str] = field(default_factory=list)
+    dominant_strategy: str = ""  # argmax(weight×strength); owns the exit
     industry: str = ""
 
     def to_signal(self, reason: str = "") -> Signal:
@@ -63,7 +64,8 @@ class FusedCandidate:
                          f"factor={self.factor_score:+.2f}{sent_str} "
                          f"final={self.final_score:.2f}")
         return Signal(stock_code=self.code, direction=Direction.BUY,
-                      strength=self.final_score, reason=msg)
+                      strength=self.final_score, reason=msg,
+                      entry_strategy=self.dominant_strategy)
 
 
 def _sigmoid(x: float, k: float = 1.0) -> float:
@@ -153,6 +155,14 @@ def fuse_buy_signals(
                  for name, strength in per_strat.items())
         ss = max(0.0, min(1.0, ss))
 
+        # Dominant strategy: the single biggest weighted contributor. This is
+        # the strategy that most justified the buy, so it's the natural owner
+        # of the exit (replay its on_bar on the holding). Every candidate has
+        # ≥1 contributor (the code only got here via a strategy BUY), so this
+        # is always well-defined.
+        dominant = max(per_strat.items(),
+                       key=lambda kv: weights.get(kv[0], 0.0) * kv[1])[0]
+
         fs = _factor_score(factor_panel, code)
         # Map factor z (typically [-3, 3]) to [0, 1] via sigmoid.
         fs_norm = _sigmoid(fs, k=1.0)
@@ -171,6 +181,7 @@ def fuse_buy_signals(
             code=code, strategy_score=ss, factor_score=fs,
             sentiment_score=sent, final_score=final,
             contributing_strategies=sorted(per_strat.keys()),
+            dominant_strategy=dominant,
             industry=_industry_for(factor_panel, code),
         ))
 

@@ -28,6 +28,7 @@ from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.paper_broker import PaperBroker
 from quanti.models import Direction, Signal
+from quanti.risk.manager import RiskConfig
 
 
 @pytest.fixture
@@ -140,6 +141,47 @@ def _append_new_bar(db, code, days_from_today_back=0,
         "turnover": 1.0,
     }])
     db.save_daily_quotes(df)
+
+
+class TestEntryStrategyPlumbing:
+    def test_entry_strategy_survives_queue_to_position(self, seeded_pending):
+        """A buy signal's entry_strategy must travel signal → order row →
+        (next-bar fill) → position row, so an exit can later replay the
+        owning strategy on the holding."""
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending")
+        sig = Signal(stock_code="AAA", direction=Direction.BUY,
+                     strength=0.5, reason="q", entry_strategy="turtle_breakout")
+        broker.execute_signal(sig, "ensemble")
+        # Stored on the pending order row.
+        assert db.list_orders(status="pending")[0]["entry_strategy"] == "turtle_breakout"
+        # Backdate + new bar so it fills.
+        db.conn.execute(
+            "UPDATE orders SET created_at=? WHERE code='AAA' AND status='pending'",
+            ((datetime.now() - timedelta(days=1)).isoformat(),))
+        db.conn.commit()
+        _append_new_bar(db, "AAA", days_from_today_back=0,
+                        open_price=11.0, close_price=11.1)
+        broker.try_fill_pending_orders()
+        pos = next(p for p in db.list_positions() if p["code"] == "AAA")
+        assert pos["entry_strategy"] == "turtle_breakout"
+
+    def test_addon_buy_preserves_original_owner(self, seeded_pending):
+        """Averaging into an existing position must NOT overwrite the original
+        entry_strategy (COALESCE on empty)."""
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=500_000,
+                             fill_mode="immediate")
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY, strength=0.3,
+                   reason="open", entry_strategy="macd_cross"), "ensemble")
+        # Second buy with a DIFFERENT (or empty) owner must not clobber it.
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY, strength=0.3,
+                   reason="addon", entry_strategy=""), "ensemble")
+        pos = next(p for p in db.list_positions() if p["code"] == "AAA")
+        assert pos["entry_strategy"] == "macd_cross"
 
 
 class TestFilling:
@@ -336,3 +378,78 @@ def test_snapshot_position_has_price_date(seeded_pending):
     # AAA's latest bar is today-1 (per fixture); price_date reflects it.
     expected = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
     assert pos["price_date"] == expected.isoformat()
+
+
+# --- exit engine: trailing take-profit + strategy replay -----------------
+
+def _exit_db(tmp_path, bars: list[tuple]):
+    """Fresh DB with one stock AAA and an explicit bar series.
+    bars = list of (date, open, high, low, close)."""
+    db = Database(str(tmp_path / "exit.db"))
+    db.initialize()
+    db.upsert_stock("AAA", "alpha", "SZ", date(1991, 4, 3), "test")
+    df = pd.DataFrame([{
+        "code": "AAA", "date": d, "open": o, "high": h, "low": lo,
+        "close": c, "volume": 5e6, "amount": c * 5e6, "turnover": 1.0,
+    } for (d, o, h, lo, c) in bars])
+    db.save_daily_quotes(df)
+    return db
+
+
+class TestExitEngine:
+    def test_trailing_take_profit_fires(self, tmp_path):
+        """Position +18% from cost, peaked at 13.0, now 11.6 (-10.8% off
+        peak) → trailing take-profit sells."""
+        today = pd.Timestamp.today().normalize()
+        bars = [(( today - pd.Timedelta(days=n)).date(),
+                 10.0, h, 9.5, c)
+                for n, (h, c) in zip(
+                    range(4, -1, -1),
+                    [(10.5, 10.2), (12.0, 11.8), (13.0, 12.9),
+                     (12.5, 12.0), (11.7, 11.6)])]
+        db = _exit_db(tmp_path, bars)
+        provider = DataProvider(db)
+        # Position opened at 10.0 well before the window.
+        db.upsert_position("AAA", 1000, 10.0, 11.6,
+                           (today - pd.Timedelta(days=20)).date())
+        broker = PaperBroker(db, provider, fill_mode="immediate",
+                             risk_config=RiskConfig(
+                                 take_profit_activate_pct=0.15,
+                                 take_profit_trail_pct=0.10,
+                                 strategy_exit_enabled=False))
+        landed = broker.check_exits()
+        assert landed == 1
+        trades = db.list_trades()
+        assert len(trades) == 1 and trades[0]["direction"] == "sell"
+
+    def test_peak_is_max_high_since_buy(self, tmp_path):
+        today = pd.Timestamp.today().normalize()
+        bars = [((today - pd.Timedelta(days=n)).date(), 10, 10 + n, 9, 10)
+                for n in range(5, 0, -1)]  # highs 15,14,13,12,11
+        db = _exit_db(tmp_path, bars)
+        broker = PaperBroker(db, DataProvider(db), fill_mode="immediate")
+        buy = (today - pd.Timedelta(days=3)).date()  # highs from this date: 13,12,11
+        peaks = broker._compute_peaks(
+            [{"code": "AAA", "buy_date": buy}])
+        assert peaks["AAA"] == pytest.approx(13.0)
+
+    def test_strategy_replay_detects_turtle_exit(self, tmp_path):
+        """A holding owned by turtle_breakout that breaks below the N/2-day
+        low on the last bar is flagged for exit by the replay."""
+        today = pd.Timestamp.today().normalize()
+        # 24 climbing bars then a final crash below the 10-day low.
+        bars = []
+        for n in range(24, 0, -1):
+            px = 10.0 + (24 - n) * 0.3
+            bars.append(((today - pd.Timedelta(days=n)).date(),
+                         px, px + 0.2, px - 0.2, px))
+        bars.append((today.date(), 16.0, 16.0, 7.0, 7.0))  # crash
+        db = _exit_db(tmp_path, bars)
+        broker = PaperBroker(db, DataProvider(db), fill_mode="immediate",
+                             strategies_dir="strategies")
+        codes = broker._compute_strategy_exits(
+            [{"code": "AAA", "buy_date": (today - pd.Timedelta(days=24)).date(),
+              "entry_strategy": "turtle_breakout"}])
+        # If the strategies dir loaded, the crash must trigger turtle's exit.
+        if broker._load_strategies():
+            assert "AAA" in codes

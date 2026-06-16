@@ -153,6 +153,42 @@ class TestQueueBuilding:
         assert queued[0] == "AAA", \
             f"held position should come first, got {queued}"
 
+    def test_pending_order_code_leads_queue(self, db_with_stocks):
+        """A code with a pending order jumps ahead of even held positions —
+        its fill is blocked until its next bar lands, so it's most urgent."""
+        # Queue a pending BUY for CCC (not held, stale).
+        db_with_stocks.insert_order({
+            "order_id": "o_test1", "code": "CCC", "direction": "buy",
+            "quantity": 0, "price_type": "market", "status": "pending",
+            "strategy_name": "test", "reason": "t",
+        })
+        adapter = StubAdapter(db_with_stocks)
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks, adapter_factory=lambda: adapter,
+            config=BackgroundSyncConfig(batch_size=10, idle_interval_sec=3600))
+        syncer._scan_and_enqueue()
+        queued = list(syncer._queue)
+        assert queued[0] == "CCC", \
+            f"pending-order code should lead, got {queued}"
+        # AAA (held) still queued, just after pending.
+        assert "AAA" in queued
+
+    def test_pending_code_respects_backoff(self, db_with_stocks):
+        """Even a pending-order code is skipped while in backoff (e.g. its
+        feed had nothing new) — no per-loop spam."""
+        db_with_stocks.insert_order({
+            "order_id": "o_test2", "code": "BBB", "direction": "buy",
+            "quantity": 0, "price_type": "market", "status": "pending",
+            "strategy_name": "test", "reason": "t",
+        })
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks,
+            adapter_factory=lambda: StubAdapter(db_with_stocks),
+            config=BackgroundSyncConfig(failure_backoff_sec=3600))
+        syncer._backoff_until["BBB"] = time.time() + 3600
+        syncer._scan_and_enqueue()
+        assert "BBB" not in list(syncer._queue)
+
     def test_failure_backoff_skips_code(self, db_with_stocks):
         """A code that throws on sync should be skipped for failure_backoff_sec.
         Verify by injecting a backoff entry directly and confirming the next
