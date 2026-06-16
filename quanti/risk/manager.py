@@ -19,6 +19,17 @@ class RiskConfig:
     max_daily_trades: int = 20
     blocked_prefixes: tuple[str, ...] = ("ST", "*ST")  # Block ST stocks
 
+    # --- Exit overlays (see check_exits) ---
+    take_profit_activate_pct: float = 0.15
+    """Arm the trailing take-profit once a position is up at least this much.
+    Below it, only the stop-loss governs. 0 disables take-profit entirely."""
+    take_profit_trail_pct: float = 0.10
+    """Once armed, exit if the price retraces this fraction from its post-entry
+    peak. Lets winners run but locks in gains on a meaningful reversal."""
+    strategy_exit_enabled: bool = True
+    """Exit a holding when its owning entry-strategy emits a SELL on the
+    latest bar (structure-based exit, coherent with why we bought)."""
+
 
 class RiskManager:
     """Independent risk control layer between signals and execution."""
@@ -67,6 +78,51 @@ class RiskManager:
                         reason=f"Stop loss triggered: {pos.pnl_pct:.1%} <= {self.config.stop_loss_pct:.1%}",
                     )
                 )
+        return signals
+
+    def check_exits(
+        self,
+        portfolio: Portfolio,
+        peaks: dict[str, float] | None = None,
+        strategy_sell_codes: set[str] | None = None,
+    ) -> list[Signal]:
+        """Decide which holdings to close, combining three exit reasons.
+
+        Pure logic — the caller supplies `peaks` (per-code post-entry high,
+        for the trailing take-profit) and `strategy_sell_codes` (codes whose
+        owning strategy says SELL); this method just applies the thresholds.
+        One SELL per code, priority: stop-loss > strategy-exit > take-profit.
+
+        Falls back to plain stop-loss when peaks/strategy info aren't given,
+        so existing callers keep working.
+        """
+        peaks = peaks or {}
+        strategy_sell_codes = strategy_sell_codes or set()
+        cfg = self.config
+        signals: list[Signal] = []
+        for code, pos in portfolio.positions.items():
+            # 1. Stop-loss — highest priority, always on.
+            if pos.pnl_pct <= cfg.stop_loss_pct:
+                signals.append(Signal(
+                    stock_code=code, direction=Direction.SELL, strength=1.0,
+                    reason=f"止损 {pos.pnl_pct:.1%} ≤ {cfg.stop_loss_pct:.1%}"))
+                continue
+            # 2. Strategy-coherent exit — the owning strategy flipped to SELL.
+            if cfg.strategy_exit_enabled and code in strategy_sell_codes:
+                signals.append(Signal(
+                    stock_code=code, direction=Direction.SELL, strength=1.0,
+                    reason="策略离场信号"))
+                continue
+            # 3. Trailing take-profit — armed above activate, exit on retrace.
+            if cfg.take_profit_activate_pct > 0 and pos.pnl_pct >= cfg.take_profit_activate_pct:
+                peak = peaks.get(code)
+                if peak and pos.current_price > 0:
+                    drawdown = (pos.current_price - peak) / peak
+                    if drawdown <= -cfg.take_profit_trail_pct:
+                        signals.append(Signal(
+                            stock_code=code, direction=Direction.SELL, strength=1.0,
+                            reason=(f"移动止盈 浮盈{pos.pnl_pct:+.1%} 自峰值回撤"
+                                    f"{drawdown:.1%}")))
         return signals
 
     def reset_daily(self) -> None:

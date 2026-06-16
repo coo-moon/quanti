@@ -87,3 +87,59 @@ class TestRiskManager:
         stop_signals = rm.check_stop_loss(portfolio)
         assert len(stop_signals) == 1
         assert stop_signals[0].direction == Direction.SELL
+
+
+class TestCheckExits:
+    """check_exits combines stop-loss + strategy-exit + trailing take-profit."""
+
+    def _pf(self, avg, cur):
+        return Portfolio(cash=0.0, positions={
+            "X": Position("X", 1000, avg, cur)})
+
+    def test_stoploss_takes_priority(self):
+        cfg = RiskConfig(stop_loss_pct=-0.08, take_profit_activate_pct=0.15)
+        rm = RiskManager(cfg)
+        # -10% loss → stop-loss, even if a strategy also said sell.
+        sells = rm.check_exits(self._pf(10.0, 9.0),
+                               strategy_sell_codes={"X"})
+        assert len(sells) == 1
+        assert "止损" in sells[0].reason
+
+    def test_strategy_exit_fires(self):
+        rm = RiskManager(RiskConfig())
+        # +2% (no stop, not armed for TP) but owning strategy says sell.
+        sells = rm.check_exits(self._pf(10.0, 10.2),
+                               strategy_sell_codes={"X"})
+        assert len(sells) == 1 and "策略" in sells[0].reason
+
+    def test_strategy_exit_respects_flag(self):
+        rm = RiskManager(RiskConfig(strategy_exit_enabled=False))
+        sells = rm.check_exits(self._pf(10.0, 10.2),
+                               strategy_sell_codes={"X"})
+        assert sells == []
+
+    def test_trailing_tp_armed_and_retraced(self):
+        cfg = RiskConfig(take_profit_activate_pct=0.15, take_profit_trail_pct=0.10)
+        rm = RiskManager(cfg)
+        # Up +16% (armed); peak 13.0, now 11.6 → -10.8% from peak ≥ 10% → exit.
+        sells = rm.check_exits(self._pf(10.0, 11.6), peaks={"X": 13.0})
+        assert len(sells) == 1 and "移动止盈" in sells[0].reason
+
+    def test_trailing_tp_not_armed_below_threshold(self):
+        cfg = RiskConfig(take_profit_activate_pct=0.15, take_profit_trail_pct=0.10)
+        rm = RiskManager(cfg)
+        # Only +8% (< activate) — even a big retrace from peak shouldn't exit.
+        sells = rm.check_exits(self._pf(10.0, 10.8), peaks={"X": 12.0})
+        assert sells == []
+
+    def test_trailing_tp_armed_but_small_retrace_holds(self):
+        cfg = RiskConfig(take_profit_activate_pct=0.15, take_profit_trail_pct=0.10)
+        rm = RiskManager(cfg)
+        # Up +18%, peak 11.9, now 11.8 → only -0.8% from peak → hold.
+        sells = rm.check_exits(self._pf(10.0, 11.8), peaks={"X": 11.9})
+        assert sells == []
+
+    def test_take_profit_disabled_when_activate_zero(self):
+        rm = RiskManager(RiskConfig(take_profit_activate_pct=0.0))
+        sells = rm.check_exits(self._pf(10.0, 20.0), peaks={"X": 25.0})
+        assert sells == []

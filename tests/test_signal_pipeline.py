@@ -67,6 +67,22 @@ class TestFuseBuy:
         out = fuse_buy_signals(sigs, {"a": 1.0})
         assert {c.code for c in out} == {"A"}
 
+    def test_dominant_strategy_is_argmax_weighted(self):
+        """dominant_strategy = argmax(weight × strength), not just any voter.
+        'b' has lower raw strength but a higher weight → it owns the exit."""
+        sigs = {
+            "a": [Signal(stock_code="X", direction=Direction.BUY, strength=0.9, reason="")],
+            "b": [Signal(stock_code="X", direction=Direction.BUY, strength=0.7, reason="")],
+        }
+        out = fuse_buy_signals(sigs, {"a": 0.2, "b": 0.8},
+                               factor_panel=None, factor_blend=0.0)
+        assert len(out) == 1
+        # a: 0.2*0.9=0.18 ; b: 0.8*0.7=0.56 → b dominates
+        assert out[0].dominant_strategy == "b"
+        assert set(out[0].contributing_strategies) == {"a", "b"}
+        # And it propagates onto the materialized signal.
+        assert out[0].to_signal().entry_strategy == "b"
+
     def test_factor_panel_blends_in(self):
         """Same strategy_score but different factor scores → different ranks."""
         sigs = {
