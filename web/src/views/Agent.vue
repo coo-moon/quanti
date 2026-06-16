@@ -138,7 +138,7 @@
           @click="applyPreset('llm')"
         >
           <div class="mode-title">LLM 决策</div>
-          <div class="mode-desc">ensemble 候选 → Claude 拍板 · 需 ANTHROPIC_API_KEY</div>
+          <div class="mode-desc">ensemble 候选 → LLM 拍板 · 默认 DeepSeek，可切 Anthropic</div>
         </button>
       </div>
       <details class="advanced">
@@ -231,16 +231,20 @@
           现金 ¥{{ formatMoney(portfolio?.cash ?? 0) }} / 市值 ¥{{
             formatMoney(portfolio?.market_value ?? 0)
           }}
+          <span v-if="portfolio?.snapshot_date" class="asof">· 净值截至 {{ portfolio.snapshot_date }}</span>
         </div>
       </div>
-      <table class="data-table" v-if="portfolio && portfolio.positions.length > 0">
+      <div class="table-wrap" v-if="portfolio && portfolio.positions.length > 0">
+        <table class="data-table">
         <thead>
           <tr>
             <th>代码</th>
             <th>名称</th>
             <th>数量</th>
             <th>成本</th>
+            <th>买入时间</th>
             <th>现价</th>
+            <th>最近更新</th>
             <th>市值</th>
             <th>盈亏</th>
             <th>盈亏 %</th>
@@ -253,7 +257,9 @@
             <td>{{ p.name }}</td>
             <td>{{ p.quantity }}</td>
             <td>{{ p.avg_cost.toFixed(2) }}</td>
+            <td class="nowrap">{{ p.buy_date ?? "—" }}</td>
             <td>{{ p.current_price.toFixed(2) }}</td>
+            <td :class="priceDateClass(p.price_date)">{{ p.price_date ?? "—" }}</td>
             <td>{{ formatMoney(p.market_value) }}</td>
             <td :class="p.pnl >= 0 ? 'up' : 'down'">{{ formatMoney(p.pnl) }}</td>
             <td :class="p.pnl_pct >= 0 ? 'up' : 'down'">{{ formatPct(p.pnl_pct) }}</td>
@@ -262,8 +268,54 @@
             </td>
           </tr>
         </tbody>
-      </table>
+        </table>
+      </div>
       <div v-else class="empty">暂无持仓</div>
+    </div>
+
+    <!-- Pending orders detail -->
+    <div class="card" v-if="pendingOrders.length > 0">
+      <div class="card-header">
+        <h2>待成交订单 <span class="count-badge">{{ pendingOrders.length }}</span></h2>
+        <div class="muted">挂单按 T+1 规则，于预计成交日的{{ fillBasisLabel }}成交</div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+        <thead>
+          <tr>
+            <th>代码</th>
+            <th>名称</th>
+            <th>方向</th>
+            <th>数量</th>
+            <th>加入队列</th>
+            <th>预计成交日</th>
+            <th>状态</th>
+            <th>理由</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="o in pendingOrders" :key="o.order_id">
+            <td>{{ o.code }}</td>
+            <td>{{ o.name }}</td>
+            <td :class="o.direction === 'buy' ? 'up' : 'down'">
+              {{ o.direction === "buy" ? "买入" : "卖出" }}
+            </td>
+            <td>{{ o.quantity || "—" }}</td>
+            <td class="nowrap">{{ formatDateTime(o.created_at) }}</td>
+            <td class="nowrap">{{ o.expected_fill_date ?? "—" }}</td>
+            <td>
+              <span :class="o.bar_available ? 'tag tag-ready' : 'tag tag-wait'">
+                {{ o.bar_available ? "待下轮成交" : "等待行情" }}
+              </span>
+              <span class="ttl-hint">
+                已等 {{ o.trading_days_pending ?? 0 }}/{{ o.ttl_trading_days }} 交易日
+              </span>
+            </td>
+            <td class="reason-cell" :title="o.reason">{{ o.reason || "—" }}</td>
+          </tr>
+        </tbody>
+        </table>
+      </div>
     </div>
 
     <!-- Manual order -->
@@ -287,7 +339,8 @@
         <h2>最近策略评估</h2>
         <div class="muted">选定:<b>{{ displayStrategy(agent.last_strategy) }}</b></div>
       </div>
-      <table class="data-table">
+      <div class="table-wrap">
+        <table class="data-table">
         <thead>
           <tr>
             <th>策略</th>
@@ -311,7 +364,8 @@
             <td>{{ e.score.toFixed(3) }}</td>
           </tr>
         </tbody>
-      </table>
+        </table>
+      </div>
     </div>
 
     <!-- Decision log -->
@@ -350,6 +404,7 @@ import {
   fetchAgentDecisions,
   fetchAgentStatus,
   fetchGoal,
+  fetchPendingOrders,
   fetchPortfolio,
   fetchScreeners,
   fetchStrategies,
@@ -359,6 +414,7 @@ import {
   type AgentStatus,
   type DecisionRecord,
   type Goal,
+  type PendingOrderDetail,
   type Portfolio,
   type ScreenerInfo,
   type StrategyInfo,
@@ -463,6 +519,7 @@ const agent = ref<AgentStatus | null>(null);
 const decisions = ref<DecisionRecord[]>([]);
 const strategies = ref<StrategyInfo[]>([]);
 const screeners = ref<ScreenerInfo[]>([]);
+const pendingOrders = ref<PendingOrderDetail[]>([]);
 
 const saving = ref(false);
 const ticking = ref(false);
@@ -492,6 +549,21 @@ function formatPct(n: number) {
 function formatTs(ts: string) {
   return ts.replace("T", " ").slice(0, 19);
 }
+// Queued time — date + HH:MM is enough; seconds are noise here.
+function formatDateTime(ts: string) {
+  if (!ts) return "—";
+  return ts.replace("T", " ").slice(0, 16);
+}
+// Flag a stale mark price: if the position's price date trails the
+// portfolio snapshot date, the row hasn't been re-marked to the latest bar.
+function priceDateClass(d: string | null) {
+  if (!d) return "td-muted";
+  if (portfolio.value?.snapshot_date && d < portfolio.value.snapshot_date)
+    return "stale-date";
+  return "";
+}
+const fillBasisLabel = computed(() =>
+  pendingOrders.value[0]?.fill_price_basis === "close" ? "收盘价" : "开盘价");
 
 const pnlClass = computed(() => {
   if (!portfolio.value) return "";
@@ -572,13 +644,14 @@ function kindClass(kind: string) {
 }
 
 async function loadAll() {
-  const [g, p, a, d, str, scr] = await Promise.all([
+  const [g, p, a, d, str, scr, pend] = await Promise.all([
     fetchGoal(),
     fetchPortfolio(),
     fetchAgentStatus(),
     fetchAgentDecisions(50),
     fetchStrategies(),
     fetchScreeners(),
+    fetchPendingOrders(),
   ]);
   Object.assign(goalDraft, g.data);
   syncAdvFromParams();
@@ -587,6 +660,7 @@ async function loadAll() {
   decisions.value = d.data;
   strategies.value = str.data;
   screeners.value = scr.data;
+  pendingOrders.value = pend.data;
 }
 
 async function loadDecisions() {
@@ -847,6 +921,14 @@ onUnmounted(() => {
   background: rgba(192, 57, 43, 0.1);
   color: #c0392b;
 }
+/* Horizontal scroll on narrow screens — matches the .table-wrap convention
+   already used by Dashboard/Backtest/Screener/Pool. Without it the wide
+   tables (10-col holdings, pending orders) wrap Chinese text char-by-char
+   on mobile. Desktop is unaffected (table fits, nothing to scroll). */
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
 .data-table {
   width: 100%;
   border-collapse: collapse;
@@ -857,6 +939,10 @@ onUnmounted(() => {
   text-align: left;
   padding: 8px 10px;
   border-bottom: 0.5px solid rgba(0, 0, 0, 0.06);
+  /* Keep each cell on one line so the table grows to its natural width and
+     scrolls inside .table-wrap on mobile, instead of wrapping Chinese names
+     char-by-char. .reason-cell overrides with its own ellipsis clamp. */
+  white-space: nowrap;
 }
 .data-table th {
   background: rgba(0, 0, 0, 0.02);
@@ -866,6 +952,60 @@ onUnmounted(() => {
   color: var(--color-text-secondary);
   padding: 16px;
   text-align: center;
+}
+.asof {
+  margin-left: 4px;
+  color: var(--color-text-secondary);
+}
+.nowrap {
+  white-space: nowrap;
+}
+.td-muted {
+  color: var(--color-text-secondary);
+}
+.stale-date {
+  color: #c2870b;
+}
+.count-badge {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 6px;
+  margin-left: 4px;
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--color-text-secondary);
+}
+.tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.tag-ready {
+  background: rgba(52, 168, 83, 0.12);
+  color: #1e7e34;
+}
+.tag-wait {
+  background: rgba(234, 179, 8, 0.14);
+  color: #a16207;
+}
+.ttl-hint {
+  margin-left: 6px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.reason-cell {
+  /* Show the full LLM rationale: wrap to a few lines instead of clipping
+     with an ellipsis. Overrides the table-wide `white-space: nowrap`. */
+  max-width: 360px;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.4;
+  color: var(--color-text-secondary);
 }
 .manual-row {
   display: grid;
