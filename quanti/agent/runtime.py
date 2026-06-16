@@ -51,6 +51,8 @@ logger = logging.getLogger(__name__)
 class AgentStatus:
     enabled: bool = False
     running: bool = False
+    started_at: Optional[str] = None  # when the current loop (re)started
+    tick_interval_sec: int = 0        # cadence, so the UI can show next-tick
     last_tick_at: Optional[str] = None
     last_tick_summary: str = ""
     last_strategy: str = ""
@@ -110,6 +112,7 @@ class AgentRuntime:
         with self._lock:
             self._status.enabled = True
             self._status.running = True
+            self._status.started_at = datetime.now().isoformat()
         self._db.log_decision("agent_start", "Agent started")
 
     def stop(self) -> None:
@@ -124,6 +127,7 @@ class AgentRuntime:
         with self._lock:
             self._status.enabled = False
             self._status.running = False
+            self._status.started_at = None
         if was_running:
             self._db.log_decision("agent_stop", "Agent stopped")
 
@@ -149,6 +153,8 @@ class AgentRuntime:
             return AgentStatus(
                 enabled=self._status.enabled,
                 running=self._thread.is_alive() if self._thread else False,
+                started_at=self._status.started_at,
+                tick_interval_sec=self._tick_interval,
                 last_tick_at=self._status.last_tick_at,
                 last_tick_summary=self._status.last_tick_summary,
                 last_strategy=self._status.last_strategy,

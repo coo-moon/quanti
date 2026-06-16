@@ -203,6 +203,8 @@ export interface Goal {
 export interface AgentStatus {
   enabled: boolean;
   running: boolean;
+  started_at: string | null;
+  tick_interval_sec?: number;
   last_tick_at: string | null;
   last_tick_summary: string;
   last_strategy: string;

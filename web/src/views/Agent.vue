@@ -31,6 +31,13 @@
           <span class="stat-value stat-value-sm">{{ agentStatusStr }}</span>
         </div>
       </div>
+      <div class="stat-card" v-if="agent?.running">
+        <div class="stat-info">
+          <span class="stat-label">运行时间</span>
+          <span class="stat-value stat-value-sm">{{ uptimeStr }}</span>
+          <span class="stat-sub">上次 {{ lastTickStr }} · 下次 {{ nextTickStr }}</span>
+        </div>
+      </div>
       <div class="stat-card" :class="modeClass">
         <div class="stat-info">
           <span class="stat-label">运行模式</span>
@@ -588,6 +595,35 @@ const agentStatusClass = computed(() => {
   return agent.value.running ? "up" : "muted-card";
 });
 
+// Live clock for the "运行时间" card — ticked every 20s (minute-granularity
+// display, so finer updates would just churn the DOM for nothing).
+const nowTs = ref(Date.now());
+let clockTimer: number | null = null;
+
+function _fmtDuration(ms: number): string {
+  if (ms < 60_000) return "刚启动";
+  const totalMin = Math.floor(ms / 60_000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h === 0 ? `${m} 分钟` : `${h} 小时 ${m} 分`;
+}
+function _hhmm(ts: string | null): string {
+  return ts ? ts.slice(11, 16) : "—"; // HH:MM from naive ISO
+}
+
+const uptimeStr = computed(() => {
+  const a = agent.value;
+  if (!a || !a.running || !a.started_at) return "—";
+  return _fmtDuration(nowTs.value - Date.parse(a.started_at));
+});
+const lastTickStr = computed(() => _hhmm(agent.value?.last_tick_at ?? null));
+const nextTickStr = computed(() => {
+  const a = agent.value;
+  if (!a || !a.running || !a.last_tick_at || !a.tick_interval_sec) return "—";
+  const next = new Date(Date.parse(a.last_tick_at) + a.tick_interval_sec * 1000);
+  return `${String(next.getHours()).padStart(2, "0")}:${String(next.getMinutes()).padStart(2, "0")}`;
+});
+
 // Lookup table: stable name → display label. Built reactively from the
 // loaded strategy/screener lists. Falls back to the stable name if the
 // list hasn't loaded yet or the lookup misses (e.g. user-removed plugin).
@@ -765,10 +801,12 @@ async function sellOne(code: string) {
 onMounted(() => {
   loadAll();
   timer = window.setInterval(loadAll, 15000);
+  clockTimer = window.setInterval(() => (nowTs.value = Date.now()), 20000);
 });
 
 onUnmounted(() => {
   if (timer !== null) window.clearInterval(timer);
+  if (clockTimer !== null) window.clearInterval(clockTimer);
 });
 </script>
 
@@ -811,6 +849,12 @@ onUnmounted(() => {
 }
 .stat-value-sm {
   font-size: 16px;
+}
+.stat-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
 }
 .up {
   color: #c0392b;
