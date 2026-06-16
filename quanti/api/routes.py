@@ -760,6 +760,7 @@ async def agent_status(request: Request):
         pending_count = 0
     return {
         "enabled": s.enabled, "running": s.running,
+        "started_at": s.started_at, "tick_interval_sec": s.tick_interval_sec,
         "last_tick_at": s.last_tick_at, "last_tick_summary": s.last_tick_summary,
         "last_strategy": s.last_strategy,
         "last_evaluations": s.last_evaluations,

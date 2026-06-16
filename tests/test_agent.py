@@ -274,6 +274,27 @@ class TestAgentRuntime:
         # Goal should now be disabled.
         assert load_goal(seeded).enabled is False
 
+    def test_status_reports_uptime_and_interval(self, seeded, test_strategies_dir):
+        """status() exposes started_at (set on start, cleared on stop) and the
+        tick cadence, so the UI can show running time + next-tick."""
+        provider = DataProvider(seeded)
+        broker = PaperBroker(seeded, provider, initial_cash=200_000)
+        agent = AgentRuntime(seeded, provider, broker,
+                             strategies_dir=test_strategies_dir,
+                             screeners_dir="strategies",
+                             tick_interval_sec=3600)
+        # Before start: no started_at, interval still reported.
+        s0 = agent.status()
+        assert s0.started_at is None
+        assert s0.tick_interval_sec == 3600
+        save_goal(seeded, Goal(strategy_name="e2e_force_buy",
+                               target_annual_return=0.15, enabled=True))
+        agent.start()
+        s1 = agent.status()
+        assert s1.started_at is not None  # stamped on start
+        agent.stop()
+        assert agent.status().started_at is None  # cleared on stop
+
     def test_prune_decisions(self, tmp_path):
         """prune_decisions should drop rows older than the retention window."""
         db = Database(str(tmp_path / "prune.db"))
