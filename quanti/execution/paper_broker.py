@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Literal
 
 from quanti.backtest.commission import AShareCommission
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
+from quanti.execution.base import BrokerResult, PendingFillResult
 from quanti.models import BarData, Direction, PriceType, Signal
 from quanti.risk.manager import RiskConfig, RiskManager
 from quanti.risk.sizer import Sizer
@@ -41,36 +41,13 @@ from quanti.utils.market import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class BrokerResult:
-    accepted: int = 0
-    rejected: int = 0
-    filled: int = 0
-    pending: int = 0  # NEW: signals that were queued for next-open fill
-    reasons: list[str] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.reasons is None:
-            self.reasons = []
-
-
-@dataclass
-class PendingFillResult:
-    """Summary of one try_fill_pending_orders() pass."""
-    scanned: int = 0
-    filled: int = 0
-    rejected: int = 0      # risk re-check failed at fill time
-    expired: int = 0       # TTL exceeded without a fillable bar
-    still_pending: int = 0
-    reasons: list[str] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.reasons is None:
-            self.reasons = []
-
-
 class PaperBroker:
-    """Stateful paper-trading broker. Single instance per process."""
+    """Stateful paper-trading broker. Single instance per process.
+
+    Structurally implements the `Broker` protocol (quanti.execution.base) —
+    the agent runtime depends on that interface, so a live `QmtBroker` can
+    drop in without touching the decision/risk pipeline.
+    """
 
     def __init__(
         self,
