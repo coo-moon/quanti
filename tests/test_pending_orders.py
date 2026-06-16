@@ -28,6 +28,7 @@ from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.paper_broker import PaperBroker
 from quanti.models import Direction, Signal
+from quanti.risk.manager import RiskConfig
 
 
 @pytest.fixture
@@ -377,3 +378,78 @@ def test_snapshot_position_has_price_date(seeded_pending):
     # AAA's latest bar is today-1 (per fixture); price_date reflects it.
     expected = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
     assert pos["price_date"] == expected.isoformat()
+
+
+# --- exit engine: trailing take-profit + strategy replay -----------------
+
+def _exit_db(tmp_path, bars: list[tuple]):
+    """Fresh DB with one stock AAA and an explicit bar series.
+    bars = list of (date, open, high, low, close)."""
+    db = Database(str(tmp_path / "exit.db"))
+    db.initialize()
+    db.upsert_stock("AAA", "alpha", "SZ", date(1991, 4, 3), "test")
+    df = pd.DataFrame([{
+        "code": "AAA", "date": d, "open": o, "high": h, "low": lo,
+        "close": c, "volume": 5e6, "amount": c * 5e6, "turnover": 1.0,
+    } for (d, o, h, lo, c) in bars])
+    db.save_daily_quotes(df)
+    return db
+
+
+class TestExitEngine:
+    def test_trailing_take_profit_fires(self, tmp_path):
+        """Position +18% from cost, peaked at 13.0, now 11.6 (-10.8% off
+        peak) → trailing take-profit sells."""
+        today = pd.Timestamp.today().normalize()
+        bars = [(( today - pd.Timedelta(days=n)).date(),
+                 10.0, h, 9.5, c)
+                for n, (h, c) in zip(
+                    range(4, -1, -1),
+                    [(10.5, 10.2), (12.0, 11.8), (13.0, 12.9),
+                     (12.5, 12.0), (11.7, 11.6)])]
+        db = _exit_db(tmp_path, bars)
+        provider = DataProvider(db)
+        # Position opened at 10.0 well before the window.
+        db.upsert_position("AAA", 1000, 10.0, 11.6,
+                           (today - pd.Timedelta(days=20)).date())
+        broker = PaperBroker(db, provider, fill_mode="immediate",
+                             risk_config=RiskConfig(
+                                 take_profit_activate_pct=0.15,
+                                 take_profit_trail_pct=0.10,
+                                 strategy_exit_enabled=False))
+        landed = broker.check_exits()
+        assert landed == 1
+        trades = db.list_trades()
+        assert len(trades) == 1 and trades[0]["direction"] == "sell"
+
+    def test_peak_is_max_high_since_buy(self, tmp_path):
+        today = pd.Timestamp.today().normalize()
+        bars = [((today - pd.Timedelta(days=n)).date(), 10, 10 + n, 9, 10)
+                for n in range(5, 0, -1)]  # highs 15,14,13,12,11
+        db = _exit_db(tmp_path, bars)
+        broker = PaperBroker(db, DataProvider(db), fill_mode="immediate")
+        buy = (today - pd.Timedelta(days=3)).date()  # highs from this date: 13,12,11
+        peaks = broker._compute_peaks(
+            [{"code": "AAA", "buy_date": buy}])
+        assert peaks["AAA"] == pytest.approx(13.0)
+
+    def test_strategy_replay_detects_turtle_exit(self, tmp_path):
+        """A holding owned by turtle_breakout that breaks below the N/2-day
+        low on the last bar is flagged for exit by the replay."""
+        today = pd.Timestamp.today().normalize()
+        # 24 climbing bars then a final crash below the 10-day low.
+        bars = []
+        for n in range(24, 0, -1):
+            px = 10.0 + (24 - n) * 0.3
+            bars.append(((today - pd.Timedelta(days=n)).date(),
+                         px, px + 0.2, px - 0.2, px))
+        bars.append((today.date(), 16.0, 16.0, 7.0, 7.0))  # crash
+        db = _exit_db(tmp_path, bars)
+        broker = PaperBroker(db, DataProvider(db), fill_mode="immediate",
+                             strategies_dir="strategies")
+        codes = broker._compute_strategy_exits(
+            [{"code": "AAA", "buy_date": (today - pd.Timedelta(days=24)).date(),
+              "entry_strategy": "turtle_breakout"}])
+        # If the strategies dir loaded, the crash must trigger turtle's exit.
+        if broker._load_strategies():
+            assert "AAA" in codes

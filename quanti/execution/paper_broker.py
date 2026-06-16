@@ -84,6 +84,7 @@ class PaperBroker:
         fill_mode: Literal["pending", "immediate"] = "immediate",
         pending_ttl_trading_days: int = 3,
         fill_price_basis: Literal["open", "close"] = "open",
+        strategies_dir: str = "strategies",
     ) -> None:
         """Args:
             sizer: Optional position sizer.
@@ -106,6 +107,8 @@ class PaperBroker:
         self._fill_mode = fill_mode
         self._pending_ttl_days = pending_ttl_trading_days
         self._fill_basis = fill_price_basis
+        self._strategies_dir = strategies_dir
+        self._strategy_cache: dict | None = None  # name → strategy instance
         # Idempotent — only writes if no row exists.
         self._db.ensure_portfolio(initial_cash)
 
@@ -749,25 +752,97 @@ class PaperBroker:
         )
         return True
 
-    # ----------------------------------------------------------- stop loss
-    def check_stop_loss(self) -> int:
-        """Generate sell signals for positions that breached the stop-loss.
+    # ----------------------------------------------------------- exits
+    def check_exits(self) -> int:
+        """Generate sell signals for holdings that hit an exit rule:
+        stop-loss, owning-strategy SELL, or trailing take-profit.
 
-        In immediate mode the return value is the number of fills (legacy).
-        In pending mode it's the number of stops successfully queued — the
-        actual fills happen in the next `try_fill_pending_orders` pass once
-        a new bar lands. Callers that care about fills vs. queued should
-        look at the order log directly.
+        Computes the two inputs RiskManager.check_exits needs — each
+        holding's post-entry peak (for the trailing take-profit) and the set
+        of codes whose owning strategy now says SELL — then queues/fills the
+        resulting sells. Return value matches check_stop_loss: fills in
+        immediate mode, queued count in pending mode.
         """
         portfolio = self._build_runtime_portfolio()
-        # Refresh prices first
+        # Refresh prices first.
         for code, position in portfolio.positions.items():
             quote = self._latest_close(code)
             if quote:
                 position.current_price = quote[0]
-        sells = self._risk.check_stop_loss(portfolio)
+
+        positions = self._db.list_positions()
+        peaks = self._compute_peaks(positions)
+        strategy_sells = self._compute_strategy_exits(positions)
+
+        sells = self._risk.check_exits(portfolio, peaks=peaks,
+                                       strategy_sell_codes=strategy_sells)
         landed = 0
         for s in sells:
-            if self.execute_signal(s, strategy_name="risk_stop_loss"):
+            if self.execute_signal(s, strategy_name="risk_exit"):
                 landed += 1
         return landed
+
+    # Back-compat alias — older callers / tests may still call this name.
+    def check_stop_loss(self) -> int:
+        return self.check_exits()
+
+    def _compute_peaks(self, positions: list[dict]) -> dict[str, float]:
+        """Per-code highest high since buy_date (post-entry peak)."""
+        peaks: dict[str, float] = {}
+        for p in positions:
+            bd = p.get("buy_date")
+            if bd is None:
+                continue
+            hw = self._db.get_high_water(p["code"], bd)
+            if hw is not None:
+                peaks[p["code"]] = hw
+        return peaks
+
+    def _compute_strategy_exits(self, positions: list[dict]) -> set[str]:
+        """Replay each holding's owning entry-strategy over its recent bars;
+        return codes whose latest bar emits a SELL. Defaults-only params (v1)
+        — close enough for an exit gate, and never raises into the cycle."""
+        if not self._risk.config.strategy_exit_enabled:
+            return set()
+        out: set[str] = set()
+        strategies = self._load_strategies()
+        if not strategies:
+            return out
+        end = date.today()
+        start = end - timedelta(days=400)
+        for p in positions:
+            name = p.get("entry_strategy") or ""
+            strat_cls = strategies.get(name)
+            if strat_cls is None:
+                continue
+            try:
+                bars = self._provider.get_daily_bars(p["code"], start, end)
+                if not bars:
+                    continue
+                strat = strat_cls()
+                strat.init(getattr(strat, "params", {}) or {})
+                last_signals: list = []
+                for bar in bars:
+                    last_signals = strat.on_bar(bar) or []
+                if any(s.direction == Direction.SELL
+                       and s.stock_code == p["code"] for s in last_signals):
+                    out.add(p["code"])
+            except Exception as e:
+                logger.debug("strategy-exit replay skipped for %s/%s: %s",
+                             p["code"], name, e)
+        return out
+
+    def _load_strategies(self) -> dict:
+        """Lazy-load strategy classes by name (cached). Returns {} if the
+        loader/dir is unavailable so exits degrade to stop-loss + TP only."""
+        if self._strategy_cache is not None:
+            return self._strategy_cache
+        cache: dict = {}
+        try:
+            from quanti.strategy.loader import StrategyLoader
+            for s in StrategyLoader().load_directory(self._strategies_dir):
+                cache[s.name] = type(s)
+        except Exception as e:
+            logger.debug("strategy load for exits failed: %s", e)
+        self._strategy_cache = cache
+        return cache

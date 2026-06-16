@@ -443,6 +443,20 @@ class Database:
         row = self.conn.execute("SELECT MAX(date) FROM daily_quotes").fetchone()
         return self._safe_quote_date(row[0]) if row else None
 
+    def get_high_water(self, code: str, since: date) -> float | None:
+        """Highest intraday high for `code` on/after `since` (the post-entry
+        peak, for trailing take-profit). None if no bars in range."""
+        row = self.conn.execute(
+            "SELECT MAX(high) FROM daily_quotes WHERE code=? AND date>=?",
+            (code, since.isoformat()),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        try:
+            return float(row[0])
+        except (ValueError, TypeError):
+            return None
+
     # --- Trade calendar ---
 
     def save_trade_calendar(self, dates: list[date]) -> None:

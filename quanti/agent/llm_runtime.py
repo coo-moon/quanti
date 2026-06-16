@@ -743,8 +743,8 @@ def run_llm_decision(
         for o in valid_orders
     ]
 
-    # Stop-loss first, then LLM-proposed buys.
-    sl_count = broker.check_stop_loss()
+    # Exits first (stop-loss / strategy / take-profit), then LLM buys.
+    sl_count = broker.check_exits()
     result = broker.execute_signals(signals, strategy_name="llm")
     snapshot = broker.snapshot_portfolio()
 

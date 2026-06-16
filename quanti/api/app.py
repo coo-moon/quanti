@@ -39,7 +39,8 @@ def create_app(
     # Backtest engine + unit tests keep using the "immediate" default of
     # PaperBroker so their assertions on synchronous fills still hold.
     broker = PaperBroker(db=db, provider=provider, initial_cash=initial_cash,
-                         fill_mode="pending")
+                         fill_mode="pending",
+                         strategies_dir=strategies_dir or "strategies")
     agent = AgentRuntime(
         db=db, provider=provider, broker=broker,
         strategies_dir=strategies_dir or "strategies",
