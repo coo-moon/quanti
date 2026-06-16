@@ -242,6 +242,7 @@
             <th>名称</th>
             <th>数量</th>
             <th>成本</th>
+            <th>买入时间</th>
             <th>现价</th>
             <th>最近更新</th>
             <th>市值</th>
@@ -256,6 +257,7 @@
             <td>{{ p.name }}</td>
             <td>{{ p.quantity }}</td>
             <td>{{ p.avg_cost.toFixed(2) }}</td>
+            <td class="nowrap">{{ p.buy_date ?? "—" }}</td>
             <td>{{ p.current_price.toFixed(2) }}</td>
             <td :class="priceDateClass(p.price_date)">{{ p.price_date ?? "—" }}</td>
             <td>{{ formatMoney(p.market_value) }}</td>
