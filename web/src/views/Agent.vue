@@ -999,10 +999,12 @@ onUnmounted(() => {
   color: var(--color-text-secondary);
 }
 .reason-cell {
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Show the full LLM rationale: wrap to a few lines instead of clipping
+     with an ellipsis. Overrides the table-wide `white-space: nowrap`. */
+  max-width: 360px;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.4;
   color: var(--color-text-secondary);
 }
 .manual-row {
