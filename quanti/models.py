@@ -64,6 +64,12 @@ class Signal:
     strength: float  # 0.0 to 1.0
     reason: str
     timestamp: datetime = field(default_factory=datetime.now)
+    entry_strategy: str = ""
+    """For BUY signals from the ensemble/LLM path: the single strategy that
+    contributed most to this pick (argmax of weight×strength). Persisted onto
+    the position so an exit can replay *that* strategy's logic. Empty when the
+    buy wasn't strategy-led (pure factor/sentiment) or in single-strategy mode
+    (the position's strategy is unambiguous anyway)."""
 
 
 @dataclass

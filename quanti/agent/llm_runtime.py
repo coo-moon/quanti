@@ -731,10 +731,15 @@ def run_llm_decision(
     # then turn size_pct into a notional. We use signal.strength = size_pct
     # so a FixedSizer with max_pct=0.10 will deploy exactly the LLM's request
     # (strength * max_pct ≈ size_pct when max_pct=0.10).
+    # Carry each candidate's dominant strategy onto the buy signal so the
+    # position records who to replay at exit (the LLM picks FROM candidates,
+    # so the ensemble's strategy attribution still applies).
+    dominant_by_code = {c.code: c.dominant_strategy for c in candidates}
     signals = [
         Signal(stock_code=o["code"], direction=Direction.BUY,
                strength=min(1.0, float(o["size_pct"]) / 0.10),
-               reason=f"LLM: {o.get('reason', '')}")
+               reason=f"LLM: {o.get('reason', '')}",
+               entry_strategy=dominant_by_code.get(o["code"], ""))
         for o in valid_orders
     ]
 

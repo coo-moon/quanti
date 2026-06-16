@@ -95,6 +95,22 @@ class Database:
         self._raw_conn.execute("PRAGMA journal_mode=WAL")
         self._conn = _LockedConnection(self._raw_conn, self._db_lock)
         self._create_tables()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Idempotent additive migrations for DBs created before a column
+        existed. SQLite ADD COLUMN is cheap and non-locking."""
+        adds = [
+            ("positions", "entry_strategy", "TEXT DEFAULT ''"),
+            ("orders", "entry_strategy", "TEXT DEFAULT ''"),
+        ]
+        for table, col, decl in adds:
+            cols = [r[1] for r in self.conn.execute(
+                f"PRAGMA table_info({table})").fetchall()]
+            if col not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        self.conn.commit()
 
     def close(self) -> None:
         if self._conn:
@@ -175,7 +191,8 @@ class Database:
                 avg_cost REAL NOT NULL,
                 current_price REAL DEFAULT 0,
                 buy_date TEXT,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                entry_strategy TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS orders (
@@ -191,7 +208,8 @@ class Database:
                 filled_quantity INTEGER DEFAULT 0,
                 reason TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
-                filled_at TEXT
+                filled_at TEXT,
+                entry_strategy TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS trades (
@@ -611,22 +629,29 @@ class Database:
                 "created_at": row[2], "updated_at": row[3]}
 
     def upsert_position(self, code: str, quantity: int, avg_cost: float,
-                        current_price: float, buy_date: date | None) -> None:
+                        current_price: float, buy_date: date | None,
+                        entry_strategy: str | None = None) -> None:
         from datetime import datetime
+        # entry_strategy is only set on the FIRST buy (position open). On a
+        # follow-on buy (averaging in) we pass None to preserve the original
+        # owning strategy via COALESCE rather than overwriting it.
         self.conn.execute(
             """
-            INSERT INTO positions (code, quantity, avg_cost, current_price, buy_date, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO positions (code, quantity, avg_cost, current_price,
+                                   buy_date, updated_at, entry_strategy)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 quantity=excluded.quantity,
                 avg_cost=excluded.avg_cost,
                 current_price=excluded.current_price,
                 buy_date=excluded.buy_date,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                entry_strategy=COALESCE(
+                    NULLIF(excluded.entry_strategy, ''), positions.entry_strategy)
             """,
             (code, quantity, avg_cost, current_price,
              buy_date.isoformat() if buy_date else None,
-             datetime.now().isoformat()),
+             datetime.now().isoformat(), entry_strategy or ""),
         )
         self.conn.commit()
 
@@ -636,7 +661,8 @@ class Database:
 
     def list_positions(self) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT code, quantity, avg_cost, current_price, buy_date, updated_at FROM positions"
+            "SELECT code, quantity, avg_cost, current_price, buy_date, "
+            "updated_at, entry_strategy FROM positions"
         ).fetchall()
         return [
             {
@@ -644,6 +670,7 @@ class Database:
                 "current_price": r[3],
                 "buy_date": date.fromisoformat(r[4]) if r[4] else None,
                 "updated_at": r[5],
+                "entry_strategy": r[6] or "",
             }
             for r in rows
         ]
@@ -662,8 +689,8 @@ class Database:
             """
             INSERT INTO orders (order_id, code, direction, quantity, price_type, limit_price,
                                 status, strategy_name, filled_price, filled_quantity,
-                                reason, created_at, filled_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                reason, created_at, filled_at, entry_strategy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order["order_id"], order["code"], order["direction"],
@@ -673,6 +700,7 @@ class Database:
                 order.get("reason", ""),
                 order.get("created_at") or datetime.now().isoformat(),
                 order.get("filled_at"),
+                order.get("entry_strategy", ""),
             ),
         )
         self.conn.commit()
@@ -699,14 +727,16 @@ class Database:
         if status:
             rows = self.conn.execute(
                 "SELECT order_id, code, direction, quantity, status, filled_price, "
-                "filled_quantity, strategy_name, reason, created_at, filled_at "
+                "filled_quantity, strategy_name, reason, created_at, filled_at, "
+                "entry_strategy "
                 "FROM orders WHERE status=? ORDER BY created_at ASC LIMIT ?",
                 (status, limit),
             ).fetchall()
         else:
             rows = self.conn.execute(
                 "SELECT order_id, code, direction, quantity, status, filled_price, "
-                "filled_quantity, strategy_name, reason, created_at, filled_at "
+                "filled_quantity, strategy_name, reason, created_at, filled_at, "
+                "entry_strategy "
                 "FROM orders ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -716,6 +746,7 @@ class Database:
                 "quantity": r[3], "status": r[4], "filled_price": r[5],
                 "filled_quantity": r[6], "strategy_name": r[7],
                 "reason": r[8], "created_at": r[9], "filled_at": r[10],
+                "entry_strategy": r[11] or "",
             }
             for r in rows
         ]

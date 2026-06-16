@@ -142,6 +142,47 @@ def _append_new_bar(db, code, days_from_today_back=0,
     db.save_daily_quotes(df)
 
 
+class TestEntryStrategyPlumbing:
+    def test_entry_strategy_survives_queue_to_position(self, seeded_pending):
+        """A buy signal's entry_strategy must travel signal → order row →
+        (next-bar fill) → position row, so an exit can later replay the
+        owning strategy on the holding."""
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending")
+        sig = Signal(stock_code="AAA", direction=Direction.BUY,
+                     strength=0.5, reason="q", entry_strategy="turtle_breakout")
+        broker.execute_signal(sig, "ensemble")
+        # Stored on the pending order row.
+        assert db.list_orders(status="pending")[0]["entry_strategy"] == "turtle_breakout"
+        # Backdate + new bar so it fills.
+        db.conn.execute(
+            "UPDATE orders SET created_at=? WHERE code='AAA' AND status='pending'",
+            ((datetime.now() - timedelta(days=1)).isoformat(),))
+        db.conn.commit()
+        _append_new_bar(db, "AAA", days_from_today_back=0,
+                        open_price=11.0, close_price=11.1)
+        broker.try_fill_pending_orders()
+        pos = next(p for p in db.list_positions() if p["code"] == "AAA")
+        assert pos["entry_strategy"] == "turtle_breakout"
+
+    def test_addon_buy_preserves_original_owner(self, seeded_pending):
+        """Averaging into an existing position must NOT overwrite the original
+        entry_strategy (COALESCE on empty)."""
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=500_000,
+                             fill_mode="immediate")
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY, strength=0.3,
+                   reason="open", entry_strategy="macd_cross"), "ensemble")
+        # Second buy with a DIFFERENT (or empty) owner must not clobber it.
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY, strength=0.3,
+                   reason="addon", entry_strategy=""), "ensemble")
+        pos = next(p for p in db.list_positions() if p["code"] == "AAA")
+        assert pos["entry_strategy"] == "macd_cross"
+
+
 class TestFilling:
     def test_pending_fill_uses_next_bar_open(self, seeded_pending):
         """Queue at time T (last AAA bar is 'today-1'). Backdate the

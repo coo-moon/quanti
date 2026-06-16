@@ -338,12 +338,14 @@ class PaperBroker:
                 continue
 
             # We have a fillable bar. Build a Signal from the order row,
-            # re-run risk, fill at bar.open (+/- slippage).
+            # re-run risk, fill at bar.open (+/- slippage). Carry the order's
+            # entry_strategy so it lands on the position at fill.
             sig = Signal(
                 stock_code=o["code"],
                 direction=Direction(o["direction"]),
                 strength=1.0,
                 reason=o.get("reason", "") or "pending fill",
+                entry_strategy=o.get("entry_strategy", "") or "",
             )
             portfolio = self._build_runtime_portfolio()
             ok, reason = self._risk.check(sig, portfolio)
@@ -482,12 +484,14 @@ class PaperBroker:
                 total_qty = existing["quantity"] + quantity
                 avg = (existing["avg_cost"] * existing["quantity"]
                        + price * quantity) / total_qty
+                # entry_strategy=None preserves the original owner on add-ons.
                 self._db.upsert_position(signal.stock_code, total_qty, avg,
                                          ref_price,
                                          existing["buy_date"] or bar_date)
             else:
                 self._db.upsert_position(signal.stock_code, quantity, price,
-                                         ref_price, bar_date)
+                                         ref_price, bar_date,
+                                         entry_strategy=signal.entry_strategy)
             self._db.update_order_filled(order_id, "filled", price, quantity)
             trade_id = "t_" + uuid.uuid4().hex[:10]
             self._db.insert_trade({
@@ -592,6 +596,7 @@ class PaperBroker:
             "reason": reason or signal.reason,
             "created_at": datetime.now().isoformat(),
             "filled_at": datetime.now().isoformat() if status == "filled" else None,
+            "entry_strategy": signal.entry_strategy,
         })
         return order_id
 
@@ -664,11 +669,13 @@ class PaperBroker:
         if existing:
             total_qty = existing["quantity"] + quantity
             avg = (existing["avg_cost"] * existing["quantity"] + price * quantity) / total_qty
+            # entry_strategy=None preserves the original owner on add-ons.
             self._db.upsert_position(signal.stock_code, total_qty, avg,
                                      ref_price, existing["buy_date"] or bar_date)
         else:
             self._db.upsert_position(signal.stock_code, quantity, price,
-                                     ref_price, bar_date)
+                                     ref_price, bar_date,
+                                     entry_strategy=signal.entry_strategy)
 
         order_id = self._record_order(
             signal, strategy_name,
