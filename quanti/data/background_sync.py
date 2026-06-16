@@ -17,7 +17,9 @@ Design:
       ACTIVE  — queue has codes to sync; process `batch_size` then short sleep.
       IDLE    — queue drained; sleep `idle_interval_sec` (~30 min), rescan.
       PAUSED  — explicitly disabled via `pause()`; no work, just heartbeat.
-  * Scan priority: held positions > codes with no bars > codes with stale bars.
+  * Scan priority: pending-order codes > held positions > no bars > stale bars.
+    Pending-order codes lead because a queued order can't fill until its next
+    trading bar is on disk — syncing them first is what unblocks fills.
   * Per-code backoff (held codes included):
       - hard failure (exception / 0 rows): exponential, `failure_backoff_sec`
         doubling per consecutive failure up to `max_backoff_sec` — a feed that
@@ -290,8 +292,9 @@ class BackgroundQuoteSyncer:
 
     def _scan_and_enqueue(self) -> None:
         """Walk the stocks table, decide which codes need sync. Priority:
-        held positions first (because their PnL freezes if stale), then
-        codes with no data at all, then codes with stale data.
+        pending-order codes first (a queued order can't fill until its next
+        bar lands, so these are the most time-sensitive), then held positions
+        (their PnL / stops freeze if stale), then no-data, then stale.
 
         Result is bounded by `max_queue_size`. Backed-off codes are skipped.
         """
@@ -308,7 +311,17 @@ class BackgroundQuoteSyncer:
                 days=self._cfg.stale_after_days - 1)
             now_ts = time.time()
 
-            # Held first
+            # Pending-order codes first — a queued buy/sell is blocked until
+            # the next trading bar for that code is on disk, so syncing these
+            # ahead of everything else is what actually unblocks fills.
+            pending_codes: list[str] = []
+            try:
+                pend = self._db.list_orders(limit=1000, status="pending") or []
+                pending_codes = [o.get("code") for o in pend if o.get("code")]
+            except Exception as e:
+                logger.warning(f"bg-sync: could not list pending orders: {e}")
+
+            # Held next
             held_codes: list[str] = []
             try:
                 positions = self._db.list_positions() or []
@@ -330,10 +343,11 @@ class BackgroundQuoteSyncer:
             def backed_off(code: str) -> bool:
                 return self._backoff_until.get(code, 0) > now_ts
 
-            # Backoff applies to held codes too — without it, a held stock
-            # whose feed has nothing new (halted, or today's bar not out yet)
-            # would be re-fetched every single loop instead of every backoff
-            # window. Held still jumps the queue whenever it IS eligible.
+            # Backoff applies to pending/held too — without it, a code whose
+            # feed has nothing new (halted, or today's bar not out yet) would
+            # be re-fetched every single loop instead of every backoff window.
+            # They still jump the queue whenever they ARE eligible.
+            pending_codes = [c for c in pending_codes if not backed_off(c)]
             held_codes = [c for c in held_codes if not backed_off(c)]
 
             missing: list[str] = []
@@ -347,10 +361,10 @@ class BackgroundQuoteSyncer:
                 elif latest < stale_cutoff:
                     stale.append(code)
 
-            # Deduped, ordered: held → missing → stale.
+            # Deduped, ordered: pending → held → missing → stale.
             ordered: list[str] = []
             seen: set[str] = set()
-            for c in held_codes + missing + stale:
+            for c in pending_codes + held_codes + missing + stale:
                 if c and c not in seen:
                     ordered.append(c)
                     seen.add(c)
@@ -361,9 +375,9 @@ class BackgroundQuoteSyncer:
                 self._last_full_scan_at = datetime.now().isoformat()
             logger.info(
                 f"bg-sync scan: {len(all_codes)} known, "
-                f"queued {len(ordered)} (held={len(held_codes)}, "
-                f"missing={len(missing)}, stale={len(stale)}, "
-                f"expected_bar={expected})"
+                f"queued {len(ordered)} (pending={len(pending_codes)}, "
+                f"held={len(held_codes)}, missing={len(missing)}, "
+                f"stale={len(stale)}, expected_bar={expected})"
             )
         except Exception as e:
             logger.exception(f"bg-sync scan failed: {e}")
