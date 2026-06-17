@@ -40,7 +40,7 @@ from typing import Protocol
 from quanti.agent.goal import Goal
 from quanti.agent.signal_pipeline import FusedCandidate
 from quanti.data.database import Database
-from quanti.execution.paper_broker import PaperBroker
+from quanti.execution.base import Broker
 from quanti.models import Direction, Signal
 
 logger = logging.getLogger(__name__)
@@ -620,7 +620,7 @@ def build_context_message(
 def run_llm_decision(
     *,
     db: Database,
-    broker: PaperBroker,
+    broker: Broker,
     goal: Goal,
     candidates: list[FusedCandidate],
     llm_client: LLMClient,

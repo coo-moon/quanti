@@ -98,3 +98,14 @@ def test_snapshot_records_history(setup):
     assert any(p["code"] == "000001" for p in snap["positions"])
     snaps = db.get_portfolio_snapshots()
     assert len(snaps) >= 1
+
+
+def test_paper_broker_satisfies_broker_protocol(setup):
+    """PaperBroker must structurally implement the Broker interface the
+    runtime depends on — guards against drift when QmtBroker is added."""
+    from quanti.execution.base import Broker
+    _, _, broker = setup
+    assert isinstance(broker, Broker)
+    for m in ("execute_signal", "execute_signals", "try_fill_pending_orders",
+              "check_exits", "snapshot_portfolio", "pending_orders_detail"):
+        assert callable(getattr(broker, m)), f"missing {m}"

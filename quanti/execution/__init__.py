@@ -1,5 +1,6 @@
 """Order execution layer (paper trading by default)."""
 
-from quanti.execution.paper_broker import PaperBroker, BrokerResult
+from quanti.execution.base import Broker, BrokerResult, PendingFillResult
+from quanti.execution.paper_broker import PaperBroker
 
-__all__ = ["PaperBroker", "BrokerResult"]
+__all__ = ["Broker", "BrokerResult", "PendingFillResult", "PaperBroker"]

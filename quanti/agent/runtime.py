@@ -38,7 +38,7 @@ from quanti.agent.signal_pipeline import (
 )
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
-from quanti.execution.paper_broker import PaperBroker
+from quanti.execution.base import Broker
 from quanti.factors.cross_sectional import FactorConfig, compute_factor_panel
 from quanti.models import Direction, Signal
 from quanti.screener.loader import ScreenerLoader
@@ -68,7 +68,7 @@ class AgentRuntime:
         self,
         db: Database,
         provider: DataProvider,
-        broker: PaperBroker,
+        broker: Broker,
         strategies_dir: str | Path = "strategies",
         screeners_dir: str | Path = "screeners",
         tick_interval_sec: int = 60 * 60 * 4,  # 4h between cycles by default
