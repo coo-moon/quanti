@@ -11,8 +11,10 @@ venv/
 env/
 .env
 *.db
+*.db
 *.db-shm
 *.db-wal
+*.db.bak
 *.sqlite3
 data/*.csv
 data/*.parquet
