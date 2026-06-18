@@ -50,6 +50,12 @@ export interface BacktestResult {
   warning: string;
 }
 
+export interface ServerMeta {
+  account: string; // "paper" | "live"
+  is_live: boolean;
+}
+export const fetchMeta = () => api.get<ServerMeta>("/meta");
+
 export const fetchStocks = () => api.get<StockInfo[]>("/stocks");
 
 export interface StockPoolStats {
