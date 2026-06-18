@@ -27,6 +27,7 @@ class TradeRecord:
     price: float
     commission: float
     strategy: str
+    reason: str = ""  # signal reason — for exits: 止损 / 移动止盈 / 策略离场
 
 
 @dataclass
@@ -203,12 +204,14 @@ class BacktestEngine:
         code = signal.stock_code
 
         if signal.direction == Direction.BUY:
-            return self._execute_buy(code, bar, portfolio, trades, current_date, bought_today, strategy_name)
+            return self._execute_buy(code, bar, portfolio, trades, current_date,
+                                     bought_today, strategy_name, signal.reason)
         elif signal.direction == Direction.SELL:
             # T+1 rule: cannot sell stocks bought today
             if code in bought_today:
                 return False
-            return self._execute_sell(code, bar, portfolio, trades, current_date, strategy_name)
+            return self._execute_sell(code, bar, portfolio, trades, current_date,
+                                      strategy_name, signal.reason)
         return False
 
     def _execute_buy(
@@ -220,6 +223,7 @@ class BacktestEngine:
         current_date: date,
         bought_today: set[str],
         strategy_name: str,
+        reason: str = "",
     ) -> bool:
         adv = self._adv20.get(code, {}).get(current_date, 0.0)
 
@@ -289,6 +293,7 @@ class BacktestEngine:
                 price=price,
                 commission=commission,
                 strategy=strategy_name,
+                reason=reason,
             )
         )
         return True
@@ -301,6 +306,7 @@ class BacktestEngine:
         trades: list[TradeRecord],
         current_date: date,
         strategy_name: str,
+        reason: str = "",
     ) -> bool:
         if code not in portfolio.positions:
             return False
@@ -329,6 +335,7 @@ class BacktestEngine:
                 price=price,
                 commission=commission,
                 strategy=strategy_name,
+                reason=reason,
             )
         )
         return True

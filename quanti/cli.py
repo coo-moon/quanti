@@ -70,7 +70,9 @@ def cmd_backtest(args):
     strategy.init({})
     codes = args.codes.split(",")
 
-    engine = BacktestEngine(provider=provider, initial_cash=args.cash)
+    from quanti.risk.manager import RiskConfig, RiskManager
+    engine = BacktestEngine(provider=provider, initial_cash=args.cash,
+                            risk_manager=RiskManager(RiskConfig()))
     result = engine.run(
         strategy=strategy,
         codes=codes,

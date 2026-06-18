@@ -28,6 +28,7 @@ class BacktestRequest(BaseModel):
     end: str
     initial_cash: float = 1_000_000.0
     params: dict = {}
+    apply_risk: bool = True  # apply live exit policy (stop-loss/TP/caps)
 
 
 class TradeResponse(BaseModel):
@@ -37,6 +38,8 @@ class TradeResponse(BaseModel):
     quantity: int
     price: float
     commission: float
+    strategy: str = ""
+    reason: str = ""  # exits: 止损 / 移动止盈 / 策略离场
 
 
 class BacktestResponse(BaseModel):
@@ -845,7 +848,12 @@ async def run_backtest(body: BacktestRequest, request: Request):
 
     strategy.init(body.params)
 
-    engine = BacktestEngine(provider=provider, initial_cash=body.initial_cash)
+    # Apply the live exit policy by default so the UI backtest reflects how
+    # the agent actually trades (stop-loss / trailing take-profit / caps).
+    from quanti.risk.manager import RiskConfig, RiskManager
+    risk = RiskManager(RiskConfig()) if body.apply_risk else None
+    engine = BacktestEngine(provider=provider, initial_cash=body.initial_cash,
+                            risk_manager=risk)
     result = engine.run(
         strategy=strategy,
         codes=body.codes,
@@ -864,6 +872,8 @@ async def run_backtest(body: BacktestRequest, request: Request):
                 quantity=t.quantity,
                 price=round(t.price, 4),
                 commission=round(t.commission, 4),
+                strategy=t.strategy,
+                reason=t.reason,
             )
             for t in result.trades
         ],
