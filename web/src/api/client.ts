@@ -39,6 +39,8 @@ export interface TradeRecord {
   quantity: number;
   price: number;
   commission: number;
+  strategy?: string;
+  reason?: string; // exits: 止损 / 移动止盈 / 策略离场
 }
 
 export interface BacktestResult {
