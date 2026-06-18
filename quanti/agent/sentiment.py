@@ -240,14 +240,20 @@ def score_candidates(
             news = []
         headlines = [n.get("title", "") for n in news if n.get("title")]
         if not headlines:
-            # Cache neutral so we don't keep hammering the news endpoint today.
+            # No model was consulted (no news) → record an empty model rather
+            # than a misleading one.
             db.upsert_news_sentiment(code, as_of_s, 0.0, reason="无近期新闻",
-                                     n_news=0, model=cfg.model)
+                                     n_news=0, model="")
             scores[code] = 0.0
             continue
         to_score.append({"code": code, "headlines": headlines})
 
     if to_score and llm_client is not None:
+        # Record the model that ACTUALLY served the call, not the requested
+        # alias — providers remap (e.g. claude-* → deepseek-v4-pro). Mirrors
+        # the resolved-model logging in run_llm_decision.
+        served_model = getattr(llm_client, "resolved_model",
+                               lambda m: m)(cfg.model)
         try:
             llm_scores = _score_with_llm(llm_client, to_score, cfg)
         except Exception as e:
@@ -258,7 +264,7 @@ def score_candidates(
             score, reason = llm_scores.get(code, (0.0, ""))
             db.upsert_news_sentiment(code, as_of_s, score, reason=reason,
                                      n_news=len(item["headlines"]),
-                                     model=cfg.model)
+                                     model=served_model)
             scores[code] = score
     else:
         # No LLM this tick — neutral, and intentionally NOT cached.

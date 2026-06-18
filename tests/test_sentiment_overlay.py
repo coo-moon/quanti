@@ -122,6 +122,23 @@ class TestScoreCandidates:
         # Exactly one batched LLM call (only the newsy code needed scoring).
         assert len(client.calls) == 1
 
+    def test_records_resolved_model_not_alias(self, db):
+        """The cache's `model` must be what actually served the call. A client
+        exposing resolved_model() (DeepSeek remaps claude-* → deepseek-v4-pro)
+        → that resolved name is stored; no-news rows record an empty model."""
+        class RemappingStub(StubLLMClient):
+            def resolved_model(self, model: str) -> str:
+                return "deepseek-v4-pro" if str(model).startswith("claude") else model
+
+        client = RemappingStub([
+            _sentiment_block([{"code": "000001", "score": 0.3, "reason": "x"}])])
+        score_candidates(db, ["000001", "000002"], client,
+                         as_of=date(2026, 6, 5), news_fetcher=_fake_news({"000001"}),
+                         cfg=SentimentConfig(model="claude-sonnet-4-5"))
+        assert db.get_news_sentiment("000001", "2026-06-05")["model"] == "deepseek-v4-pro"
+        # No-news code: empty model (nothing scored it).
+        assert db.get_news_sentiment("000002", "2026-06-05")["model"] == ""
+
     def test_second_call_hits_cache_no_llm(self, db):
         fetch = _fake_news({"000001"})
         score_candidates(db, ["000001"], StubLLMClient([
