@@ -94,3 +94,57 @@ class TestTradeCalendar:
         db.save_trade_calendar(dates)
         assert db.is_trade_date(date(2024, 1, 2)) is True
         assert db.is_trade_date(date(2024, 1, 1)) is False
+
+
+class TestAccountMarketSplit:
+    """Split mode: trading state in the account DB, market data in a shared
+    market DB. Keeps real money (live.db) isolated from paper, market synced
+    once. Unqualified queries resolve across the attach (no query changes)."""
+
+    def test_tables_land_in_right_db(self, tmp_path):
+        db = Database(str(tmp_path / "paper.db"),
+                      market_db_path=str(tmp_path / "market.db"))
+        db.initialize()
+        main = {r[0] for r in db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        mkt = {r[0] for r in db.conn.execute(
+            "SELECT name FROM market.sqlite_master WHERE type='table'").fetchall()}
+        assert {"positions", "orders", "portfolio_state"} <= main
+        assert {"daily_quotes", "stocks", "news_sentiment"} <= mkt
+        assert "daily_quotes" not in main and "positions" not in mkt
+        db.close()
+
+    def test_writes_route_across_attach(self, tmp_path):
+        import pandas as pd
+        db = Database(str(tmp_path / "paper.db"),
+                      market_db_path=str(tmp_path / "market.db"))
+        db.initialize()
+        # Market write → market DB; trading write → account DB. Both via
+        # unqualified names (the broker/agent code is unchanged).
+        db.save_daily_quotes(pd.DataFrame({
+            "code": ["X"], "date": ["2026-06-16"], "open": [1.0], "high": [1.0],
+            "low": [1.0], "close": [1.0], "volume": [1.0], "amount": [1.0],
+            "turnover": [1.0]}))
+        db.upsert_position("X", 100, 1.0, 1.0, date(2026, 6, 16))
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM market.daily_quotes").fetchone()[0] == 1
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM main.positions").fetchone()[0] == 1
+        # And the high-level readers work unchanged.
+        assert db.get_latest_quote_date("X") == date(2026, 6, 16)
+        assert len(db.list_positions()) == 1
+        db.close()
+
+    def test_two_accounts_share_market_isolate_trades(self, tmp_path):
+        """paper + live attach the same market DB but keep separate trades."""
+        mkt = str(tmp_path / "market.db")
+        paper = Database(str(tmp_path / "paper.db"), market_db_path=mkt)
+        paper.initialize()
+        live = Database(str(tmp_path / "live.db"), market_db_path=mkt)
+        live.initialize()
+        paper.upsert_position("AAA", 100, 10.0, 10.0, date(2026, 6, 16))
+        # Live sees no paper position; trades are isolated by file.
+        assert len(paper.list_positions()) == 1
+        assert len(live.list_positions()) == 0
+        paper.close()
+        live.close()

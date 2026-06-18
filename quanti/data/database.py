@@ -82,8 +82,21 @@ class _LockedConnection:
 class Database:
     """SQLite-based storage for market data."""
 
-    def __init__(self, db_path: str = "data/quanti.db"):
+    def __init__(self, db_path: str = "data/quanti.db",
+                 market_db_path: str | None = None):
+        """Args:
+            db_path: the account DB — holds trading state (portfolio, positions,
+                orders, trades, goal, decisions). Each account (paper / live)
+                gets its own file, so real money is never mixed with paper.
+            market_db_path: shared market DB (stocks, daily_quotes, calendar,
+                pools, sync_jobs, news_sentiment), ATTACHed as `market`. When
+                None, everything lives in db_path as before (single-file mode,
+                used by tests). Market tables sync once and both accounts read
+                them; SQLite resolves unqualified names across the attach, so
+                queries don't change.
+        """
         self._db_path = db_path
+        self._market_db_path = market_db_path
         self._raw_conn: sqlite3.Connection | None = None
         self._conn: _LockedConnection | None = None
         self._db_lock = threading.RLock()
@@ -93,6 +106,11 @@ class Database:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._raw_conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._raw_conn.execute("PRAGMA journal_mode=WAL")
+        if self._market_db_path:
+            Path(self._market_db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._raw_conn.execute("ATTACH DATABASE ? AS market",
+                                   (self._market_db_path,))
+            self._raw_conn.execute("PRAGMA market.journal_mode=WAL")
         self._conn = _LockedConnection(self._raw_conn, self._db_lock)
         self._create_tables()
         self._migrate()
@@ -125,9 +143,13 @@ class Database:
         return self._conn
 
     def _create_tables(self) -> None:
+        # Market / shared data → `market.` schema when a market DB is attached,
+        # otherwise the main DB (single-file mode). SQLite resolves unqualified
+        # names across the attach, so only DDL needs the prefix; queries don't.
+        m = "market." if self._market_db_path else ""
         self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS stocks (
+            f"""
+            CREATE TABLE IF NOT EXISTS {m}stocks (
                 code TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 exchange TEXT NOT NULL,
@@ -135,7 +157,7 @@ class Database:
                 industry TEXT DEFAULT ''
             );
 
-            CREATE TABLE IF NOT EXISTS daily_quotes (
+            CREATE TABLE IF NOT EXISTS {m}daily_quotes (
                 code TEXT NOT NULL,
                 date TEXT NOT NULL,
                 open REAL NOT NULL,
@@ -148,35 +170,53 @@ class Database:
                 PRIMARY KEY (code, date)
             );
 
-            CREATE TABLE IF NOT EXISTS trade_calendar (
+            CREATE TABLE IF NOT EXISTS {m}trade_calendar (
                 date TEXT PRIMARY KEY
             );
 
-            CREATE TABLE IF NOT EXISTS stock_pools (
+            CREATE TABLE IF NOT EXISTS {m}stock_pools (
                 name TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
                 description TEXT DEFAULT ''
             );
 
-            CREATE TABLE IF NOT EXISTS pool_stocks (
+            CREATE TABLE IF NOT EXISTS {m}pool_stocks (
                 pool_name TEXT NOT NULL,
                 code TEXT NOT NULL,
                 added_at TEXT NOT NULL,
                 PRIMARY KEY (pool_name, code)
             );
 
-            CREATE TABLE IF NOT EXISTS sync_jobs (
+            CREATE TABLE IF NOT EXISTS {m}sync_jobs (
                 job_id TEXT PRIMARY KEY,
                 pool_name TEXT NOT NULL,
                 total INTEGER NOT NULL,
                 current INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'running',
-                errors_json TEXT DEFAULT '{}',
+                errors_json TEXT DEFAULT '{{}}',
                 created_at TEXT NOT NULL
             );
 
-            -- Live / paper-trading state ---------------------------------
+            CREATE TABLE IF NOT EXISTS {m}news_sentiment (
+                code TEXT NOT NULL,
+                as_of TEXT NOT NULL,
+                score REAL NOT NULL,
+                reason TEXT DEFAULT '',
+                n_news INTEGER DEFAULT 0,
+                model TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (code, as_of)
+            );
 
+            CREATE INDEX IF NOT EXISTS {m}idx_daily_quotes_code
+                ON daily_quotes(code);
+            CREATE INDEX IF NOT EXISTS {m}idx_daily_quotes_date
+                ON daily_quotes(date);
+            """
+        )
+        # Trading state → always the main (account) DB.
+        self.conn.executescript(
+            """
             CREATE TABLE IF NOT EXISTS portfolio_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 cash REAL NOT NULL,
@@ -258,25 +298,6 @@ class Database:
                 details_json TEXT DEFAULT '{}'
             );
 
-            -- News/sentiment overlay cache. One row per (code, as_of trading
-            -- date) so we never re-fetch news or re-score with the LLM more
-            -- than once per stock per day. `score` is the LLM's sentiment in
-            -- [-1, 1]; `n_news` records how many headlines fed the score.
-            CREATE TABLE IF NOT EXISTS news_sentiment (
-                code TEXT NOT NULL,
-                as_of TEXT NOT NULL,
-                score REAL NOT NULL,
-                reason TEXT DEFAULT '',
-                n_news INTEGER DEFAULT 0,
-                model TEXT DEFAULT '',
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (code, as_of)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_daily_quotes_code
-                ON daily_quotes(code);
-            CREATE INDEX IF NOT EXISTS idx_daily_quotes_date
-                ON daily_quotes(date);
             CREATE INDEX IF NOT EXISTS idx_trades_date
                 ON trades(trade_date);
             CREATE INDEX IF NOT EXISTS idx_orders_created

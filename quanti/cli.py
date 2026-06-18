@@ -4,19 +4,29 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def _open_db():
+    """Open the account DB (trading state) with the shared market DB attached.
+    Account = QUANTI_ACCOUNT env (default 'paper') so the CLI shares market
+    data with the server and keeps each account's trades in its own file."""
+    from quanti.data.database import Database
+    account = os.environ.get("QUANTI_ACCOUNT", "paper")
+    db = Database(f"data/{account}.db", market_db_path="data/market.db")
+    db.initialize()
+    return db
+
+
 def cmd_sync(args):
     """Sync market data."""
     from quanti.data.akshare_adapter import AkShareAdapter
-    from quanti.data.database import Database
 
-    db = Database()
-    db.initialize()
+    db = _open_db()
     adapter = AkShareAdapter(db)
 
     if args.calendar:
@@ -47,12 +57,10 @@ def cmd_backtest(args):
     from datetime import date
 
     from quanti.backtest.engine import BacktestEngine
-    from quanti.data.database import Database
     from quanti.data.provider import DataProvider
     from quanti.strategy.loader import StrategyLoader
 
-    db = Database()
-    db.initialize()
+    db = _open_db()
     provider = DataProvider(db)
 
     loader = StrategyLoader()
@@ -107,10 +115,8 @@ def cmd_up(args):
     from quanti.agent.goal import RiskTolerance, load_goal, save_goal
     from quanti.api.app import create_app
     from quanti.data.akshare_adapter import AkShareAdapter
-    from quanti.data.database import Database
 
-    db = Database()
-    db.initialize()
+    db = _open_db()
 
     # First-run: populate stock list so the universe isn't empty. Run in a
     # background thread so the API is reachable immediately while the list
@@ -120,9 +126,7 @@ def cmd_up(args):
 
         def _bootstrap_stocks() -> None:
             try:
-                from quanti.data.database import Database as _DB
-                local_db = _DB()
-                local_db.initialize()
+                local_db = _open_db()  # own connection for the thread
                 adapter = AkShareAdapter(local_db)
                 count = adapter.sync_stock_list()
                 logger.info(f"后台股票列表同步完成：{count} 只")
@@ -166,12 +170,10 @@ def cmd_agent(args):
     """Inspect or trigger the agent without a server."""
     from quanti.agent.goal import RiskTolerance, load_goal, save_goal
     from quanti.agent.runtime import AgentRuntime
-    from quanti.data.database import Database
     from quanti.data.provider import DataProvider
     from quanti.execution.paper_broker import PaperBroker
 
-    db = Database()
-    db.initialize()
+    db = _open_db()
     provider = DataProvider(db)
     broker = PaperBroker(db, provider, initial_cash=args.cash)
     agent = AgentRuntime(db, provider, broker)

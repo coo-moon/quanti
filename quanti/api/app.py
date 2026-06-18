@@ -31,7 +31,13 @@ def create_app(
     autostart_background_sync: bool = True,
 ) -> FastAPI:
     if db is None:
-        db = Database()
+        # Paper account by default; trading state in data/paper.db, market
+        # data shared in data/market.db. The live account (data/live.db,
+        # same market DB) is wired when QmtBroker lands — real money never
+        # shares a file with paper.
+        import os
+        account = os.environ.get("QUANTI_ACCOUNT", "paper")
+        db = Database(f"data/{account}.db", market_db_path="data/market.db")
         db.initialize()
     provider = provider or DataProvider(db)
     # Production fill mode is "pending" — signals queue and fill at the
