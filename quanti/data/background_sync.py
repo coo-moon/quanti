@@ -274,7 +274,10 @@ class BackgroundQuoteSyncer:
                 with self._lock:
                     self._state = "active"
 
-            # Active path: drain a batch.
+            # Active path: pending-order codes jump to the front of the queue
+            # every batch, so an order queued mid-cycle is synced next instead
+            # of waiting for the queue to drain and the next full rescan.
+            self._prioritize_pending()
             self._process_batch()
             self._sleep_responsive(self._cfg.batch_idle_sec)
 
@@ -382,6 +385,33 @@ class BackgroundQuoteSyncer:
         except Exception as e:
             logger.exception(f"bg-sync scan failed: {e}")
             self._last_error = f"scan: {e}"
+
+    def _prioritize_pending(self) -> None:
+        """Move pending-order codes to the FRONT of the live queue so a
+        freshly-queued order is synced next, not after the (possibly huge)
+        stale backlog drains. Backed-off codes are skipped — consistent with
+        the scan — which also bounds re-syncing: once a pending code syncs
+        with no new bar it flat-backs-off and drops out until it's due again.
+        Never raises into the loop."""
+        try:
+            pend = self._db.list_orders(limit=1000, status="pending") or []
+        except Exception as e:
+            logger.debug("bg-sync: prioritize_pending list_orders failed: %s", e)
+            return
+        now_ts = time.time()
+        codes: list[str] = []
+        seen: set[str] = set()
+        for o in pend:
+            c = o.get("code")
+            if c and c not in seen and self._backoff_until.get(c, 0) <= now_ts:
+                codes.append(c)
+                seen.add(c)
+        if not codes:
+            return
+        with self._lock:
+            front = set(codes)
+            rest = [c for c in self._queue if c not in front]
+            self._queue = deque(codes + rest)
 
     def _fetch_latest_quote_dates(self, codes: list[str]) -> dict[str, date]:
         """Return {code: max(date)} for codes that have any bars.
