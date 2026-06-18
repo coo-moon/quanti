@@ -62,6 +62,24 @@ class TestHealthEndpoint:
         assert response.json()["status"] == "ok"
 
 
+class TestMetaEndpoint:
+    @pytest.mark.asyncio
+    async def test_meta_defaults_paper(self, client):
+        r = await client.get("/api/meta")
+        assert r.status_code == 200
+        assert r.json() == {"account": "paper", "is_live": False}
+
+    @pytest.mark.asyncio
+    async def test_meta_reflects_live_account(self, db, monkeypatch):
+        monkeypatch.setenv("QUANTI_ACCOUNT", "live")
+        app = create_app(db=db, provider=DataProvider(db),
+                         strategies_dir="strategies")
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://test") as c:
+            body = (await c.get("/api/meta")).json()
+        assert body == {"account": "live", "is_live": True}
+
+
 class TestStockEndpoints:
     @pytest.mark.asyncio
     async def test_list_stocks(self, client):

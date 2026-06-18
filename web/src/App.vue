@@ -46,6 +46,10 @@
             股票池
           </router-link>
         </div>
+        <span class="account-badge" :class="isLive ? 'acct-live' : 'acct-paper'"
+              :title="isLive ? '实盘 — 真实资金,下单会真实成交' : '模拟盘 — 不涉及真实资金'">
+          {{ isLive ? "● 实盘" : "模拟盘" }}
+        </span>
       </div>
     </nav>
     <main>
@@ -53,6 +57,22 @@
     </main>
   </div>
 </template>
+
+<script setup lang="ts">
+import { onMounted, ref } from "vue";
+import { fetchMeta } from "./api/client";
+
+// Paper vs live, surfaced as an always-visible nav badge so real money is
+// never mistaken for the simulator. Defaults to paper if /meta is unreachable.
+const isLive = ref(false);
+onMounted(async () => {
+  try {
+    isLive.value = (await fetchMeta()).data.is_live;
+  } catch {
+    isLive.value = false;
+  }
+});
+</script>
 
 <style>
 @import "./assets/base.css";
@@ -113,6 +133,26 @@
 .nav-links {
   display: flex;
   gap: 4px;
+}
+
+/* Paper/live indicator — pushed to the far right of the nav. Live is loud
+   (red, filled) so real money can never be mistaken for the simulator. */
+.account-badge {
+  margin-left: auto;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.acct-paper {
+  color: var(--color-text-secondary);
+  background: rgba(0, 0, 0, 0.06);
+}
+.acct-live {
+  color: #fff;
+  background: #e02424;
+  box-shadow: 0 0 0 3px rgba(224, 36, 36, 0.18);
 }
 
 .nav-link {

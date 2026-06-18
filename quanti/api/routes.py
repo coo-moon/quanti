@@ -207,6 +207,13 @@ async def health():
     return {"status": "ok"}
 
 
+@router.get("/meta")
+async def meta(request: Request):
+    """Which account this server serves — drives the UI's 模拟盘/实盘 badge."""
+    account = getattr(request.app.state, "account", "paper")
+    return {"account": account, "is_live": account == "live"}
+
+
 @router.get("/sync/background/status")
 async def background_sync_status(request: Request):
     """Read the live status of the BackgroundQuoteSyncer daemon.

@@ -49,11 +49,12 @@ SERVER_VERSION = "0.2.0"
 class QuantiContext:
     """Bundle of long-lived objects the MCP tools work against."""
 
-    def __init__(self, db_path: str = "data/quanti.db",
+    def __init__(self, db_path: str = "data/paper.db",
                  strategies_dir: str = "strategies",
                  screeners_dir: str = "screeners",
-                 initial_cash: float = 1_000_000.0) -> None:
-        self.db = Database(db_path)
+                 initial_cash: float = 1_000_000.0,
+                 market_db_path: str = "data/market.db") -> None:
+        self.db = Database(db_path, market_db_path=market_db_path)
         self.db.initialize()
         self.provider = DataProvider(self.db)
         self.strategies_dir = strategies_dir

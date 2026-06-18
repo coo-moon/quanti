@@ -30,8 +30,15 @@ def create_app(
     autostart_agent: bool = False,
     autostart_background_sync: bool = True,
 ) -> FastAPI:
+    # Which account this process serves (paper / live). Determines the
+    # trading DB AND drives the UI's 模拟盘/实盘 badge so real money is never
+    # mistaken for paper. Default 'paper'.
+    import os
+    account = os.environ.get("QUANTI_ACCOUNT", "paper")
     if db is None:
-        db = Database()
+        # Trading state in data/{account}.db, market data shared in
+        # data/market.db. Real money never shares a file with paper.
+        db = Database(f"data/{account}.db", market_db_path="data/market.db")
         db.initialize()
     provider = provider or DataProvider(db)
     # Production fill mode is "pending" — signals queue and fill at the
@@ -88,6 +95,7 @@ def create_app(
     )
 
     app.state.db = db
+    app.state.account = account
     app.state.provider = provider
     app.state.strategies_dir = strategies_dir
     app.state.screeners_dir = screeners_dir
