@@ -173,6 +173,43 @@ class TestQueueBuilding:
         # AAA (held) still queued, just after pending.
         assert "AAA" in queued
 
+    def test_prioritize_pending_jumps_live_queue(self, db_with_stocks):
+        """A pending order placed mid-cycle (queue already full of stale codes)
+        jumps to the FRONT on the next batch — without waiting for a rescan."""
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks,
+            adapter_factory=lambda: StubAdapter(db_with_stocks),
+            config=BackgroundSyncConfig())
+        # Simulate a live queue mid-drain (stale codes already loaded).
+        syncer._queue.extend(["AAA", "BBB", "CCC"])
+        # A pending order arrives now.
+        db_with_stocks.insert_order({
+            "order_id": "o_live", "code": "CCC", "direction": "buy",
+            "quantity": 0, "price_type": "market", "status": "pending",
+            "strategy_name": "test", "reason": "t",
+        })
+        syncer._prioritize_pending()
+        q = list(syncer._queue)
+        assert q[0] == "CCC", f"pending code must jump to front, got {q}"
+        # No duplication, the rest preserved.
+        assert q.count("CCC") == 1 and set(q) == {"AAA", "BBB", "CCC"}
+
+    def test_prioritize_pending_skips_backed_off(self, db_with_stocks):
+        """A pending code in backoff is NOT re-injected (bounds re-sync)."""
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks,
+            adapter_factory=lambda: StubAdapter(db_with_stocks),
+            config=BackgroundSyncConfig())
+        syncer._queue.extend(["AAA", "BBB"])
+        db_with_stocks.insert_order({
+            "order_id": "o_bo", "code": "CCC", "direction": "buy",
+            "quantity": 0, "price_type": "market", "status": "pending",
+            "strategy_name": "test", "reason": "t",
+        })
+        syncer._backoff_until["CCC"] = time.time() + 3600
+        syncer._prioritize_pending()
+        assert "CCC" not in list(syncer._queue)
+
     def test_pending_code_respects_backoff(self, db_with_stocks):
         """Even a pending-order code is skipped while in backoff (e.g. its
         feed had nothing new) — no per-loop spam."""
