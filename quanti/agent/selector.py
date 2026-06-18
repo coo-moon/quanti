@@ -33,6 +33,7 @@ from quanti.agent.walk_forward import run_walk_forward
 from quanti.backtest.engine import BacktestEngine
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
+from quanti.risk.manager import RiskConfig, RiskManager
 from quanti.strategy.base import BaseStrategy
 from quanti.strategy.loader import StrategyLoader
 
@@ -111,8 +112,13 @@ class StrategySelector:
         end = date.today()
         # In-sample window still computed for tie-break and as a fallback.
         is_start = end - timedelta(days=self._training_days)
+        # Score strategies under the SAME exit policy they'll trade live
+        # (stop-loss + trailing take-profit + position caps). Without this the
+        # Selector ranked raw strategy alpha while the live agent trades with
+        # exits — a backtest/live mismatch that can mis-rank strategies.
         engine = BacktestEngine(provider=self._provider,
-                                initial_cash=self._initial_cash)
+                                initial_cash=self._initial_cash,
+                                risk_manager=RiskManager(RiskConfig()))
 
         results: list[StrategyEvaluation] = []
         # Cap universe so each Selector cycle stays bounded. Default raised

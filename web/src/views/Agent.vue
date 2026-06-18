@@ -325,6 +325,38 @@
       </div>
     </div>
 
+    <!-- Recent exits -->
+    <div class="card" v-if="recentExits.length > 0">
+      <div class="card-header">
+        <h2>最近离场</h2>
+        <div class="muted">止损 / 移动止盈 / 策略离场 触发的卖出</div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+        <thead>
+          <tr>
+            <th>代码</th>
+            <th>类型</th>
+            <th>状态</th>
+            <th>成交价</th>
+            <th>时间</th>
+            <th>原因</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="o in recentExits" :key="o.order_id">
+            <td>{{ o.code }}</td>
+            <td><span :class="exitTag(o)">{{ exitLabel(o) }}</span></td>
+            <td>{{ o.status === "filled" ? "已成交" : (o.status === "pending" ? "待成交" : o.status) }}</td>
+            <td>{{ o.filled_price ? o.filled_price.toFixed(2) : "—" }}</td>
+            <td class="nowrap">{{ formatDateTime(o.filled_at || o.created_at) }}</td>
+            <td class="reason-cell" :title="o.reason">{{ o.reason || "—" }}</td>
+          </tr>
+        </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- Manual order -->
     <div class="card">
       <div class="card-header"><h2>手动下单</h2></div>
@@ -411,6 +443,7 @@ import {
   fetchAgentDecisions,
   fetchAgentStatus,
   fetchGoal,
+  fetchOrders,
   fetchPendingOrders,
   fetchPortfolio,
   fetchScreeners,
@@ -421,6 +454,7 @@ import {
   type AgentStatus,
   type DecisionRecord,
   type Goal,
+  type OrderRecord,
   type PendingOrderDetail,
   type Portfolio,
   type ScreenerInfo,
@@ -527,6 +561,26 @@ const decisions = ref<DecisionRecord[]>([]);
 const strategies = ref<StrategyInfo[]>([]);
 const screeners = ref<ScreenerInfo[]>([]);
 const pendingOrders = ref<PendingOrderDetail[]>([]);
+const orders = ref<OrderRecord[]>([]);
+
+// Exits = sells. risk_exit is the stop-loss/take-profit/strategy-exit path;
+// other sells (manual, etc.) still count as an exit worth showing.
+const recentExits = computed(() =>
+  orders.value.filter((o) => o.direction === "sell").slice(0, 12));
+
+function exitLabel(o: OrderRecord): string {
+  const r = o.reason || "";
+  if (r.includes("止损")) return "止损";
+  if (r.includes("移动止盈") || r.includes("止盈")) return "止盈";
+  if (r.includes("策略离场") || o.strategy_name !== "risk_exit") return o.strategy_name === "risk_exit" ? "策略离场" : "卖出";
+  return "离场";
+}
+function exitTag(o: OrderRecord): string {
+  const label = exitLabel(o);
+  if (label === "止损") return "tag tag-wait";   // amber
+  if (label === "止盈") return "tag tag-ready";  // green
+  return "tag";
+}
 
 const saving = ref(false);
 const ticking = ref(false);
@@ -680,7 +734,7 @@ function kindClass(kind: string) {
 }
 
 async function loadAll() {
-  const [g, p, a, d, str, scr, pend] = await Promise.all([
+  const [g, p, a, d, str, scr, pend, ord] = await Promise.all([
     fetchGoal(),
     fetchPortfolio(),
     fetchAgentStatus(),
@@ -688,6 +742,7 @@ async function loadAll() {
     fetchStrategies(),
     fetchScreeners(),
     fetchPendingOrders(),
+    fetchOrders(200),
   ]);
   Object.assign(goalDraft, g.data);
   syncAdvFromParams();
@@ -697,6 +752,7 @@ async function loadAll() {
   strategies.value = str.data;
   screeners.value = scr.data;
   pendingOrders.value = pend.data;
+  orders.value = ord.data;
 }
 
 async function loadDecisions() {

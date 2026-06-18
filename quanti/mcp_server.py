@@ -370,8 +370,11 @@ def _handle_tool_call(ctx: QuantiContext, name: str, args: dict[str, Any]) -> An
         end = date.fromisoformat(args["end"]) if args.get("end") else date.today()
         start = (date.fromisoformat(args["start"])
                  if args.get("start") else end - timedelta(days=365))
-        engine = BacktestEngine(provider=ctx.provider,
-                                initial_cash=float(args.get("initial_cash", 1_000_000)))
+        from quanti.risk.manager import RiskConfig, RiskManager
+        engine = BacktestEngine(
+            provider=ctx.provider,
+            initial_cash=float(args.get("initial_cash", 1_000_000)),
+            risk_manager=RiskManager(RiskConfig()))
         bt = engine.run(strat, args["codes"], start, end)
         return {
             "metrics": bt.metrics,

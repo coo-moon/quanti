@@ -127,6 +127,7 @@
                 <th>数量</th>
                 <th>价格</th>
                 <th>手续费</th>
+                <th>离场原因</th>
               </tr>
             </thead>
             <tbody>
@@ -141,6 +142,9 @@
                 <td class="td-mono">{{ trade.quantity.toLocaleString() }}</td>
                 <td class="td-mono">{{ trade.price.toFixed(2) }}</td>
                 <td class="td-mono td-muted">{{ trade.commission.toFixed(2) }}</td>
+                <td class="td-muted exit-reason" :title="trade.reason || ''">
+                  {{ trade.direction === "sell" ? (trade.reason || "—") : "" }}
+                </td>
               </tr>
             </tbody>
           </table>
