@@ -83,3 +83,38 @@ class Broker(Protocol):
     def pending_orders_detail(self) -> list[dict]:
         """Pending orders enriched with their fill timeline (for the UI)."""
         ...
+
+    # ------------------------------------------------------------ health
+    def is_connected(self) -> bool:
+        """Whether the broker can currently submit/query orders.
+
+        PaperBroker is always connected (no external venue). A live broker
+        (QmtBroker) returns False when the qmt-bridge / QMT client / trading
+        account is unreachable — the runtime should refuse to trade rather
+        than silently queue orders that will never reach the venue.
+        """
+        ...
+
+    # -------------------------------------------------------- order control
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a single still-open order. Returns True if it was cancelled
+        (or already terminal in a way that needs no action). For paper this
+        flips a PENDING order to CANCELLED; for live it sends a venue cancel
+        and reconciles on the callback."""
+        ...
+
+    def cancel_all_pending(self) -> int:
+        """Cancel every still-open order. Returns the count cancelled.
+
+        First half of the kill switch — stop anything from filling. Safe to
+        call repeatedly (idempotent: already-terminal orders are skipped)."""
+        ...
+
+    def flatten(self, reason: str = "kill-switch") -> int:
+        """Submit exit (SELL) orders for all current holdings. Returns the
+        number of positions acted on.
+
+        Second half of the kill switch — get out of the market. Goes through
+        the normal submit path so RiskManager and venue rules still apply;
+        T+1 unsellable lots are simply skipped by the broker."""
+        ...

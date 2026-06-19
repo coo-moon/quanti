@@ -401,6 +401,64 @@ class PaperBroker:
             })
         return out
 
+    # ----------------------------------------------------------- health
+    def is_connected(self) -> bool:
+        """Paper broker has no external venue — always 'connected'.
+
+        Exists so the runtime can gate on `broker.is_connected()` uniformly;
+        QmtBroker overrides this with a real bridge/QMT health check."""
+        return True
+
+    # ------------------------------------------------------- order control
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a single still-pending order. Returns False if the order
+        isn't pending (already filled / cancelled / unknown)."""
+        pending = {o["order_id"]
+                   for o in self._db.list_orders(limit=1000, status="pending")}
+        if order_id not in pending:
+            return False
+        self._db.update_order_status(order_id, "cancelled",
+                                     reason="cancelled by user")
+        self._db.log_decision(
+            "order_cancelled", f"撤单 {order_id}",
+            details={"order_id": order_id})
+        return True
+
+    def cancel_all_pending(self) -> int:
+        """Kill switch, step 1: cancel every pending order. Returns count.
+
+        Idempotent — a second call finds nothing pending and returns 0."""
+        pending = self._db.list_orders(limit=1000, status="pending")
+        for o in pending:
+            self._db.update_order_status(o["order_id"], "cancelled",
+                                         reason="kill-switch: cancel all")
+        if pending:
+            self._db.log_decision(
+                "kill_switch", f"急停：撤销 {len(pending)} 笔挂单",
+                details={"cancelled": len(pending)})
+        return len(pending)
+
+    def flatten(self, reason: str = "kill-switch") -> int:
+        """Kill switch, step 2: submit SELL orders for all holdings.
+
+        Routed through `execute_signals`, so RiskManager and T+1 still apply
+        (a lot bought today won't sell and is skipped). Returns the number of
+        positions an exit was submitted for (filled in immediate mode, queued
+        in pending mode)."""
+        positions = [p for p in self._db.list_positions() if p["quantity"] > 0]
+        if not positions:
+            return 0
+        sells = [Signal(stock_code=p["code"], direction=Direction.SELL,
+                        strength=1.0, reason=reason) for p in positions]
+        result = self.execute_signals(sells, strategy_name="kill_switch")
+        acted = result.filled + result.pending
+        self._db.log_decision(
+            "kill_switch",
+            f"急停：清仓 {acted}/{len(sells)} 个持仓 ({reason})",
+            details={"positions": len(sells), "acted": acted,
+                     "filled": result.filled, "pending": result.pending})
+        return acted
+
     def _fill_pending(self, signal: Signal, ref_price: float,
                       bar_date: date, order_row: dict) -> bool:
         """Fill an existing pending order row at the given price.
