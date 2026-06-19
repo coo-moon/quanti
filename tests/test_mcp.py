@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -10,6 +11,10 @@ import pytest
 
 from quanti.data.database import Database
 from quanti.mcp_server import QuantiContext, _handle_tool_call, _tool_specs
+
+# Repo root, so strategy/screener dirs resolve on any machine (the fixture
+# chdir's into tmp_path, so a bare relative "strategies" would miss them).
+_REPO = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
@@ -33,8 +38,8 @@ def ctx(tmp_path, monkeypatch):
     db.save_daily_quotes(df)
     db.close()
     return QuantiContext(db_path=db_path,
-                         strategies_dir="/Users/coo/source/quanti/strategies",
-                         screeners_dir="/Users/coo/source/quanti/screeners")
+                         strategies_dir=str(_REPO / "strategies"),
+                         screeners_dir=str(_REPO / "screeners"))
 
 
 def test_tool_specs_contain_essentials():
