@@ -68,6 +68,8 @@ class PaperBroker:
         strategies_dir: str = "strategies",
     ) -> None:
         """Args:
+            protection_config: ProtectionManager thresholds; None → default
+                ProtectionConfig() (enabled, fail-open with no history).
             sizer: Optional position sizer.
             fill_mode: "pending" (default) — signals are queued and filled
                 at the OPEN of the next trading bar via `try_fill_pending_orders`.
@@ -97,7 +99,8 @@ class PaperBroker:
         # Idempotent — only writes if no row exists.
         self._db.ensure_portfolio(initial_cash)
 
-    def _entry_allowed(self, signal, portfolio):
+    def _entry_allowed(self, signal: Signal,
+                       portfolio) -> tuple[bool, str, str]:
         """Risk caps + protections gate for an entry, via the shared helper.
         Returns (ok, reason, reject_kind). Protections only gate BUY."""
         from quanti.risk.protection_context import evaluate_entry
