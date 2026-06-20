@@ -102,6 +102,15 @@ class RiskManager:
             ind_room = float("inf")
         return max(0.0, min(stock_room, ind_room, total_room))
 
+    def check_portfolio_stop(self, total_value: float, peak_value: float) -> bool:
+        """True when equity has drawn down from its high-water mark past
+        `portfolio_stop_loss_pct` (e.g. -15%). Portfolio-level circuit breaker
+        — the caller flattens everything and halts the agent."""
+        if peak_value <= 0:
+            return False
+        return ((total_value - peak_value) / peak_value
+                <= self.config.portfolio_stop_loss_pct)
+
     def check_stop_loss(self, portfolio: Portfolio) -> list[Signal]:
         """Check positions against stop-loss rules. Returns sell signals for positions to close."""
         signals = []

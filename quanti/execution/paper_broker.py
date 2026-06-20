@@ -459,6 +459,27 @@ class PaperBroker:
                      "filled": result.filled, "pending": result.pending})
         return acted
 
+    def enforce_portfolio_stop(self) -> bool:
+        """Portfolio drawdown circuit breaker: if equity is down past
+        `portfolio_stop_loss_pct` from its high-water mark, cancel pending +
+        flatten everything. Returns True iff it fired (caller halts the agent)."""
+        snap = self.snapshot_portfolio()  # also persists today's snapshot
+        total = snap["total_value"]
+        peak = max(self._db.get_peak_total_value(), total)
+        if not self._risk.check_portfolio_stop(total, peak):
+            return False
+        self.cancel_all_pending()
+        self.flatten("组合回撤熔断")
+        dd = (total - peak) / peak if peak else 0.0
+        self._db.log_decision(
+            "portfolio_stop",
+            f"组合回撤熔断：净值 {total:,.0f} 自峰值 {peak:,.0f} 回撤 {dd:.1%} "
+            f"≤ {self._risk.config.portfolio_stop_loss_pct:.0%}，已清仓",
+            details={"total_value": total, "peak_value": peak,
+                     "drawdown": dd,
+                     "limit": self._risk.config.portfolio_stop_loss_pct})
+        return True
+
     def _fill_pending(self, signal: Signal, ref_price: float,
                       bar_date: date, order_row: dict) -> bool:
         """Fill an existing pending order row at the given price.

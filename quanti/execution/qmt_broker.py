@@ -126,6 +126,9 @@ class QmtBroker:
                 "pnl": (cur - avg) * vol,
                 "pnl_pct": (cur - avg) / avg if avg else 0.0,
             })
+        # Persist the equity snapshot so the portfolio drawdown high-water mark
+        # accumulates for the circuit breaker (and the UI equity curve).
+        self._db.save_portfolio_snapshot(date.today(), cash, market_value, total)
         return {
             "cash": cash, "initial_cash": self._initial_cash,
             "market_value": market_value, "total_value": total,
@@ -380,6 +383,25 @@ class QmtBroker:
                                   f"急停：清仓 {acted} 个实盘持仓 ({reason})",
                                   details={"venue": "qmt", "acted": acted})
         return acted
+
+    def enforce_portfolio_stop(self) -> bool:
+        """Portfolio drawdown circuit breaker (live): flatten + signal halt when
+        equity is down past portfolio_stop_loss_pct from its high-water mark."""
+        snap = self.snapshot_portfolio()  # persists a snapshot for the peak
+        total = snap["total_value"]
+        peak = max(self._db.get_peak_total_value(), total)
+        if not self._risk.check_portfolio_stop(total, peak):
+            return False
+        self.cancel_all_pending()
+        self.flatten("组合回撤熔断")
+        dd = (total - peak) / peak if peak else 0.0
+        self._db.log_decision(
+            "portfolio_stop",
+            f"组合回撤熔断(实盘)：净值 {total:,.0f} 自峰值 {peak:,.0f} 回撤 {dd:.1%}，已清仓",
+            details={"venue": "qmt", "total_value": total, "peak_value": peak,
+                     "drawdown": dd,
+                     "limit": self._risk.config.portfolio_stop_loss_pct})
+        return True
 
     # ----------------------------------------------------------- internals
     def _mirror_order(self, signal: Signal, strategy_name: str, *,

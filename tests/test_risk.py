@@ -176,6 +176,15 @@ def test_max_additional_buy_value_enforces_all_caps():
     assert rm.max_additional_buy_value(pf_total, "600000", "银行") == 0.0
 
 
+def test_check_portfolio_stop():
+    rm = RiskManager(RiskConfig(portfolio_stop_loss_pct=-0.15))
+    assert rm.check_portfolio_stop(85_000, 100_000) is True    # -15% exactly
+    assert rm.check_portfolio_stop(80_000, 100_000) is True    # -20%
+    assert rm.check_portfolio_stop(86_000, 100_000) is False   # -14% within
+    assert rm.check_portfolio_stop(120_000, 100_000) is False  # new high
+    assert rm.check_portfolio_stop(50_000, 0) is False         # no peak yet
+
+
 def test_daily_cap_auto_resets_on_new_calendar_day(monkeypatch):
     """Live/paper never call reset_daily(); the daily-trade cap must auto-roll
     when the calendar day changes, else it becomes a permanent lifetime lock

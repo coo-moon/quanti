@@ -593,6 +593,22 @@ class AgentRuntime:
             # Broker without pending support (legacy / test stub).
             pending_result = None
 
+        # Portfolio drawdown circuit breaker — if equity has fallen past the
+        # portfolio stop from its high-water mark, flatten everything and halt
+        # the agent. Last line of defense before deeper losses; runs before any
+        # new signal generation.
+        try:
+            if self._broker.enforce_portfolio_stop():
+                summary = "组合回撤熔断：已清仓并暂停 agent"
+                self._db.log_decision("cycle_halt", summary)
+                self.stop()  # disables goal + sets stop flag (no self-join)
+                with self._lock:
+                    self._status.last_tick_at = ts
+                    self._status.last_tick_summary = summary
+                return {"ok": True, "halted": True, "reason": summary}
+        except AttributeError:
+            pass  # broker without circuit-breaker support (test stub)
+
         universe = self._resolve_universe(goal)
         if not universe:
             summary = "宇宙为空:请先 sync stocks 或选择一个非空 pool"

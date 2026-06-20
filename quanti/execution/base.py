@@ -118,3 +118,10 @@ class Broker(Protocol):
         the normal submit path so RiskManager and venue rules still apply;
         T+1 unsellable lots are simply skipped by the broker."""
         ...
+
+    def enforce_portfolio_stop(self) -> bool:
+        """Portfolio-level circuit breaker. If equity has drawn down past the
+        portfolio stop (RiskConfig.portfolio_stop_loss_pct) from its high-water
+        mark, cancel pending + flatten everything and return True — the runtime
+        then halts the agent. Returns False when within tolerance (no-op)."""
+        ...

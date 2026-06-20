@@ -143,3 +143,48 @@ def test_industry_cap_limits_same_industry_buy(tmp_path):
     pos = {p["code"]: p for p in db.list_positions()}
     assert "600000" in pos
     assert pos["600000"]["quantity"] * 10.0 <= 2_000 * 1.05  # industry-capped
+
+
+def _seed_drawdown_env(tmp_path, name, mark_price):
+    db = Database(str(tmp_path / name))
+    db.initialize()
+    db.upsert_stock("000001", "平安银行", "SZ", date(1991, 4, 3), "银行")
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=8)
+    px = np.full(len(dates), mark_price)
+    db.save_daily_quotes(pd.DataFrame({
+        "code": "000001", "date": [d.date() for d in dates],
+        "open": px, "high": px, "low": px, "close": px,
+        "volume": np.full(len(dates), 1e6),
+        "amount": np.full(len(dates), mark_price * 1e6),
+        "turnover": np.ones(len(dates))}))
+    return db
+
+
+def test_portfolio_stop_flattens_on_drawdown(tmp_path):
+    """>15% drawdown from the equity high-water mark trips the circuit breaker:
+    positions are flattened and it returns True (runtime then halts)."""
+    from quanti.risk.manager import RiskConfig
+    db = _seed_drawdown_env(tmp_path, "ps.db", 7.5)  # position marks to 7.5
+    provider = DataProvider(db)
+    broker = PaperBroker(db, provider, initial_cash=100_000, fill_mode="immediate",
+                         risk_config=RiskConfig(portfolio_stop_loss_pct=-0.15))
+    db.save_portfolio_snapshot(date.today(), 100_000.0, 0.0, 100_000.0)  # peak
+    db.update_cash(20_000.0)
+    db.upsert_position("000001", 8000, 10.0, 7.5, date(2020, 1, 1))  # mv 60k
+    # total = 20k + 60k = 80k vs peak 100k → -20% → fire.
+    assert broker.enforce_portfolio_stop() is True
+    assert db.list_positions() == []
+
+
+def test_portfolio_stop_holds_within_tolerance(tmp_path):
+    from quanti.risk.manager import RiskConfig
+    db = _seed_drawdown_env(tmp_path, "ps2.db", 9.8)
+    provider = DataProvider(db)
+    broker = PaperBroker(db, provider, initial_cash=100_000, fill_mode="immediate",
+                         risk_config=RiskConfig(portfolio_stop_loss_pct=-0.15))
+    db.save_portfolio_snapshot(date.today(), 100_000.0, 0.0, 100_000.0)
+    db.update_cash(5_000.0)
+    db.upsert_position("000001", 9000, 10.0, 9.8, date(2020, 1, 1))  # mv 88.2k
+    # total = 5k + 88.2k = 93.2k vs peak 100k → -6.8% → hold.
+    assert broker.enforce_portfolio_stop() is False
+    assert len(db.list_positions()) == 1
