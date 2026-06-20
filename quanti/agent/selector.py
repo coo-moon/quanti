@@ -219,9 +219,11 @@ class StrategySelector:
             # All non-positive: fall back to score rank.
             weights = [1.0 / len(top)] * len(top)
         else:
-            # Soft-temperature weighting so the top doesn't get 100%.
+            # Soft-temperature weighting. temp=1.0 (was 0.5) flattens the
+            # allocation so a noisy Sharpe edge — estimated from short OOS
+            # windows — doesn't concentrate most of the capital into one pick.
             import math
-            temp = 0.5
+            temp = 1.0
             exps = [math.exp(s / temp) for s in sharpes]
             ze = sum(exps)
             weights = [e / ze for e in exps]
