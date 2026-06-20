@@ -14,6 +14,46 @@ from quanti.models import StockInfo
 import threading
 
 
+class _Result:
+    """Materialized result of one ``execute()``.
+
+    The rows are fetched while the connection lock is still held, so a query is
+    atomic end-to-end. Returning a live sqlite cursor and letting the caller
+    ``.fetchone()/.fetchall()`` *after* the lock was released let a concurrent
+    ``execute`` on the shared connection corrupt the read (torn rows with NULL
+    columns) — see :class:`_LockedConnection`.
+    """
+
+    def __init__(self, rows, rowcount, lastrowid, description) -> None:
+        self._rows = list(rows)
+        self._i = 0
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+        self.description = description
+
+    def fetchone(self):
+        if self._i < len(self._rows):
+            row = self._rows[self._i]
+            self._i += 1
+            return row
+        return None
+
+    def fetchall(self):
+        out = self._rows[self._i:]
+        self._i = len(self._rows)
+        return out
+
+    def fetchmany(self, size: int = 1):
+        out = self._rows[self._i:self._i + size]
+        self._i += len(out)
+        return out
+
+    def __iter__(self):
+        start = self._i
+        self._i = len(self._rows)
+        return iter(self._rows[start:])
+
+
 class _LockedConnection:
     """sqlite3.Connection wrapper that serializes all execute/commit/etc
     operations behind a shared lock.
@@ -39,8 +79,16 @@ class _LockedConnection:
         self._lock = lock
 
     def execute(self, *args, **kwargs):
+        # Materialize the result UNDER the lock. The connection is shared across
+        # threads (AgentRuntime loop + web requests + BackgroundQuoteSyncer);
+        # returning a live cursor and letting the caller fetch *outside* the
+        # lock lets a concurrent execute on the same connection corrupt the read
+        # (e.g. a torn row surfacing NULLs). Fetching here keeps each query
+        # atomic. See _Result.
         with self._lock:
-            return self._conn.execute(*args, **kwargs)
+            cur = self._conn.execute(*args, **kwargs)
+            rows = cur.fetchall() if cur.description is not None else []
+            return _Result(rows, cur.rowcount, cur.lastrowid, cur.description)
 
     def executescript(self, *args, **kwargs):
         with self._lock:
