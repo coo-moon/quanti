@@ -120,7 +120,7 @@ class ProtectionManager:
             for _wd, wv in window:
                 if peak is None or wv > peak:
                     peak = wv
-                if peak and peak > 0:
+                if peak > 0:  # guards a degenerate zero-valued equity point
                     dd = (wv - peak) / peak
                     if dd < mdd:
                         mdd = dd

@@ -111,6 +111,13 @@ def test_max_drawdown_unlocks_after_k_days():
     assert mgr.check_entry(_ctx(_d(5), equity=eq))[0] is True   # K+1
 
 
+def test_max_drawdown_disabled():
+    cfg = ProtectionConfig(max_drawdown_enabled=False)
+    mgr = ProtectionManager(cfg)
+    eq = _equity([(0, 100), (1, 96), (2, 92), (3, 90), (4, 88)])  # -12%
+    assert mgr.check_entry(_ctx(_d(4), equity=eq))[0] is True
+
+
 # ---- Aggregation ------------------------------------------------------
 
 def test_check_entry_first_lock_wins_and_disabled_passes():
@@ -118,3 +125,10 @@ def test_check_entry_first_lock_wins_and_disabled_passes():
     eq = _equity([(0, 100), (1, 96), (2, 92), (3, 90), (4, 88)])
     assert mgr.check_entry(_ctx(_d(4), sl_dates=[_d(2), _d(3), _d(4)],
                                 equity=eq)) == (True, "")
+
+
+def test_check_entry_code_param_ignored():
+    mgr = ProtectionManager(ProtectionConfig())
+    ctx = _ctx(_d(3), sl_dates=[_d(1), _d(2), _d(3)])  # StoplossGuard locks
+    assert mgr.check_entry(ctx, code="000001") == mgr.check_entry(ctx)
+    assert mgr.check_entry(ctx, code="000001")[0] is False
