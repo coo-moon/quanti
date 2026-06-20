@@ -5,6 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# Below this many bars, annualizing extrapolates too aggressively (e.g. a
+# ~2-week window has exponent 252/14 ≈ 18, turning +20% into 900%+). Such
+# figures dominated walk-forward strategy selection. For short windows we
+# report the un-extrapolated cumulative return as `annual_return` instead.
+_MIN_DAYS_TO_ANNUALIZE = 60
+
 
 def compute_metrics(
     equity_curve: pd.Series,
@@ -16,7 +22,10 @@ def compute_metrics(
 
     total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0]) - 1
     n_days = len(equity_curve)
-    annual_return = (1 + total_return) ** (trading_days / max(n_days, 1)) - 1
+    if n_days >= _MIN_DAYS_TO_ANNUALIZE:
+        annual_return = (1 + total_return) ** (trading_days / n_days) - 1
+    else:
+        annual_return = total_return  # don't extrapolate a tiny window
 
     # Volatility
     annual_vol = returns.std() * np.sqrt(trading_days) if len(returns) > 1 else 0.0
