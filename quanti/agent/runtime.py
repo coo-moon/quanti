@@ -47,6 +47,30 @@ from quanti.strategy.loader import StrategyLoader
 logger = logging.getLogger(__name__)
 
 
+def _parse_hhmm(value) -> tuple[int, int] | None:
+    """Parse a 'HH:MM' 24-hour string → (hour, minute), or None if absent or
+    malformed. Used for the optional daily-run schedule."""
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        h, m = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    return (h, m) if 0 <= h <= 23 and 0 <= m <= 59 else None
+
+
+def _seconds_until_daily(now: datetime, hour: int, minute: int) -> float:
+    """Seconds from `now` until the next occurrence of hour:minute — today if
+    it's still ahead, otherwise tomorrow."""
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
 @dataclass
 class AgentStatus:
     enabled: bool = False
@@ -169,12 +193,32 @@ class AgentRuntime:
 
     # ------------------------------------------------------------ internal
     def _loop(self) -> None:
-        # Run immediately so the user gets feedback without waiting.
-        self._safe_cycle()
-        while not self._stop_flag.is_set():
-            if self._stop_flag.wait(self._tick_interval):
-                break
+        # Interval mode: run immediately so the user gets feedback. Daily-
+        # schedule mode (goal.params["daily_run_time"]="HH:MM", e.g. "17:30"):
+        # wait for the scheduled time instead of firing on start.
+        if self._daily_run_time() is None:
             self._safe_cycle()
+        while not self._stop_flag.is_set():
+            if self._stop_flag.wait(self._next_wait_seconds()):
+                break
+            if not self._stop_flag.is_set():
+                self._safe_cycle()
+
+    def _next_wait_seconds(self) -> float:
+        """Seconds to wait before the next cycle: until a fixed daily clock time
+        when goal.params['daily_run_time']='HH:MM' is set, else the tick
+        interval. Re-read each iteration so the schedule can change live."""
+        t = self._daily_run_time()
+        if t is None:
+            return self._tick_interval
+        return _seconds_until_daily(datetime.now(), t[0], t[1])
+
+    def _daily_run_time(self) -> tuple[int, int] | None:
+        try:
+            raw = (load_goal(self._db).params or {}).get("daily_run_time")
+        except Exception:  # noqa: BLE001 - schedule lookup must never crash loop
+            return None
+        return _parse_hhmm(raw)
 
     def _safe_cycle(self) -> None:
         """Run one cycle and swallow ALL errors — including ones thrown by the
