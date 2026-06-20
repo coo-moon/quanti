@@ -216,3 +216,33 @@ def test_cancel_all_pending_cancels_open_order(env):
 def test_check_exits_runs_clean(env):
     db, provider = env
     assert _make(db, provider).check_exits() == 0
+
+
+def test_qmt_protection_blocks_buy(tmp_path):
+    from datetime import datetime, timedelta
+
+    from quanti.risk.protections import ProtectionConfig
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    provider = DataProvider(db)
+    today = date.today()
+    iso = lambda d: datetime(d.year, d.month, d.day, 15, 0).isoformat()  # noqa: E731
+    for i, c in enumerate(["000001", "000002", "000003"]):
+        d = today - timedelta(days=i + 1)
+        db.insert_order({
+            "order_id": f"o{i}", "code": c, "direction": "sell",
+            "quantity": 100, "price_type": "market", "limit_price": 0.0,
+            "status": "filled", "strategy_name": "risk_exit",
+            "filled_price": 9.0, "filled_quantity": 100,
+            "reason": "止损 -10% ≤ -8%", "created_at": iso(d),
+            "filled_at": iso(d), "entry_strategy": "",
+        })
+    broker = QmtBroker(db, provider, client=InProcBridge(),
+                       protection_config=ProtectionConfig(
+                           sg_lookback_days=10, sg_trade_limit=3,
+                           sg_lock_days=10, max_drawdown_enabled=False))
+    ok, reason, kind = broker._entry_allowed(
+        Signal("600519", Direction.BUY, 1.0, "buy"),
+        broker._reconciled_portfolio()[0])
+    assert ok is False and kind == "protection_block"

@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import date, datetime
+from typing import TYPE_CHECKING
 
 from quanti.bridge_client import BridgeClient, DEFAULT_BRIDGE_URL, HttpBridgeClient
 from quanti.data.database import Database
@@ -36,6 +37,9 @@ from quanti.data.provider import DataProvider
 from quanti.execution.base import BrokerResult, PendingFillResult
 from quanti.models import Direction, Portfolio, Position, PriceType, Signal
 from quanti.risk.manager import RiskConfig, RiskManager
+
+if TYPE_CHECKING:
+    from quanti.risk.protections import ProtectionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,7 @@ class QmtBroker:
         bridge_url: str = DEFAULT_BRIDGE_URL,
         initial_cash: float = 1_000_000.0,
         risk_config: RiskConfig | None = None,
+        protection_config: ProtectionConfig | None = None,
         slippage: float = 0.001,
         strategies_dir: str = "strategies",
     ) -> None:
@@ -60,6 +65,10 @@ class QmtBroker:
         self._client: BridgeClient = client or HttpBridgeClient(bridge_url)
         self._initial_cash = initial_cash
         self._risk = RiskManager(risk_config)
+        from quanti.risk.protections import ProtectionConfig, ProtectionManager
+        self._protections = ProtectionManager(
+            protection_config if protection_config is not None
+            else ProtectionConfig())
         self._slippage = slippage
         self._strategies_dir = strategies_dir
 
@@ -162,6 +171,14 @@ class QmtBroker:
                 out.pending += 1
         return out
 
+    def _entry_allowed(self, signal: Signal,
+                       portfolio) -> tuple[bool, str, str]:
+        """Risk caps + protections gate via the shared helper. Returns
+        (ok, reason, reject_kind). Protections only gate BUY."""
+        from quanti.risk.protection_context import evaluate_entry
+        return evaluate_entry(self._risk, self._protections, self._db,
+                              self._provider, signal, portfolio)
+
     def _submit_signal(self, signal: Signal,
                        strategy_name: str) -> tuple[bool, str, str]:
         """Risk-check → size → submit. Returns (landed, status, reason) with
@@ -171,13 +188,14 @@ class QmtBroker:
         at the T+1-sellable quantity (`can_use_volume`) so a lot bought today
         is never over-sold — a frozen position is skipped, not submitted."""
         portfolio, sellable = self._reconciled_portfolio()
-        ok, reason = self._risk.check(signal, portfolio)
+        ok, reason, kind = self._entry_allowed(signal, portfolio)
         if not ok:
             self._mirror_order(signal, strategy_name, status="rejected",
                                reason=reason)
             self._db.log_decision(
-                "risk_reject",
-                f"风控拒绝(实盘) {signal.direction.value} {signal.stock_code}: {reason}",
+                kind,
+                f"{'风控' if kind == 'risk_reject' else '保护层'}拒绝(实盘) "
+                f"{signal.direction.value} {signal.stock_code}: {reason}",
                 code=signal.stock_code,
                 details={"venue": "qmt", "signal_reason": signal.reason})
             return False, "rejected", reason
