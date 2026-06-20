@@ -79,3 +79,21 @@ def test_bad_daily_time_falls_back_to_interval(tmp_path):
     save_goal(db, goal)
     assert rt._daily_run_time() is None
     assert rt._next_wait_seconds() == 14400
+
+
+def test_daily_runs_only_on_trading_days(tmp_path, monkeypatch):
+    import quanti.utils.market as mkt
+    db, rt = _runtime(tmp_path)
+    goal = load_goal(db)
+    goal.params = {**(goal.params or {}), "daily_run_time": "17:30"}
+    save_goal(db, goal)
+
+    monkeypatch.setattr(mkt, "is_trading_day", lambda d, p=None: True)
+    assert rt._daily_runs_today() is True
+    monkeypatch.setattr(mkt, "is_trading_day", lambda d, p=None: False)
+    assert rt._daily_runs_today() is False  # non-trading day → skipped
+
+    # Opt out of the gate → runs every day regardless of the calendar.
+    goal.params = {**goal.params, "daily_trading_days_only": False}
+    save_goal(db, goal)
+    assert rt._daily_runs_today() is True
