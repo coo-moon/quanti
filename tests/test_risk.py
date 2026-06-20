@@ -186,7 +186,7 @@ def test_check_portfolio_stop():
 
 
 def test_check_exits_stop_loss_reason_uses_prefix():
-    from quanti.models import Direction, Portfolio, Position
+    from quanti.models import Portfolio, Position
     from quanti.risk.manager import (
         RiskManager, RiskConfig, STOP_LOSS_REASON_PREFIX,
     )

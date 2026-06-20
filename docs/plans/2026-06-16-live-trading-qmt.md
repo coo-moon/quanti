@@ -112,6 +112,7 @@ Windows 机器(常开、交易时段保持登录):
 3. **symbol 格式**:vnpy 的 `vt_symbol` / `symbol.exchange`(如 `000001.SZSE` / `600519.SSE`)与 quanti 内部 `code` 的双向映射;同时核对 xtdata 行情接口的代码后缀(`.SZ` / `.SH`)。
 
 附:`PositionData.yd_volume` 作为 T+1 可卖量、异步成交回调(`on_order` / `on_trade`)累计的字段名,也在真机上顺带验证。
+- **protections 依赖交易日历**：StoplossGuard/MaxDrawdown 的窗口与锁期按交易日计；上实盘前确保 `trade_calendar` 已 sync（否则 `is_trading_day` 退化为"工作日"，窗口会偏）。
 
 ## 待用户提供(进入阶段 ② 只读 spike 前)
 

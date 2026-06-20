@@ -1,4 +1,19 @@
-"""Risk management module."""
+"""Risk management module.
+
+Two-layer drawdown architecture
+--------------------------------
+Layer 1 — **protections** (``quanti/risk/protections.py``):
+    MaxDrawdown soft-lock. Window peak-to-trough; threshold default -8%.
+    Locks *new BUY entries* for K trading days after any trigger day.
+    Does NOT force a sell.
+
+Layer 2 — **portfolio_stop_loss** (this module, ``check_portfolio_stop``):
+    All-time HWM hard breaker. Default -15% from the running high-water mark.
+    Flattens all positions and halts the agent when triggered.
+    Threshold: ``RiskConfig.portfolio_stop_loss_pct``.
+
+Layer 1 fires first and is softer; Layer 2 is the last resort.
+"""
 
 from __future__ import annotations
 
