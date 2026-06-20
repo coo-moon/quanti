@@ -37,6 +37,14 @@ Windows 机器(常开、交易时段保持登录):
 
 起步:两进程同机走 localhost,最简单。后期可把 quanti 主体挪回 Mac、只留 bridge 在 Windows。
 
+### bridge 后端选型:Option B —— 用 vnpy 的 QMT gateway(已落地, #22)
+
+调研后(见 `docs/2026-06-20-reference-mature-quant-systems.md`)决定:**不在 bridge 里手写 xtquant 的订单状态机/异步成交/重连**,而是在 bridge 进程内跑 **headless vnpy + `vnpy_xt` gateway**,把其事件翻译成现有 HTTP 契约。
+
+- **为什么保留 bridge 进程(而非进程内直接用 vnpy)**:故障隔离(QMT 崩了不带崩 web/agent)、不把 quanti 主体绑死在 vnpy+Windows、保留已建好且测试过的 `QmtBroker`/契约。
+- **Python 版本**:vnpy 支持 3.10–3.13(推荐 3.13),quanti 正是 3.13 —— 若 xtquant 也能在 3.13 跑,bridge 与 quanti *可* 共用解释器;但仍保留进程边界做故障隔离。
+- **落地**:`bridge/vnpy_backend.py`(`VnpyBackend`,守卫导入,无 vnpy 退回 mock)+ `bridge/qmt_bridge.py` 检测/委托。交易走 vnpy gateway 回调,行情走 xtdata;可卖量取 `PositionData.yd_volume`(T+1)。quanti 侧零改动。
+
 ## Windows 环境清单
 
 - **机器**:Win10/11 或 Server,常开,关睡眠/休眠/锁屏,网络稳定(建议云 Windows VPS);注意 RDP 断开可能影响 QMT GUI。
@@ -80,21 +88,34 @@ Windows 机器(常开、交易时段保持登录):
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| **① Broker 接口** | 抽 `quanti.execution.base.Broker` Protocol,runtime 依赖接口;PaperBroker 结构化实现。纯重构。 | ✅ 合并 (#12) |
-| **② qmt-bridge + 只读冒烟** | Windows 上 `xtquant` 包成 HTTP;只读脚本 `XtQuantTrader.connect → 查资金/持仓`,确认能读到真实账户。**不下单**。 | ⬜ 待环境 |
-| **③ QmtBroker** | 实现 `Broker`:`order_stock` 下单 + 成交/委托回调 + 持仓现金对账 + 部分成交/废单/撤单/幂等。 | ⬜ |
-| **④ xtdata→SQLite 历史源** | 写 xtdata adapter,日线下载后落 `daily_quotes`(同 akshare 出口);akshare 退居兜底/新闻。研究/回测读 SQLite,不绑 QMT 在线。 | ⬜ |
+| **① Broker 接口** | 抽 `quanti.execution.base.Broker` Protocol,runtime 依赖接口;PaperBroker 结构化实现。后续补急停/健康/回撤熔断。 | ✅ 合并 (#12,#19) |
+| **② bridge + 只读冒烟** | bridge(HTTP 契约 + mock)就绪、可端到端跑;实盘改为 **vnpy_xt** 后端。**只读 spike 待 QMT 机器**:headless vnpy + vnpy_xt `connect → 查资金/持仓`。 | 🟡 脚手架就绪 (#19,#22),待真机 |
+| **③ QmtBroker** | 实现 `Broker`:下单 + 成交/委托回调 + 持仓现金对账 + 部分成交/废单/撤单。**已审计加固**(风控前置、T+1 可卖量、对账);实盘下单经 vnpy gateway。 | 🟡 已实现 (#19,#22),待真机验证 |
+| **④ xtdata→SQLite 历史源** | `XtdataAdapter` 经 bridge 取日线落 `daily_quotes`(同 akshare 出口);vnpy 后端用 xtdata 取真数据。 | 🟡 骨架就绪 (#19,#22),待真机 |
 | **⑤ 实时报价 + 盘中离场** | `xtdata` 订阅实时报价 → `DataProvider` 加实时接口;agent 改盘中循环,止损/止盈改盘中触发(注意:实时报价非分钟 bar)。 | ⬜ |
 | **⑥ 影子模式** | QmtBroker 与 PaperBroker 并行,核对成交/持仓差异,跑一段。 | ⬜ |
 | **⑦ 小资金实盘** | 通过对账 + 监控告警后,小资金灰度放量。 | ⬜ |
 | (可选) 偏差修正 | 若要可信回测,接 Tushare/米筐 补退市股 + point-in-time。与上面解耦,按需做。 | ⬜ |
 
+> 另:交易核心已做对抗式审计 + 修复(前视/回测≡实盘、行业·单票·总仓硬限、组合 -15% 熔断、日内上限、选股指标),并修了 DB 跨线程脏读。见 `docs/2026-06-20-audit-trading-core.md`。
+
 ## 复用(无需重写)
 
 `RiskManager` 硬限 / T+1 / 佣金印花税模型 / 挂单→成交生命周期 / 止损止盈 —— 迁移时大多直接复用,QmtBroker 主要是把"模拟成交"换成"真下单 + 等回报 + 对账"。
 
-## 待用户提供(进入阶段 ②前)
+## Option B 待真机验证清单(代码中以 `# VERIFY` 标注)
 
-1. `xtquant` 实际可用的 Python 版本(定 bridge 解释器);
-2. 券商名 + `userdata_mini` 路径;
-3. 是否有 QMT 模拟交易环境(影子阶段用)。
+`bridge/vnpy_backend.py` 在没有 vnpy/xtquant 的机器上只能按文档/惯例写"最佳猜测",以下三处**必须在装好 `vnpy_xt` 的 QMT 机器上核对**(只读 spike 阶段即可全部确认,无需下单):
+
+1. **connect 设置键**:`vnpy_xt` gateway `connect()` 接受的 setting dict 字段名/取值(账号、`userdata_mini` 路径、账户类型 STOCK 等)—— 以 gateway 源码 / `get_default_setting()` 为准,据此修正 `_connect_setting_from_env()` 的 env→key 映射。
+2. **股票现货的 offset 语义**:A 股现货 买=开、卖=平 在 vnpy 里如何表达(`Offset.OPEN`/`Offset.CLOSE` vs `Offset.NONE`)—— 不同 gateway 口径不同,下单前必须确认,否则平仓单可能被拒或语义错。
+3. **symbol 格式**:vnpy 的 `vt_symbol` / `symbol.exchange`(如 `000001.SZSE` / `600519.SSE`)与 quanti 内部 `code` 的双向映射;同时核对 xtdata 行情接口的代码后缀(`.SZ` / `.SH`)。
+
+附:`PositionData.yd_volume` 作为 T+1 可卖量、异步成交回调(`on_order` / `on_trade`)累计的字段名,也在真机上顺带验证。
+
+## 待用户提供(进入阶段 ② 只读 spike 前)
+
+1. QMT 机器上 `xtquant` 实际可用的 Python 版本(确认能否用 3.13;定 bridge 解释器);
+2. 券商名 + `userdata_mini` 路径 + 资金账号;
+3. 是否有 QMT 模拟交易环境(影子阶段用);
+4. 在该机装 `vnpy` + `vnpy_xt`,跑只读 spike 核对上面三条 `# VERIFY`。
