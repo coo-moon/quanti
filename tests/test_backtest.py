@@ -240,18 +240,18 @@ def test_backtest_protections_block_buys_after_stop_cluster(tmp_path):
     guarded = BacktestEngine(
         provider, 200_000.0, risk_manager=RiskManager(risk_cfg),
         protection_manager=ProtectionManager(ProtectionConfig(
-            sg_lookback_days=5, sg_trade_limit=2, sg_lock_days=5,
+            sg_lookback_days=10, sg_trade_limit=2, sg_lock_days=10,
             max_drawdown_enabled=False)),
     ).run(_make_strat(), codes, start, end)
 
-    # Guarded run skips at least as many signals as base (guard adds more skips).
-    assert guarded.skipped_signals >= base.skipped_signals
+    # Guarded run STRICTLY skips more signals than base (guard fired and locked).
+    assert guarded.skipped_signals > base.skipped_signals
 
-    # Once the guard trips, fewer BUYs should fill.
+    # Once the guard trips, strictly fewer BUYs should fill.
     def n_buys(r):
         return sum(1 for t in r.trades if t.direction == Direction.BUY)
 
-    assert n_buys(guarded) <= n_buys(base)
+    assert n_buys(guarded) < n_buys(base)
 
     # Smoke: no protection_manager (backward-compatible) still works.
     smoke = BacktestEngine(provider, 200_000.0).run(
