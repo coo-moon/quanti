@@ -126,8 +126,11 @@ def test_backtest_risk_exit_tags_reason(tmp_path):
 
     db = Database(str(tmp_path / "rx.db"))
     db.initialize()
-    dates = pd.bdate_range("2024-01-02", periods=10)
-    closes = [10.0, 10.1, 10.05, 10.1, 10.0, 10.1, 10.05, 10.0, 10.1, 8.0]  # crash
+    # 10 calm bars, a -20% crash on bar 10, then a trailing bar so the
+    # stop-loss (detected at the crash close) can fill at the NEXT bar's open
+    # — the engine fills at next-open, never the same close.
+    dates = pd.bdate_range("2024-01-02", periods=11)
+    closes = [10.0, 10.1, 10.05, 10.1, 10.0, 10.1, 10.05, 10.0, 10.1, 8.0, 8.0]
     df = pd.DataFrame({
         "code": "000001", "date": [d.date() for d in dates],
         "open": closes, "high": [c + 0.1 for c in closes],
