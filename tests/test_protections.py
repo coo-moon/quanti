@@ -132,3 +132,89 @@ def test_check_entry_code_param_ignored():
     ctx = _ctx(_d(3), sl_dates=[_d(1), _d(2), _d(3)])  # StoplossGuard locks
     assert mgr.check_entry(ctx, code="000001") == mgr.check_entry(ctx)
     assert mgr.check_entry(ctx, code="000001")[0] is False
+
+
+# ---- Live context builder ---------------------------------------------
+
+def test_build_db_context_from_database(tmp_path):
+    from datetime import date, datetime
+    from quanti.data.database import Database
+    from quanti.data.provider import DataProvider
+    from quanti.risk.protections import ProtectionConfig
+    from quanti.risk.protection_context import build_db_context
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.ensure_portfolio(100_000)
+
+    def iso(d):
+        return datetime(d.year, d.month, d.day, 15, 0).isoformat()
+
+    db.insert_order({
+        "order_id": "o1", "code": "000001", "direction": "sell",
+        "quantity": 100, "price_type": "market", "limit_price": 0.0,
+        "status": "filled", "strategy_name": "risk_exit",
+        "filled_price": 9.0, "filled_quantity": 100,
+        "reason": "止损 -10% ≤ -8%", "created_at": iso(date(2026, 6, 18)),
+        "filled_at": iso(date(2026, 6, 18)), "entry_strategy": "",
+    })
+    db.save_portfolio_snapshot(date(2026, 6, 18), 50_000, 50_000, 100_000)
+    db.save_portfolio_snapshot(date(2026, 6, 19), 50_000, 48_000, 98_000)
+
+    ctx = build_db_context(db, DataProvider(db), ProtectionConfig(),
+                           today=date(2026, 6, 20))
+    assert date(2026, 6, 18) in ctx.stop_loss_exit_dates
+    assert any(v == 100_000 for _d, v in ctx.equity_series)
+    assert ctx.today == date(2026, 6, 20)
+    assert callable(ctx.trading_days_between)
+
+
+# ---- evaluate_entry shared entry gate ---------------------------------
+
+def test_evaluate_entry_gates_buy_not_sell(tmp_path):
+    from datetime import date, datetime, timedelta
+    from quanti.data.database import Database
+    from quanti.data.provider import DataProvider
+    from quanti.models import Direction, Signal
+    from quanti.risk.protections import ProtectionConfig, ProtectionManager
+    from quanti.risk.protection_context import evaluate_entry
+
+    class _OkRisk:
+        def check(self, signal, portfolio):
+            return True, ""
+
+    class _NoRisk:
+        def check(self, signal, portfolio):
+            return False, "cap hit"
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    db.ensure_portfolio(100_000)
+    today = date.today()
+
+    def _iso(d):
+        return datetime(d.year, d.month, d.day, 15, 0).isoformat()
+
+    for i, c in enumerate(["000001", "000002", "000003"]):
+        d = today - timedelta(days=i + 1)
+        db.insert_order({
+            "order_id": f"o{i}", "code": c, "direction": "sell",
+            "quantity": 100, "price_type": "market", "limit_price": 0.0,
+            "status": "filled", "strategy_name": "risk_exit",
+            "filled_price": 9.0, "filled_quantity": 100,
+            "reason": "止损 -10% ≤ -8%", "created_at": _iso(d),
+            "filled_at": _iso(d), "entry_strategy": "",
+        })
+    pm = ProtectionManager(ProtectionConfig(
+        sg_lookback_days=10, sg_trade_limit=3, sg_lock_days=10,
+        max_drawdown_enabled=False))
+    provider = DataProvider(db)
+    buy = Signal("600519", Direction.BUY, 1.0, "buy")
+    sell = Signal("600519", Direction.SELL, 1.0, "sell")
+
+    ok, reason, kind = evaluate_entry(_OkRisk(), pm, db, provider, buy, object())
+    assert ok is False and kind == "protection_block" and "StoplossGuard" in reason
+    ok2, _, _ = evaluate_entry(_OkRisk(), pm, db, provider, sell, object())
+    assert ok2 is True
+    ok3, _, kind3 = evaluate_entry(_NoRisk(), pm, db, provider, buy, object())
+    assert ok3 is False and kind3 == "risk_reject"
