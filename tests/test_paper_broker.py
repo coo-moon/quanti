@@ -188,3 +188,47 @@ def test_portfolio_stop_holds_within_tolerance(tmp_path):
     # total = 5k + 88.2k = 93.2k vs peak 100k → -6.8% → hold.
     assert broker.enforce_portfolio_stop() is False
     assert len(db.list_positions()) == 1
+
+
+def test_protection_blocks_buy_after_stop_loss_cluster(tmp_path):
+    from datetime import date, datetime, timedelta
+    from quanti.data.database import Database
+    from quanti.data.provider import DataProvider
+    from quanti.models import Direction, Signal
+    from quanti.execution.paper_broker import PaperBroker
+    from quanti.risk.protections import ProtectionConfig
+
+    db = Database(str(tmp_path / "t.db"))
+    db.initialize()
+    provider = DataProvider(db)
+    # Seed 3 stop-loss exits in the last few days → StoplossGuard locks BUYs.
+    today = date.today()
+
+    def iso(d):
+        return datetime(d.year, d.month, d.day, 15, 0).isoformat()
+
+    for i, c in enumerate(["000001", "000002", "000003"]):
+        d = today - timedelta(days=i + 1)
+        db.insert_order({
+            "order_id": f"o{i}", "code": c, "direction": "sell",
+            "quantity": 100, "price_type": "market", "limit_price": 0.0,
+            "status": "filled", "strategy_name": "risk_exit",
+            "filled_price": 9.0, "filled_quantity": 100,
+            "reason": "止损 -10% ≤ -8%", "created_at": iso(d),
+            "filled_at": iso(d), "entry_strategy": "",
+        })
+    broker = PaperBroker(db, provider, initial_cash=200_000,
+                         fill_mode="immediate",
+                         protection_config=ProtectionConfig(
+                             sg_lookback_days=10, sg_trade_limit=3,
+                             sg_lock_days=10, max_drawdown_enabled=False))
+    ok, reason, kind = broker._entry_allowed(
+        Signal("600519", Direction.BUY, 1.0, "test buy"),
+        broker._build_runtime_portfolio())
+    assert ok is False and kind == "protection_block"
+    assert "StoplossGuard" in reason
+    # A SELL is never protection-blocked.
+    ok2, _, _ = broker._entry_allowed(
+        Signal("600519", Direction.SELL, 1.0, "test sell"),
+        broker._build_runtime_portfolio())
+    assert ok2 is True
