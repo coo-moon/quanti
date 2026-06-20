@@ -361,7 +361,12 @@ class TestPendingDetail:
         d = broker.pending_orders_detail()[0]
         assert d["bar_available"] is True
         assert d["expected_fill_date"] == today.isoformat()
-        assert d["trading_days_pending"] >= 1
+        # trading_days_pending counts *trading* days only, so it's legitimately
+        # 0 when "today" is a weekend/holiday. Assert it matches the calendar
+        # function (robust on any run date) rather than hard-coding >= 1.
+        from quanti.utils.market import count_trading_days_between
+        created = (datetime.now() - timedelta(days=1)).date()
+        assert d["trading_days_pending"] == count_trading_days_between(created, today)
 
 
 def test_snapshot_position_has_price_date(seeded_pending):

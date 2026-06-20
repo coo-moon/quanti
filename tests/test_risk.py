@@ -143,3 +143,69 @@ class TestCheckExits:
         rm = RiskManager(RiskConfig(take_profit_activate_pct=0.0))
         sells = rm.check_exits(self._pf(10.0, 20.0), peaks={"X": 25.0})
         assert sells == []
+
+
+def test_max_additional_buy_value_enforces_all_caps():
+    rm = RiskManager(RiskConfig(max_position_pct=0.10, max_industry_pct=0.30,
+                                max_total_position_pct=0.80))
+    # Fresh buy, nothing held: single-stock cap binds → 10% of 100k.
+    pf = Portfolio(cash=100_000.0)
+    assert rm.max_additional_buy_value(pf, "000001", "银行") == pytest.approx(10_000.0)
+
+    # Same name already at 8% → only 2% single-stock room left.
+    pf_stock = Portfolio(cash=92_000.0, positions={
+        "000001": Position("000001", 800, 10.0, 10.0, industry="银行")})
+    assert pf_stock.total_value == pytest.approx(100_000.0)
+    assert rm.max_additional_buy_value(pf_stock, "000001", "银行") == pytest.approx(2_000.0)
+
+    # Industry cap binds: 25% already in 银行, candidate also 银行 → 30%-25% = 5%.
+    pf_ind = Portfolio(cash=75_000.0, positions={
+        "600000": Position("600000", 2500, 10.0, 10.0, industry="银行")})
+    assert rm.max_additional_buy_value(pf_ind, "000001", "银行") == pytest.approx(5_000.0)
+    # …but a candidate in a DIFFERENT industry isn't bound by 银行's exposure.
+    assert rm.max_additional_buy_value(pf_ind, "000002", "地产") == pytest.approx(10_000.0)
+
+    # Total cap binds: 78% invested → only 2% total room regardless of name.
+    pf_total = Portfolio(cash=22_000.0, positions={
+        "600000": Position("600000", 3900, 10.0, 10.0, industry="银行"),
+        "000002": Position("000002", 3900, 10.0, 10.0, industry="地产")})
+    assert pf_total.market_value == pytest.approx(78_000.0)
+    assert rm.max_additional_buy_value(pf_total, "300001", "科技") == pytest.approx(2_000.0)
+
+    # Already over a cap → 0 room.
+    assert rm.max_additional_buy_value(pf_total, "600000", "银行") == 0.0
+
+
+def test_check_portfolio_stop():
+    rm = RiskManager(RiskConfig(portfolio_stop_loss_pct=-0.15))
+    assert rm.check_portfolio_stop(85_000, 100_000) is True    # -15% exactly
+    assert rm.check_portfolio_stop(80_000, 100_000) is True    # -20%
+    assert rm.check_portfolio_stop(86_000, 100_000) is False   # -14% within
+    assert rm.check_portfolio_stop(120_000, 100_000) is False  # new high
+    assert rm.check_portfolio_stop(50_000, 0) is False         # no peak yet
+
+
+def test_daily_cap_auto_resets_on_new_calendar_day(monkeypatch):
+    """Live/paper never call reset_daily(); the daily-trade cap must auto-roll
+    when the calendar day changes, else it becomes a permanent lifetime lock
+    after max_daily_trades trades."""
+    import quanti.risk.manager as m
+    from datetime import date as _date
+
+    rm = RiskManager(RiskConfig(max_daily_trades=2))
+    pf = Portfolio(cash=1_000_000.0)
+    buy = Signal(stock_code="000001", direction=Direction.BUY,
+                 strength=1.0, reason="x")
+
+    monkeypatch.setattr(m, "date", type("D", (), {
+        "today": staticmethod(lambda: _date(2026, 1, 5))}))
+    rm.record_trade()
+    rm.record_trade()
+    ok, reason = rm.check(buy, pf)
+    assert not ok and "Daily trade limit" in reason
+
+    # Next calendar day → counter rolls, buys allowed again (no reset_daily call).
+    monkeypatch.setattr(m, "date", type("D", (), {
+        "today": staticmethod(lambda: _date(2026, 1, 6))}))
+    ok2, _ = rm.check(buy, pf)
+    assert ok2

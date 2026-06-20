@@ -144,7 +144,7 @@ def run_walk_forward(
             continue
 
         oos_curve = _slice_oos_curve(bt.equity_curve, fold)
-        if len(oos_curve) < 2:
+        if len(oos_curve) < 5:  # too few OOS bars to score meaningfully
             fold_results.append(FoldResult(fold=fold, metrics={},
                                            n_trades_oos=0))
             continue

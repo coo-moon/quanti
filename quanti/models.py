@@ -98,6 +98,7 @@ class Position:
     avg_cost: float
     current_price: float = 0.0
     buy_date: date | None = None
+    industry: str = ""  # for the industry-concentration risk cap
 
     @property
     def market_value(self) -> float:

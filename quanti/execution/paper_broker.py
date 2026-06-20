@@ -401,6 +401,85 @@ class PaperBroker:
             })
         return out
 
+    # ----------------------------------------------------------- health
+    def is_connected(self) -> bool:
+        """Paper broker has no external venue — always 'connected'.
+
+        Exists so the runtime can gate on `broker.is_connected()` uniformly;
+        QmtBroker overrides this with a real bridge/QMT health check."""
+        return True
+
+    # ------------------------------------------------------- order control
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a single still-pending order. Returns False if the order
+        isn't pending (already filled / cancelled / unknown)."""
+        pending = {o["order_id"]
+                   for o in self._db.list_orders(limit=1000, status="pending")}
+        if order_id not in pending:
+            return False
+        self._db.update_order_status(order_id, "cancelled",
+                                     reason="cancelled by user")
+        self._db.log_decision(
+            "order_cancelled", f"撤单 {order_id}",
+            details={"order_id": order_id})
+        return True
+
+    def cancel_all_pending(self) -> int:
+        """Kill switch, step 1: cancel every pending order. Returns count.
+
+        Idempotent — a second call finds nothing pending and returns 0."""
+        pending = self._db.list_orders(limit=1000, status="pending")
+        for o in pending:
+            self._db.update_order_status(o["order_id"], "cancelled",
+                                         reason="kill-switch: cancel all")
+        if pending:
+            self._db.log_decision(
+                "kill_switch", f"急停：撤销 {len(pending)} 笔挂单",
+                details={"cancelled": len(pending)})
+        return len(pending)
+
+    def flatten(self, reason: str = "kill-switch") -> int:
+        """Kill switch, step 2: submit SELL orders for all holdings.
+
+        Routed through `execute_signals`, so RiskManager and T+1 still apply
+        (a lot bought today won't sell and is skipped). Returns the number of
+        positions an exit was submitted for (filled in immediate mode, queued
+        in pending mode)."""
+        positions = [p for p in self._db.list_positions() if p["quantity"] > 0]
+        if not positions:
+            return 0
+        sells = [Signal(stock_code=p["code"], direction=Direction.SELL,
+                        strength=1.0, reason=reason) for p in positions]
+        result = self.execute_signals(sells, strategy_name="kill_switch")
+        acted = result.filled + result.pending
+        self._db.log_decision(
+            "kill_switch",
+            f"急停：清仓 {acted}/{len(sells)} 个持仓 ({reason})",
+            details={"positions": len(sells), "acted": acted,
+                     "filled": result.filled, "pending": result.pending})
+        return acted
+
+    def enforce_portfolio_stop(self) -> bool:
+        """Portfolio drawdown circuit breaker: if equity is down past
+        `portfolio_stop_loss_pct` from its high-water mark, cancel pending +
+        flatten everything. Returns True iff it fired (caller halts the agent)."""
+        snap = self.snapshot_portfolio()  # also persists today's snapshot
+        total = snap["total_value"]
+        peak = max(self._db.get_peak_total_value(), total)
+        if not self._risk.check_portfolio_stop(total, peak):
+            return False
+        self.cancel_all_pending()
+        self.flatten("组合回撤熔断")
+        dd = (total - peak) / peak if peak else 0.0
+        self._db.log_decision(
+            "portfolio_stop",
+            f"组合回撤熔断：净值 {total:,.0f} 自峰值 {peak:,.0f} 回撤 {dd:.1%} "
+            f"≤ {self._risk.config.portfolio_stop_loss_pct:.0%}，已清仓",
+            details={"total_value": total, "peak_value": peak,
+                     "drawdown": dd,
+                     "limit": self._risk.config.portfolio_stop_loss_pct})
+        return True
+
     def _fill_pending(self, signal: Signal, ref_price: float,
                       bar_date: date, order_row: dict) -> bool:
         """Fill an existing pending order row at the given price.
@@ -421,11 +500,12 @@ class PaperBroker:
             cash = state["cash"]
             price = ref_price * (1 + self._slippage)
 
-            max_position_pct = self._risk.config.max_position_pct
             total_value = cash + sum(
                 p["quantity"] * (p["current_price"] or p["avg_cost"])
                 for p in self._db.list_positions())
-            size_cap = total_value * max_position_pct
+            size_cap = self._risk.max_additional_buy_value(
+                self._build_runtime_portfolio(), signal.stock_code,
+                self._stock_industry(signal.stock_code))
             if self._sizer is not None:
                 recent = self._recent_bars(signal.stock_code)
                 target_w = self._sizer.target_weight(
@@ -554,8 +634,13 @@ class PaperBroker:
                 avg_cost=pos["avg_cost"],
                 current_price=pos["current_price"] or pos["avg_cost"],
                 buy_date=pos["buy_date"],
+                industry=self._stock_industry(pos["code"]),
             )
         return portfolio
+
+    def _stock_industry(self, code: str) -> str:
+        stock = self._db.get_stock(code)
+        return stock.industry if stock else ""
 
     def _record_order(self, signal: Signal, strategy_name: str, *,
                       status: str, reason: str = "",
@@ -588,11 +673,15 @@ class PaperBroker:
         cash = state["cash"]
         price = ref_price * (1 + self._slippage)
 
-        # Size: use signal.strength as % of cash to deploy, capped by single-stock risk.
+        # Size by deployable cash, capped by the hard risk limits. size_cap is
+        # the post-trade single-stock + industry + total cap (the real
+        # enforcement point); max_position_pct is kept for the reject reason.
         max_position_pct = self._risk.config.max_position_pct
         total_value = cash + sum(p["quantity"] * (p["current_price"] or p["avg_cost"])
                                  for p in self._db.list_positions())
-        size_cap = total_value * max_position_pct
+        size_cap = self._risk.max_additional_buy_value(
+            self._build_runtime_portfolio(), signal.stock_code,
+            self._stock_industry(signal.stock_code))
         if self._sizer is not None:
             # Sizer-driven path: convert target portfolio weight to a notional
             # cap. The single-stock RiskManager cap still applies on top so

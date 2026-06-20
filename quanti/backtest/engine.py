@@ -1,4 +1,14 @@
-"""Event-driven backtesting engine."""
+"""Event-driven backtesting engine.
+
+Fill model (since 2026-06-20 audit fix): a signal generated from bar *t* fills at
+the OPEN of the next available trading bar — never at the same bar's close. This
+removes the same-bar look-ahead (you cannot observe the close and trade at it)
+and makes the backtest agree with the live path (PaperBroker pending mode also
+fills at next-bar open). T+1 is enforced *by construction*: a buy and any sell of
+it can never fill on the same day. Untradeable opens (limit-up for buys /
+limit-down for sells, or a suspended/no-bar day) are skipped and the signal
+waits, up to a short TTL.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +24,38 @@ from quanti.data.provider import DataProvider
 from quanti.models import BarData, Direction, Portfolio, Position, Signal
 from quanti.risk.manager import RiskManager
 from quanti.strategy.base import BaseStrategy
+
+# A signal waits at most this many trading bars for a fillable (tradable, has a
+# bar) day before being abandoned — mirrors PaperBroker's pending TTL.
+_PENDING_TTL_BARS = 3
+
+
+def _limit_pct(code: str) -> float:
+    """A-share daily price-limit by board (best-effort by code prefix).
+
+    STAR (688/689) + ChiNext (300/301): 20%; Beijing Exchange (8../4../920): 30%;
+    main board: 10%. ST (±5%) can't be detected from the code alone, so it falls
+    back to the board limit (conservative — won't over-block)."""
+    if code.startswith(("688", "689", "300", "301")):
+        return 0.20
+    if code.startswith(("8", "4", "920", "92")):
+        return 0.30
+    return 0.10
+
+
+def _tradable_at_open(direction: Direction, bar: BarData,
+                      prev_close: float | None) -> bool:
+    """Whether an order can realistically fill at this bar's open.
+
+    Blocks buying into a limit-up open and selling into a limit-down open (incl.
+    一字板 locked-limit days). Without a prior close to reference, allow it."""
+    if prev_close is None or prev_close <= 0:
+        return True
+    lim = _limit_pct(bar.code)
+    eps = 0.005
+    if direction == Direction.BUY:
+        return bar.open < prev_close * (1 + lim) - eps
+    return bar.open > prev_close * (1 - lim) + eps
 
 
 @dataclass
@@ -83,13 +125,13 @@ class BacktestEngine:
         portfolio = Portfolio(cash=self._initial_cash)
         trades: list[TradeRecord] = []
         equity_values: dict[date, float] = {}
-        # Track T+1: stocks bought today cannot be sold today
-        bought_today: set[str] = set()
         # Post-entry peak (highest high since entry) per held code, for the
-        # trailing take-profit in RiskManager.check_exits. Updated each day a
-        # position is held, dropped when it's closed.
+        # trailing take-profit in RiskManager.check_exits.
         peaks: dict[str, float] = {}
         skipped_signals = 0
+        # Signals generated on a bar, waiting to fill at the NEXT bar's open.
+        # Each: {"signal", "gen_idx", "strategy_name"}.
+        pending: list[dict] = []
 
         # Load all data upfront
         all_bars: dict[str, list[BarData]] = {}
@@ -103,20 +145,25 @@ class BacktestEngine:
         sorted_dates = sorted(all_dates)
 
         # Precompute rolling 20-bar ADV (average daily turnover, in 元) per
-        # (code, date). The slippage model uses this to scale impact with the
-        # order's participation rate. Missing/zero turnover → adv20 stays 0
-        # and the slippage model gracefully degrades to base bps.
+        # (code, date) for the slippage model, and the prior close per
+        # (code, date) for the price-limit tradability gate.
         adv20: dict[str, dict[date, float]] = {}
+        prev_close: dict[str, dict[date, float | None]] = {}
         for code, bars in all_bars.items():
             amounts = [float(b.amount or 0) for b in bars]
             adv20[code] = {}
+            prev_close[code] = {}
+            last_close: float | None = None
             for i, bar in enumerate(bars):
                 window = amounts[max(0, i - 19): i + 1]
                 adv20[code][bar.date] = sum(window) / len(window) if window else 0.0
+                prev_close[code][bar.date] = last_close
+                last_close = bar.close
         self._adv20 = adv20
 
-        for current_date in sorted_dates:
-            bought_today.clear()
+        for idx, current_date in enumerate(sorted_dates):
+            if self._risk is not None:
+                self._risk.reset_daily()
 
             # Collect bars for today
             today_bars: dict[str, BarData] = {}
@@ -126,54 +173,53 @@ class BacktestEngine:
                         today_bars[code] = bar
                         break
 
-            # Update position prices + post-entry peaks (use today's HIGH).
+            # 1) Fill yesterday's pending signals at TODAY's open (sells first
+            #    so cash frees up before buys). Next-open + T+1 by construction.
+            pending = self._fill_pending(
+                pending, idx, current_date, today_bars, prev_close,
+                portfolio, trades, peaks)
+
+            # 2) Mark held positions to today's close; track post-entry peaks.
             for code, bar in today_bars.items():
                 if code in portfolio.positions:
                     portfolio.positions[code].current_price = bar.close
                     peaks[code] = max(peaks.get(code, 0.0), bar.high)
-            # Drop peaks for codes we no longer hold.
             for code in list(peaks):
                 if code not in portfolio.positions:
                     peaks.pop(code, None)
 
-            # Risk-driven exits first (stop-loss + trailing take-profit) so
-            # cash frees up before buys. The strategy's OWN sells still flow
-            # through on_bar below, so strategy_sell_codes is left empty here
-            # to avoid double-counting — the backtest already replays the
-            # strategy in full.
-            if self._risk is not None:
-                self._risk.reset_daily()
-                for sl in self._risk.check_exits(portfolio, peaks=peaks):
-                    sl_bar = today_bars.get(sl.stock_code)
-                    if sl_bar is None:
-                        continue
-                    if self._process_signal(sl, sl_bar, portfolio, trades,
-                                            current_date, bought_today,
-                                            "risk_exit"):
-                        peaks.pop(sl.stock_code, None)
+            # 3) Generate today's signals → queue for next-open fill.
+            pending_keys = {(p["signal"].stock_code, p["signal"].direction)
+                            for p in pending}
 
-            # Generate signals from strategy
+            def _queue(sig: Signal, sname: str) -> None:
+                key = (sig.stock_code, sig.direction)
+                if key in pending_keys:  # dedup: one order per code+direction
+                    return
+                pending.append({"signal": sig, "gen_idx": idx,
+                                "strategy_name": sname})
+                pending_keys.add(key)
+
+            # Risk-driven exits (stop-loss + trailing take-profit). The
+            # strategy's OWN sells still flow through on_bar, so we leave
+            # strategy_sell_codes empty to avoid double-counting.
+            if self._risk is not None:
+                for sl in self._risk.check_exits(portfolio, peaks=peaks):
+                    if sl.stock_code in today_bars:
+                        _queue(sl, "risk_exit")
+
             for code, bar in today_bars.items():
-                signals = strategy.on_bar(bar)
-                for signal in signals:
-                    # Use the bar matching the signal's stock_code, not the triggering bar
-                    signal_bar = today_bars.get(signal.stock_code, bar)
-                    if signal_bar.code != signal.stock_code:
-                        continue  # Skip if we don't have price data for the target stock
+                for signal in strategy.on_bar(bar):
+                    if signal.stock_code not in today_bars:
+                        continue  # no price data for the target stock
                     if self._risk is not None:
                         ok, _ = self._risk.check(signal, portfolio)
                         if not ok:
                             skipped_signals += 1
                             continue
-                    executed = self._process_signal(
-                        signal, signal_bar, portfolio, trades, current_date, bought_today, strategy.name
-                    )
-                    if not executed:
-                        skipped_signals += 1
-                    elif self._risk is not None:
-                        self._risk.record_trade()
+                    _queue(signal, strategy.name)
 
-            # Record equity
+            # 4) Record equity (marked to today's close).
             equity_values[current_date] = portfolio.total_value
 
         equity_curve = pd.Series(equity_values).sort_index()
@@ -191,6 +237,47 @@ class BacktestEngine:
             skip_reason=skip_reason,
         )
 
+    def _fill_pending(
+        self,
+        pending: list[dict],
+        idx: int,
+        current_date: date,
+        today_bars: dict[str, BarData],
+        prev_close: dict[str, dict[date, float | None]],
+        portfolio: Portfolio,
+        trades: list[TradeRecord],
+        peaks: dict[str, float],
+    ) -> list[dict]:
+        """Fill due pending signals at today's open; return the still-pending
+        list. Sells fill before buys (free cash first). A signal waits across
+        suspended / limit-locked days up to `_PENDING_TTL_BARS`."""
+        ordered = ([p for p in pending if p["signal"].direction == Direction.SELL]
+                   + [p for p in pending if p["signal"].direction == Direction.BUY])
+        survivors: list[dict] = []
+        for p in ordered:
+            sig = p["signal"]
+            code = sig.stock_code
+            expired = (idx - p["gen_idx"]) > _PENDING_TTL_BARS
+            bar = today_bars.get(code)
+            if bar is None:  # suspended today — wait (within TTL)
+                if not expired:
+                    survivors.append(p)
+                continue
+            pc = prev_close.get(code, {}).get(current_date)
+            if not _tradable_at_open(sig.direction, bar, pc):  # limit-locked
+                if not expired:
+                    survivors.append(p)
+                continue
+            filled = self._process_signal(sig, bar, portfolio, trades,
+                                          current_date, p["strategy_name"])
+            if filled and sig.direction == Direction.SELL:
+                peaks.pop(code, None)
+            # Retry an unfilled BUY (transient cash shortfall) within the TTL;
+            # everything else (filled, or a sell with no position) is dropped.
+            if not filled and sig.direction == Direction.BUY and not expired:
+                survivors.append(p)
+        return survivors
+
     def _process_signal(
         self,
         signal: Signal,
@@ -198,21 +285,21 @@ class BacktestEngine:
         portfolio: Portfolio,
         trades: list[TradeRecord],
         current_date: date,
-        bought_today: set[str],
         strategy_name: str,
     ) -> bool:
         code = signal.stock_code
 
         if signal.direction == Direction.BUY:
-            return self._execute_buy(code, bar, portfolio, trades, current_date,
-                                     bought_today, strategy_name, signal.reason)
+            filled = self._execute_buy(code, bar, portfolio, trades, current_date,
+                                       strategy_name, signal.reason)
         elif signal.direction == Direction.SELL:
-            # T+1 rule: cannot sell stocks bought today
-            if code in bought_today:
-                return False
-            return self._execute_sell(code, bar, portfolio, trades, current_date,
-                                      strategy_name, signal.reason)
-        return False
+            filled = self._execute_sell(code, bar, portfolio, trades, current_date,
+                                        strategy_name, signal.reason)
+        else:
+            return False
+        if filled and self._risk is not None:
+            self._risk.record_trade()
+        return filled
 
     def _execute_buy(
         self,
@@ -221,23 +308,27 @@ class BacktestEngine:
         portfolio: Portfolio,
         trades: list[TradeRecord],
         current_date: date,
-        bought_today: set[str],
         strategy_name: str,
         reason: str = "",
     ) -> bool:
         adv = self._adv20.get(code, {}).get(current_date, 0.0)
 
         # Two-pass slippage: estimate qty under base slippage, then re-compute
-        # the actual fill price at that qty. The volume-impact model has a
-        # tiny self-consistency loop (bigger qty → bigger slippage → smaller
-        # affordable qty) — one iteration of fixed-point is close enough for
-        # backtest purposes.
+        # the actual fill price at that qty. Fill at the bar's OPEN (next-open
+        # model), not its close.
         est_frac = self._slippage.adjust(
-            code=code, price=bar.close, qty=100,
+            code=code, price=bar.open, qty=100,
             direction=Direction.BUY, adv20=adv)
-        price_est = bar.close * (1 + est_frac)
+        price_est = bar.open * (1 + est_frac)
 
         max_spend = portfolio.cash * 0.95  # Keep 5% cash buffer
+        if self._risk is not None:
+            # Same hard caps as the live path (single-stock / industry / total),
+            # post-trade — otherwise the backtest over-concentrates vs live.
+            # Industry data isn't in the backtest provider, so industry is ""
+            # (single + total still bind).
+            max_spend = min(max_spend, self._risk.max_additional_buy_value(
+                portfolio, code, ""))
         commission_est = self._commission.calculate(price_est, 100, Direction.BUY)
         affordable = int(max_spend / (price_est * 100 + commission_est)) * 100
 
@@ -248,9 +339,9 @@ class BacktestEngine:
 
         # Now apply the real slippage at the actual quantity.
         real_frac = self._slippage.adjust(
-            code=code, price=bar.close, qty=quantity,
+            code=code, price=bar.open, qty=quantity,
             direction=Direction.BUY, adv20=adv)
-        price = bar.close * (1 + real_frac)
+        price = bar.open * (1 + real_frac)
         cost = price * quantity
         commission = self._commission.calculate(price, quantity, Direction.BUY)
         total_cost = cost + commission
@@ -268,7 +359,6 @@ class BacktestEngine:
                 return False
 
         portfolio.cash -= total_cost
-        bought_today.add(code)
 
         if code in portfolio.positions:
             pos = portfolio.positions[code]
@@ -312,12 +402,17 @@ class BacktestEngine:
             return False
 
         pos = portfolio.positions[code]
+        # T+1 safety net: a lot bought today can't be sold today. The next-open
+        # fill model already guarantees this, but guard anyway.
+        if pos.buy_date == current_date:
+            return False
+
         quantity = pos.quantity
         adv = self._adv20.get(code, {}).get(current_date, 0.0)
         slip_frac = self._slippage.adjust(
-            code=code, price=bar.close, qty=quantity,
+            code=code, price=bar.open, qty=quantity,
             direction=Direction.SELL, adv20=adv)
-        price = bar.close * (1 - slip_frac)
+        price = bar.open * (1 - slip_frac)
 
         revenue = price * quantity
         commission = self._commission.calculate(price, quantity, Direction.SELL)

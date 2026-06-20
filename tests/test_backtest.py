@@ -45,6 +45,20 @@ class TestMetrics:
         assert "sharpe_ratio" in metrics
         assert metrics["max_drawdown"] <= 0  # Drawdown is negative
 
+    def test_short_window_not_annualized(self):
+        # A ~14-bar window must NOT be extrapolated to an absurd annual figure
+        # (the "933%" walk-forward bug). It reports the cumulative return.
+        eq = pd.Series([100.0 * (1.05) ** (i / 13) for i in range(14)])  # +5%
+        m = compute_metrics(eq)
+        assert m["annual_return"] == pytest.approx(m["total_return"])
+        assert m["annual_return"] < 0.20
+
+    def test_long_window_is_annualized(self):
+        # A full year (+20% total) annualizes to ~+20%.
+        eq = pd.Series([100.0 * (1.20) ** (i / 251) for i in range(252)])
+        m = compute_metrics(eq)
+        assert m["annual_return"] == pytest.approx(0.20, rel=0.1)
+
 
 class AlwaysBuyStrategy(BaseStrategy):
     """Buys on first bar, for testing."""
@@ -126,8 +140,11 @@ def test_backtest_risk_exit_tags_reason(tmp_path):
 
     db = Database(str(tmp_path / "rx.db"))
     db.initialize()
-    dates = pd.bdate_range("2024-01-02", periods=10)
-    closes = [10.0, 10.1, 10.05, 10.1, 10.0, 10.1, 10.05, 10.0, 10.1, 8.0]  # crash
+    # 10 calm bars, a -20% crash on bar 10, then a trailing bar so the
+    # stop-loss (detected at the crash close) can fill at the NEXT bar's open
+    # — the engine fills at next-open, never the same close.
+    dates = pd.bdate_range("2024-01-02", periods=11)
+    closes = [10.0, 10.1, 10.05, 10.1, 10.0, 10.1, 10.05, 10.0, 10.1, 8.0, 8.0]
     df = pd.DataFrame({
         "code": "000001", "date": [d.date() for d in dates],
         "open": closes, "high": [c + 0.1 for c in closes],

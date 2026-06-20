@@ -840,6 +840,13 @@ class Database:
             for r in rows
         ]
 
+    def get_peak_total_value(self) -> float:
+        """Highest portfolio total_value ever recorded — the high-water mark for
+        the portfolio drawdown circuit breaker. 0.0 when no snapshots exist."""
+        row = self.conn.execute(
+            "SELECT MAX(total_value) FROM portfolio_snapshots").fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
     def save_portfolio_snapshot(self, snapshot_date: date, cash: float,
                                 market_value: float, total_value: float) -> None:
         from datetime import datetime
