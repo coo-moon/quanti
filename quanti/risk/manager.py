@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 
 from quanti.models import Direction, Portfolio, Signal
 
@@ -37,9 +38,21 @@ class RiskManager:
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig()
         self._daily_trade_count = 0
+        # Calendar day the count belongs to. Live/paper never call reset_daily(),
+        # so the count auto-rolls when the real date changes — otherwise the cap
+        # became a permanent lifetime lock after `max_daily_trades` trades.
+        self._count_day: date | None = None
+
+    def _roll_day_if_needed(self) -> None:
+        """Reset the daily counter when the calendar day has changed."""
+        today = date.today()
+        if self._count_day != today:
+            self._daily_trade_count = 0
+            self._count_day = today
 
     def check(self, signal: Signal, portfolio: Portfolio) -> tuple[bool, str]:
         """Check if a signal passes risk rules. Returns (allowed, reason)."""
+        self._roll_day_if_needed()
         # Always allow sells
         if signal.direction == Direction.SELL:
             return True, ""
@@ -126,9 +139,12 @@ class RiskManager:
         return signals
 
     def reset_daily(self) -> None:
-        """Reset daily counters. Call at start of each trading day."""
+        """Reset daily counters. Backtest calls this per simulated day; live/
+        paper rely on the auto-roll in `_roll_day_if_needed`."""
         self._daily_trade_count = 0
+        self._count_day = date.today()
 
     def record_trade(self) -> None:
         """Record that a trade was executed."""
+        self._roll_day_if_needed()
         self._daily_trade_count += 1

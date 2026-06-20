@@ -143,3 +143,29 @@ class TestCheckExits:
         rm = RiskManager(RiskConfig(take_profit_activate_pct=0.0))
         sells = rm.check_exits(self._pf(10.0, 20.0), peaks={"X": 25.0})
         assert sells == []
+
+
+def test_daily_cap_auto_resets_on_new_calendar_day(monkeypatch):
+    """Live/paper never call reset_daily(); the daily-trade cap must auto-roll
+    when the calendar day changes, else it becomes a permanent lifetime lock
+    after max_daily_trades trades."""
+    import quanti.risk.manager as m
+    from datetime import date as _date
+
+    rm = RiskManager(RiskConfig(max_daily_trades=2))
+    pf = Portfolio(cash=1_000_000.0)
+    buy = Signal(stock_code="000001", direction=Direction.BUY,
+                 strength=1.0, reason="x")
+
+    monkeypatch.setattr(m, "date", type("D", (), {
+        "today": staticmethod(lambda: _date(2026, 1, 5))}))
+    rm.record_trade()
+    rm.record_trade()
+    ok, reason = rm.check(buy, pf)
+    assert not ok and "Daily trade limit" in reason
+
+    # Next calendar day → counter rolls, buys allowed again (no reset_daily call).
+    monkeypatch.setattr(m, "date", type("D", (), {
+        "today": staticmethod(lambda: _date(2026, 1, 6))}))
+    ok2, _ = rm.check(buy, pf)
+    assert ok2
