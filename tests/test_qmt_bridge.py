@@ -112,6 +112,66 @@ def test_unknown_route_404(gw):
     assert status == 404
 
 
+class _FakeBackend:
+    """Stand-in for the vnpy backend so we can test the live delegation path
+    without vnpy/xtquant installed."""
+    connected = True
+
+    def __init__(self):
+        self.calls = []
+
+    def asset(self):
+        self.calls.append("asset")
+        return {"cash": 5.0, "frozen_cash": 0.0, "market_value": 0.0,
+                "total_asset": 5.0}
+
+    def positions(self):
+        self.calls.append("positions")
+        return {"positions": []}
+
+    def submit_order(self, body):
+        self.calls.append(("submit", body))
+        return {"ok": True, "order_id": "v-1", "status": "submitted",
+                "filled_volume": 0, "filled_price": 0.0, "msg": ""}
+
+    def cancel(self, body):
+        self.calls.append(("cancel", body))
+        return {"ok": True, "msg": "cancel sent"}
+
+    def orders(self):
+        return {"orders": [{"order_id": "v-1", "status": "accepted"}]}
+
+    def trades(self):
+        return {"trades": []}
+
+    def kline(self, code, start, end, period):
+        return {"code": code, "period": period, "bars": []}
+
+    def stock_list(self):
+        return {"stocks": []}
+
+    def quote(self, code):
+        return {"code": code, "last": 1.23}
+
+
+def test_live_backend_delegation():
+    """With a backend injected, the gateway leaves mock mode and delegates
+    every op to the backend (the vnpy path's wiring, testable without vnpy)."""
+    fake = _FakeBackend()
+    gw = QmtGateway(backend=fake)
+    assert gw.mock is False
+    assert route(gw, "GET", "/health", {}, None)[1]["mode"] == "vnpy"
+    assert route(gw, "GET", "/trader/asset", {}, None)[1]["cash"] == 5.0
+    res = route(gw, "POST", "/trader/order", {},
+                {"code": "000001", "direction": "buy",
+                 "volume": 100, "price": 10.0})[1]
+    assert res["order_id"] == "v-1" and res["status"] == "submitted"
+    assert route(gw, "POST", "/trader/cancel", {},
+                 {"order_id": "v-1"})[1]["ok"] is True
+    assert route(gw, "GET", "/data/quote", {"code": ["000001"]}, None)[1]["last"] == 1.23
+    assert "asset" in fake.calls
+
+
 def test_http_round_trip_health():
     """The actual socket path: handler -> route -> JSON over HTTP."""
     gw = QmtGateway()
