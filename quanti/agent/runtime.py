@@ -201,8 +201,33 @@ class AgentRuntime:
         while not self._stop_flag.is_set():
             if self._stop_flag.wait(self._next_wait_seconds()):
                 break
-            if not self._stop_flag.is_set():
-                self._safe_cycle()
+            if self._stop_flag.is_set():
+                break
+            # Daily-schedule mode skips non-trading days (weekends / holidays)
+            # unless goal.params["daily_trading_days_only"] is False. Interval
+            # mode runs every tick as before.
+            if self._daily_run_time() is not None and not self._daily_runs_today():
+                logger.info("daily schedule: %s is not a trading day, skipping",
+                            date.today().isoformat())
+                continue
+            self._safe_cycle()
+
+    def _daily_runs_today(self) -> bool:
+        """In daily-schedule mode, whether today should run. Gated to trading
+        days unless goal.params['daily_trading_days_only'] is False. Holiday
+        accuracy needs a synced trade_calendar (`quanti sync --calendar`);
+        without it, falls back to weekday. Never blocks on a calendar error."""
+        try:
+            params = load_goal(self._db).params or {}
+        except Exception:  # noqa: BLE001
+            params = {}
+        if not params.get("daily_trading_days_only", True):
+            return True
+        try:
+            from quanti.utils.market import is_trading_day
+            return is_trading_day(date.today(), self._provider)
+        except Exception:  # noqa: BLE001 - never block trading on a calendar error
+            return True
 
     def _next_wait_seconds(self) -> float:
         """Seconds to wait before the next cycle: until a fixed daily clock time
