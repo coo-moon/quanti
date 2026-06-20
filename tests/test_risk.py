@@ -185,6 +185,24 @@ def test_check_portfolio_stop():
     assert rm.check_portfolio_stop(50_000, 0) is False         # no peak yet
 
 
+def test_check_exits_stop_loss_reason_uses_prefix():
+    from quanti.models import Direction, Portfolio, Position
+    from quanti.risk.manager import (
+        RiskManager, RiskConfig, STOP_LOSS_REASON_PREFIX,
+    )
+    rm = RiskManager(RiskConfig(stop_loss_pct=-0.08,
+                                take_profit_activate_pct=0.15))
+    # A position down -10% → stop-loss exit.
+    pos = Position(stock_code="000001", quantity=1000, avg_cost=10.0,
+                   current_price=9.0)
+    pf = Portfolio(cash=0.0, positions={"000001": pos})
+    sells = rm.check_exits(pf)
+    assert sells and sells[0].reason.startswith(STOP_LOSS_REASON_PREFIX)
+    # Take-profit / strategy-exit reasons must NOT match the stop-loss prefix.
+    assert not "移动止盈".startswith(STOP_LOSS_REASON_PREFIX)
+    assert not "策略离场信号".startswith(STOP_LOSS_REASON_PREFIX)
+
+
 def test_daily_cap_auto_resets_on_new_calendar_day(monkeypatch):
     """Live/paper never call reset_daily(); the daily-trade cap must auto-roll
     when the calendar day changes, else it becomes a permanent lifetime lock

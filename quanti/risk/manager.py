@@ -7,6 +7,11 @@ from datetime import date
 
 from quanti.models import Direction, Portfolio, Signal
 
+STOP_LOSS_REASON_PREFIX = "止损"
+"""Single source of truth for the stop-loss exit reason prefix. `check_exits`
+emits it; protections identify stop-loss exits by it (plus strategy_name
+'risk_exit'). Changing the wording here keeps producer and consumer in sync."""
+
 
 @dataclass
 class RiskConfig:
@@ -151,7 +156,7 @@ class RiskManager:
             if pos.pnl_pct <= cfg.stop_loss_pct:
                 signals.append(Signal(
                     stock_code=code, direction=Direction.SELL, strength=1.0,
-                    reason=f"止损 {pos.pnl_pct:.1%} ≤ {cfg.stop_loss_pct:.1%}"))
+                    reason=f"{STOP_LOSS_REASON_PREFIX} {pos.pnl_pct:.1%} ≤ {cfg.stop_loss_pct:.1%}"))
                 continue
             # 2. Strategy-coherent exit — the owning strategy flipped to SELL.
             if cfg.strategy_exit_enabled and code in strategy_sell_codes:
