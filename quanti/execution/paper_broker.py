@@ -479,11 +479,12 @@ class PaperBroker:
             cash = state["cash"]
             price = ref_price * (1 + self._slippage)
 
-            max_position_pct = self._risk.config.max_position_pct
             total_value = cash + sum(
                 p["quantity"] * (p["current_price"] or p["avg_cost"])
                 for p in self._db.list_positions())
-            size_cap = total_value * max_position_pct
+            size_cap = self._risk.max_additional_buy_value(
+                self._build_runtime_portfolio(), signal.stock_code,
+                self._stock_industry(signal.stock_code))
             if self._sizer is not None:
                 recent = self._recent_bars(signal.stock_code)
                 target_w = self._sizer.target_weight(
@@ -612,8 +613,13 @@ class PaperBroker:
                 avg_cost=pos["avg_cost"],
                 current_price=pos["current_price"] or pos["avg_cost"],
                 buy_date=pos["buy_date"],
+                industry=self._stock_industry(pos["code"]),
             )
         return portfolio
+
+    def _stock_industry(self, code: str) -> str:
+        stock = self._db.get_stock(code)
+        return stock.industry if stock else ""
 
     def _record_order(self, signal: Signal, strategy_name: str, *,
                       status: str, reason: str = "",
@@ -646,11 +652,15 @@ class PaperBroker:
         cash = state["cash"]
         price = ref_price * (1 + self._slippage)
 
-        # Size: use signal.strength as % of cash to deploy, capped by single-stock risk.
+        # Size by deployable cash, capped by the hard risk limits. size_cap is
+        # the post-trade single-stock + industry + total cap (the real
+        # enforcement point); max_position_pct is kept for the reject reason.
         max_position_pct = self._risk.config.max_position_pct
         total_value = cash + sum(p["quantity"] * (p["current_price"] or p["avg_cost"])
                                  for p in self._db.list_positions())
-        size_cap = total_value * max_position_pct
+        size_cap = self._risk.max_additional_buy_value(
+            self._build_runtime_portfolio(), signal.stock_code,
+            self._stock_industry(signal.stock_code))
         if self._sizer is not None:
             # Sizer-driven path: convert target portfolio weight to a notional
             # cap. The single-stock RiskManager cap still applies on top so

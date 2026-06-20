@@ -78,6 +78,30 @@ class RiskManager:
 
         return True, ""
 
+    def max_additional_buy_value(self, portfolio: Portfolio, code: str,
+                                 industry: str = "") -> float:
+        """Largest 元 value addable to `code` without breaching the single-stock,
+        industry, or total-position caps — computed POST-trade (room up to the
+        ceiling, net of what's already held). 0.0 when any cap is already at its
+        limit. This is the real enforcement point for the hard caps; callers
+        size buys against it. Pass `industry=""` to skip the industry cap (e.g.
+        when industry data isn't available, as in the backtest)."""
+        total = portfolio.total_value
+        if total <= 0:
+            return 0.0
+        cfg = self.config
+        held = portfolio.positions.get(code)
+        stock_mv = held.market_value if held else 0.0
+        stock_room = total * cfg.max_position_pct - stock_mv
+        total_room = total * cfg.max_total_position_pct - portfolio.market_value
+        if industry:
+            ind_mv = sum(p.market_value for p in portfolio.positions.values()
+                         if p.industry == industry)
+            ind_room = total * cfg.max_industry_pct - ind_mv
+        else:
+            ind_room = float("inf")
+        return max(0.0, min(stock_room, ind_room, total_room))
+
     def check_stop_loss(self, portfolio: Portfolio) -> list[Signal]:
         """Check positions against stop-loss rules. Returns sell signals for positions to close."""
         signals = []

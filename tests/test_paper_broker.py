@@ -109,3 +109,37 @@ def test_paper_broker_satisfies_broker_protocol(setup):
     for m in ("execute_signal", "execute_signals", "try_fill_pending_orders",
               "check_exits", "snapshot_portfolio", "pending_orders_detail"):
         assert callable(getattr(broker, m)), f"missing {m}"
+
+
+def test_industry_cap_limits_same_industry_buy(tmp_path):
+    """A buy in a sector already near the 30% industry cap is limited by the
+    *industry* room, not the (looser) 10% single-stock cap — proving the
+    industry concentration limit is actually enforced at sizing."""
+    from quanti.risk.manager import RiskConfig
+
+    db = Database(str(tmp_path / "ind.db"))
+    db.initialize()
+    db.upsert_stock("000001", "平安银行", "SZ", date(1991, 4, 3), "银行")
+    db.upsert_stock("600000", "浦发银行", "SH", date(1999, 11, 10), "银行")
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=10)
+    for code in ("000001", "600000"):
+        px = np.full(len(dates), 10.0)
+        db.save_daily_quotes(pd.DataFrame({
+            "code": code, "date": [d.date() for d in dates],
+            "open": px, "high": px, "low": px, "close": px,
+            "volume": np.full(len(dates), 1e6), "amount": np.full(len(dates), 1e7),
+            "turnover": np.ones(len(dates))}))
+    provider = DataProvider(db)
+    broker = PaperBroker(db, provider, initial_cash=100_000, fill_mode="immediate",
+                         risk_config=RiskConfig(max_position_pct=0.10,
+                                                max_industry_pct=0.30))
+    # Seed 28% already in 银行 (2800 sh @ 10 = 28k; cash 72k → total 100k).
+    db.update_cash(72_000.0)
+    db.upsert_position("000001", 2800, 10.0, 10.0, date(2020, 1, 1))
+
+    # Buy another 银行 name: industry room = 30% - 28% = 2% (~2k), far under the
+    # 10% single-stock cap (~10k) — so the fill is industry-limited.
+    broker.execute_signal(Signal("600000", Direction.BUY, 1.0, "x"), "s")
+    pos = {p["code"]: p for p in db.list_positions()}
+    assert "600000" in pos
+    assert pos["600000"]["quantity"] * 10.0 <= 2_000 * 1.05  # industry-capped

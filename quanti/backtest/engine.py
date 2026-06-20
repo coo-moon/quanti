@@ -322,6 +322,13 @@ class BacktestEngine:
         price_est = bar.open * (1 + est_frac)
 
         max_spend = portfolio.cash * 0.95  # Keep 5% cash buffer
+        if self._risk is not None:
+            # Same hard caps as the live path (single-stock / industry / total),
+            # post-trade — otherwise the backtest over-concentrates vs live.
+            # Industry data isn't in the backtest provider, so industry is ""
+            # (single + total still bind).
+            max_spend = min(max_spend, self._risk.max_additional_buy_value(
+                portfolio, code, ""))
         commission_est = self._commission.calculate(price_est, 100, Direction.BUY)
         affordable = int(max_spend / (price_est * 100 + commission_est)) * 100
 

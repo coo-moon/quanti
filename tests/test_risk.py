@@ -145,6 +145,37 @@ class TestCheckExits:
         assert sells == []
 
 
+def test_max_additional_buy_value_enforces_all_caps():
+    rm = RiskManager(RiskConfig(max_position_pct=0.10, max_industry_pct=0.30,
+                                max_total_position_pct=0.80))
+    # Fresh buy, nothing held: single-stock cap binds → 10% of 100k.
+    pf = Portfolio(cash=100_000.0)
+    assert rm.max_additional_buy_value(pf, "000001", "银行") == pytest.approx(10_000.0)
+
+    # Same name already at 8% → only 2% single-stock room left.
+    pf_stock = Portfolio(cash=92_000.0, positions={
+        "000001": Position("000001", 800, 10.0, 10.0, industry="银行")})
+    assert pf_stock.total_value == pytest.approx(100_000.0)
+    assert rm.max_additional_buy_value(pf_stock, "000001", "银行") == pytest.approx(2_000.0)
+
+    # Industry cap binds: 25% already in 银行, candidate also 银行 → 30%-25% = 5%.
+    pf_ind = Portfolio(cash=75_000.0, positions={
+        "600000": Position("600000", 2500, 10.0, 10.0, industry="银行")})
+    assert rm.max_additional_buy_value(pf_ind, "000001", "银行") == pytest.approx(5_000.0)
+    # …but a candidate in a DIFFERENT industry isn't bound by 银行's exposure.
+    assert rm.max_additional_buy_value(pf_ind, "000002", "地产") == pytest.approx(10_000.0)
+
+    # Total cap binds: 78% invested → only 2% total room regardless of name.
+    pf_total = Portfolio(cash=22_000.0, positions={
+        "600000": Position("600000", 3900, 10.0, 10.0, industry="银行"),
+        "000002": Position("000002", 3900, 10.0, 10.0, industry="地产")})
+    assert pf_total.market_value == pytest.approx(78_000.0)
+    assert rm.max_additional_buy_value(pf_total, "300001", "科技") == pytest.approx(2_000.0)
+
+    # Already over a cap → 0 room.
+    assert rm.max_additional_buy_value(pf_total, "600000", "银行") == 0.0
+
+
 def test_daily_cap_auto_resets_on_new_calendar_day(monkeypatch):
     """Live/paper never call reset_daily(); the daily-trade cap must auto-roll
     when the calendar day changes, else it becomes a permanent lifetime lock

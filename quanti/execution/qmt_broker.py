@@ -92,9 +92,11 @@ class QmtBroker:
             avg = float(p.get("avg_price", 0.0))
             mv = float(p.get("market_value", avg * vol))
             cur = mv / vol if vol else avg
+            stock = self._db.get_stock(p["code"])
             pf.positions[p["code"]] = Position(
                 stock_code=p["code"], quantity=vol, avg_cost=avg,
-                current_price=cur, buy_date=None)
+                current_price=cur, buy_date=None,
+                industry=stock.industry if stock else "")
             sellable[p["code"]] = int(p.get("can_use_volume", 0))
         return pf, sellable
 
@@ -239,15 +241,13 @@ class QmtBroker:
         if price <= 0:
             return 0, 0.0
         cash = portfolio.cash
-        total = portfolio.total_value
-        cap = self._risk.config.max_position_pct
-        existing = portfolio.positions.get(signal.stock_code)
-        existing_mv = existing.market_value if existing else 0.0
-        # Per-stock cap is a *post-trade* ceiling: subtract what we already hold
-        # in this name so an add-on buy can't push the weight past the limit.
-        stock_room = max(0.0, total * cap - existing_mv)
+        stock = self._db.get_stock(signal.stock_code)
+        # Post-trade single-stock + industry + total caps, centralized in
+        # RiskManager so paper/live/backtest can't drift apart.
+        room = self._risk.max_additional_buy_value(
+            portfolio, signal.stock_code, stock.industry if stock else "")
         cash_cap = cash * 0.95 * max(min(signal.strength, 1.0), 0.1)
-        target_value = min(cash_cap, stock_room)
+        target_value = min(cash_cap, room)
         lots = int(target_value / (price * 100)) if price > 0 else 0
         return lots * 100, price * (1 + self._slippage)
 
