@@ -372,10 +372,12 @@ def _handle_tool_call(ctx: QuantiContext, name: str, args: dict[str, Any]) -> An
         start = (date.fromisoformat(args["start"])
                  if args.get("start") else end - timedelta(days=365))
         from quanti.risk.manager import RiskConfig, RiskManager
+        from quanti.risk.protections import ProtectionManager
         engine = BacktestEngine(
             provider=ctx.provider,
             initial_cash=float(args.get("initial_cash", 1_000_000)),
-            risk_manager=RiskManager(RiskConfig()))
+            risk_manager=RiskManager(RiskConfig()),
+            protection_manager=ProtectionManager())
         bt = engine.run(strat, args["codes"], start, end)
         return {
             "metrics": bt.metrics,

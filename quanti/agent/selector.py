@@ -34,6 +34,7 @@ from quanti.backtest.engine import BacktestEngine
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.risk.manager import RiskConfig, RiskManager
+from quanti.risk.protections import ProtectionManager
 from quanti.strategy.base import BaseStrategy
 from quanti.strategy.loader import StrategyLoader
 
@@ -118,7 +119,8 @@ class StrategySelector:
         # exits — a backtest/live mismatch that can mis-rank strategies.
         engine = BacktestEngine(provider=self._provider,
                                 initial_cash=self._initial_cash,
-                                risk_manager=RiskManager(RiskConfig()))
+                                risk_manager=RiskManager(RiskConfig()),
+                                protection_manager=ProtectionManager())
 
         results: list[StrategyEvaluation] = []
         # Cap universe so each Selector cycle stays bounded. Default raised

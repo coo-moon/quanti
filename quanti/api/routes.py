@@ -858,9 +858,11 @@ async def run_backtest(body: BacktestRequest, request: Request):
     # Apply the live exit policy by default so the UI backtest reflects how
     # the agent actually trades (stop-loss / trailing take-profit / caps).
     from quanti.risk.manager import RiskConfig, RiskManager
+    from quanti.risk.protections import ProtectionManager
     risk = RiskManager(RiskConfig()) if body.apply_risk else None
+    protections = ProtectionManager() if body.apply_risk else None
     engine = BacktestEngine(provider=provider, initial_cash=body.initial_cash,
-                            risk_manager=risk)
+                            risk_manager=risk, protection_manager=protections)
     result = engine.run(
         strategy=strategy,
         codes=body.codes,

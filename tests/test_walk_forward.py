@@ -241,3 +241,29 @@ class TestTopK:
         # All weights positive (we floor non-positive Sharpes at 0 but
         # softmax avoids exactly 0)
         assert all(w > 0 for _, w in pairs)
+
+
+def test_selector_engine_enables_protections(monkeypatch, seeded_long):
+    """The Selector's backtest engine must carry a ProtectionManager so its
+    strategy ranking matches how live trades execute (backtest≡live)."""
+    import quanti.agent.selector as sel
+
+    captured: dict = {}
+    real_engine = sel.BacktestEngine
+
+    def _spy(*args, **kwargs):
+        captured["protection_manager"] = kwargs.get("protection_manager")
+        return real_engine(*args, **kwargs)
+
+    monkeypatch.setattr(sel, "BacktestEngine", _spy)
+
+    provider = DataProvider(seeded_long)
+    selector = StrategySelector(seeded_long, provider,
+                                strategies_dir="strategies",
+                                training_days=200)
+    goal = Goal(params={"wf_enabled": False})
+    selector.evaluate(goal, codes=["000001"])
+
+    assert captured.get("protection_manager") is not None, (
+        "Selector must pass protection_manager=ProtectionManager() to BacktestEngine"
+    )
