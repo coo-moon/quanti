@@ -12,19 +12,22 @@ its own process: this bridge runs on the QMT-bundled Python, ``import``s
         │  xtquant (xttrader / xtdata)
     qmt_bridge.py  ──HTTP──>  quanti (QmtBroker, XtdataAdapter)
 
-Self-contained on purpose: **stdlib only**, no quanti imports, no third-party
-web framework — so it drops onto whatever interpreter ``xtquant`` requires.
+The HTTP layer is **stdlib only**; the live backend (see ``vnpy_backend.py``) is
+what touches the venue. quanti is never imported here, so the bridge drops onto
+whatever interpreter the QMT stack requires.
 
-Mock mode
----------
-If ``xtquant`` can't be imported (i.e. anywhere that isn't the QMT box), the
-gateway runs in **mock mode**: it serves deterministic synthetic asset /
-positions / orders / k-line so the whole quanti↔bridge chain is runnable and
-testable end-to-end before the real Windows/QMT environment exists. The HTTP
-contract is identical in both modes; only the data source differs.
+Two backends, one HTTP contract
+-------------------------------
+* **vnpy backend** (``VnpyBackend``) — when ``vnpy`` + a QMT gateway (``vnpy_xt``)
+  are installed (the Windows/QMT box). Drives vnpy's mature gateway headless and
+  translates its events into the contract below. (Option B of the live-trading
+  roadmap: don't hand-roll the xtquant order/fill/reconnect glue — reuse vnpy's.)
+* **mock backend** — anywhere else: deterministic synthetic asset / positions /
+  orders / k-line so the whole quanti↔bridge chain is runnable and testable
+  before the real QMT environment exists.
 
-The real-QMT code paths are marked ``# TODO(qmt):`` with the intended xtquant
-call — fill them in on the QMT box (phase ② onward), the contract won't change.
+The HTTP contract is identical in both modes; only the backend differs. Bits of
+the vnpy backend that depend on the exact gateway build are marked ``# VERIFY``.
 
 Run:  python bridge/qmt_bridge.py --host 127.0.0.1 --port 18099
 """
@@ -51,6 +54,24 @@ try:  # pragma: no cover - depends on the QMT environment
 except Exception:  # noqa: BLE001 - any import failure means "not on QMT box"
     XTQUANT_AVAILABLE = False
 
+# Live backend = vnpy's QMT gateway (Option B). Importing VnpyBackend never
+# fails — it guards its own vnpy import — so this works in mock mode too.
+try:
+    from bridge.vnpy_backend import VnpyBackend
+except ImportError:  # when run as a script from inside bridge/
+    from vnpy_backend import VnpyBackend
+
+
+def _connect_setting_from_env() -> dict:  # pragma: no cover - QMT box only
+    """vnpy gateway connect dict, built from env vars. VERIFY the exact keys
+    against the installed vnpy_xt gateway's `default_setting`."""
+    import os
+    return {
+        "账号": os.environ.get("QMT_ACCOUNT", ""),
+        "miniQMT路径": os.environ.get("QMT_USERDATA_MINI", ""),
+        "session_id": os.environ.get("QMT_SESSION_ID", "0"),
+    }
+
 
 def _today() -> date:
     return datetime.now().date()
@@ -64,9 +85,15 @@ class QmtGateway:
     tests can call these directly without a socket.
     """
 
-    def __init__(self) -> None:
-        self.mock = not XTQUANT_AVAILABLE
-        self.trader_connected = False
+    def __init__(self, backend: "VnpyBackend | None" = None) -> None:
+        # Live backend = vnpy QMT gateway when available (or an injected fake in
+        # tests). Absent → mock mode. The mock state below is always set so the
+        # synthetic engine is usable for dev/tests regardless of mode.
+        if backend is None and VnpyBackend.available():  # pragma: no cover - QMT box
+            backend = VnpyBackend(_connect_setting_from_env())
+            backend.start()
+        self._backend = backend
+        self.mock = backend is None
         # --- mock state (only used in mock mode) ---
         self._mock_cash = 1_000_000.0
         self._mock_positions: dict[str, dict] = {}
@@ -76,18 +103,16 @@ class QmtGateway:
         # When False, mock orders rest as "accepted" instead of filling at
         # submit — lets tests exercise the cancel / pending-reconcile paths.
         self._mock_autofill = True
-        if not self.mock:  # pragma: no cover - QMT box only
-            # TODO(qmt): construct XtQuantTrader(userdata_mini_path, session_id),
-            #   start(), connect(), subscribe(account); set trader_connected.
-            pass
 
     # ------------------------------------------------------------ health
     def health(self) -> dict:
         return {
             "ok": True,
             "xtquant": XTQUANT_AVAILABLE,
-            "trader_connected": self.trader_connected,
-            "mode": "mock" if self.mock else "live",
+            "vnpy": VnpyBackend.available(),
+            "trader_connected": bool(
+                self._backend and getattr(self._backend, "connected", False)),
+            "mode": "mock" if self.mock else "vnpy",
             "version": BRIDGE_VERSION,
         }
 
@@ -99,8 +124,7 @@ class QmtGateway:
             return {"cash": round(self._mock_cash, 2), "frozen_cash": 0.0,
                     "market_value": round(mv, 2),
                     "total_asset": round(self._mock_cash + mv, 2)}
-        # TODO(qmt): asset = trader.query_stock_asset(account); map fields.
-        raise NotImplementedError("live asset query not wired yet")
+        return self._backend.asset()
 
     def positions(self) -> dict:
         if self.mock:
@@ -110,8 +134,7 @@ class QmtGateway:
                  "market_value": round(p["volume"] * p["avg_price"], 2)}
                 for code, p in self._mock_positions.items() if p["volume"] > 0
             ]}
-        # TODO(qmt): positions = trader.query_stock_positions(account); map.
-        raise NotImplementedError("live positions query not wired yet")
+        return self._backend.positions()
 
     def submit_order(self, body: dict) -> dict:
         code = str(body.get("code", ""))
@@ -125,11 +148,7 @@ class QmtGateway:
             if self._mock_autofill:
                 return self._mock_fill(code, direction, volume, price)
             return self._mock_accept(code, direction, volume, price)
-        # TODO(qmt): order_id = trader.order_stock(account, code,
-        #   xtconstant.STOCK_BUY/SELL, volume, price_type, price); the actual
-        #   fill arrives asynchronously via XtQuantTraderCallback.on_stock_trade
-        #   — accumulate those and expose them through orders()/trades().
-        raise NotImplementedError("live order submit not wired yet")
+        return self._backend.submit_order(body)
 
     def cancel(self, body: dict) -> dict:
         order_id = str(body.get("order_id", ""))
@@ -140,20 +159,17 @@ class QmtGateway:
                     o["status"] = "cancelled"
                     return {"ok": True, "msg": "cancelled"}
             return {"ok": False, "msg": "order not cancellable (unknown/filled)"}
-        # TODO(qmt): trader.cancel_order_stock(account, order_id-or-sysid).
-        raise NotImplementedError("live cancel not wired yet")
+        return self._backend.cancel(body)
 
     def orders(self) -> dict:
         if self.mock:
             return {"orders": list(self._mock_orders)}
-        # TODO(qmt): trader.query_stock_orders(account); map to contract.
-        raise NotImplementedError("live orders query not wired yet")
+        return self._backend.orders()
 
     def trades(self) -> dict:
         if self.mock:
             return {"trades": list(self._mock_trades)}
-        # TODO(qmt): trader.query_stock_trades(account); map to contract.
-        raise NotImplementedError("live trades query not wired yet")
+        return self._backend.trades()
 
     # ------------------------------------------------------------ data
     def kline(self, code: str, start: str, end: str, period: str) -> dict:
@@ -162,16 +178,12 @@ class QmtGateway:
         if self.mock:
             return {"code": code, "period": period,
                     "bars": _mock_bars(code, start, end)}
-        # TODO(qmt): xtdata.download_history_data(code, period, start, end) then
-        #   xtdata.get_market_data_ex([], [code], period=period, ...); reshape
-        #   the per-field frames into the flat bar list below.
-        raise NotImplementedError("live kline not wired yet")
+        return self._backend.kline(code, start, end, period)
 
     def stock_list(self) -> dict:
         if self.mock:
             return {"stocks": _MOCK_STOCKS}
-        # TODO(qmt): xtdata.get_stock_list_in_sector('沪深A股'); split market.
-        raise NotImplementedError("live stock_list not wired yet")
+        return self._backend.stock_list()
 
     def quote(self, code: str) -> dict:
         if self.mock:
@@ -179,8 +191,7 @@ class QmtGateway:
             return {"code": code, "last": last, "open": last, "high": last,
                     "low": last, "time": datetime.now().isoformat(),
                     "bid": last, "ask": last}
-        # TODO(qmt): xtdata.get_full_tick([code]); map lastPrice/bid/ask.
-        raise NotImplementedError("live quote not wired yet")
+        return self._backend.quote(code)
 
     # ------------------------------------------------- mock fill engine
     def _mock_fill(self, code: str, direction: str, volume: int,
