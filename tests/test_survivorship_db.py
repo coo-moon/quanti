@@ -77,3 +77,21 @@ def test_get_pool_stocks_carries_delist_date(db):
     pooled = db.get_pool_stocks("p1")
     assert len(pooled) == 1
     assert pooled[0].delist_date == date(2019, 1, 1)
+
+
+def test_point_in_time_universe(db):
+    # listed before window, never delisted → included
+    db.upsert_stock("000001", "在市", "SZ", date(2010, 1, 1), "")
+    # delisted mid-window → included (it traded during the window)
+    db.upsert_stock("600001", "中途退市", "SH", date(2005, 1, 1), "",
+                    delist_date=date(2022, 6, 1))
+    # delisted BEFORE window start → excluded
+    db.upsert_stock("600002", "早已退市", "SH", date(2000, 1, 1), "",
+                    delist_date=date(2019, 1, 1))
+    # listed AFTER window end → excluded
+    db.upsert_stock("301001", "窗后上市", "SZ", date(2023, 1, 1), "")
+    # listed mid-window, still listed → included (existed for part of window)
+    db.upsert_stock("000002", "窗中上市", "SZ", date(2021, 6, 1), "")
+
+    universe = db.point_in_time_universe(date(2021, 1, 1), date(2022, 12, 31))
+    assert universe == ["000001", "000002", "600001"]

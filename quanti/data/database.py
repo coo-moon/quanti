@@ -486,6 +486,26 @@ class Database:
             for r in rows
         ]
 
+    def point_in_time_universe(self, start: date, end: date) -> list[str]:
+        """Codes that were alive at some point within [start, end] — the
+        survivorship-bias-free backtest universe.
+
+        A stock qualifies if it had listed on/before the window end AND had not
+        yet delisted at the window start (delist_date NULL = still listed).
+        list_date/delist_date are stored as ISO YYYY-MM-DD, so lexicographic
+        string comparison equals date comparison.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT code FROM stocks
+            WHERE list_date <= ?
+              AND (delist_date IS NULL OR delist_date >= ?)
+            ORDER BY code
+            """,
+            (end.isoformat(), start.isoformat()),
+        ).fetchall()
+        return [r[0] for r in rows]
+
     # --- Daily quote operations ---
 
     def save_daily_quotes(self, df: pd.DataFrame) -> int:
