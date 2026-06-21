@@ -316,6 +316,7 @@ export const manualOrder = (data: { code: string; direction: "buy" | "sell"; str
 
 export const agentStart = () => api.post<{ status: string }>("/agent/start");
 export const agentStop = () => api.post<{ status: string }>("/agent/stop");
+export const agentRestart = () => api.post<{ status: string }>("/agent/restart");
 export const agentTick = () => api.post<Record<string, unknown>>("/agent/tick");
 export const fetchAgentStatus = () => api.get<AgentStatus>("/agent/status");
 export const fetchAgentDecisions = (limit = 50, kind?: string) =>

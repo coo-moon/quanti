@@ -504,6 +504,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import {
   agentStart,
   agentStop,
+  agentRestart,
   agentTick,
   fetchAgentDecisions,
   fetchAgentStatus,
@@ -567,6 +568,11 @@ const advParams = reactive({
   llm_debate_rounds: 1,
   llm_risk_debate: false,
   llm_reflection: false,
+  // 每日定时调度（cron-lite）：开启后每天在 daily_run_time 跑一次，
+  // 否则按 tick_interval_sec 间隔跑。daily_schedule_enabled 仅 UI 本地状态。
+  daily_schedule_enabled: false,
+  daily_run_time: "09:35",
+  daily_trading_days_only: true,
 });
 
 function syncAdvFromParams() {
@@ -587,12 +593,16 @@ function syncAdvFromParams() {
     typeof p.llm_debate_rounds === "number" ? p.llm_debate_rounds : 1;
   advParams.llm_risk_debate = !!p.llm_risk_debate;
   advParams.llm_reflection = !!p.llm_reflection;
+  const drt = typeof p.daily_run_time === "string" ? p.daily_run_time : "";
+  advParams.daily_schedule_enabled = drt !== "";
+  if (drt) advParams.daily_run_time = drt;
+  advParams.daily_trading_days_only = p.daily_trading_days_only !== false;
 }
 
 function syncParamsFromAdv() {
   // Preserve any unknown keys the user may have set via API/MCP.
   const existing = (goalDraft.params || {}) as Record<string, unknown>;
-  goalDraft.params = {
+  const params: Record<string, unknown> = {
     ...existing,
     agent_mode: advParams.agent_mode === "llm" ? "llm" : "",
     ensemble_enabled:
@@ -610,6 +620,14 @@ function syncParamsFromAdv() {
     llm_risk_debate: advParams.llm_risk_debate,
     llm_reflection: advParams.llm_reflection,
   };
+  if (advParams.daily_schedule_enabled && advParams.daily_run_time) {
+    params.daily_run_time = advParams.daily_run_time;
+    params.daily_trading_days_only = advParams.daily_trading_days_only;
+  } else {
+    delete params.daily_run_time;
+    delete params.daily_trading_days_only;
+  }
+  goalDraft.params = params;
 }
 
 function applyPreset(mode: AgentMode) {
