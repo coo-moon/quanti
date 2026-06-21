@@ -1,0 +1,112 @@
+"""Declarative, look-ahead-proof factor expression DSL.
+
+Factors are built from composable Expr nodes evaluated over a single stock's
+bars: `Expr.evaluate(ctx) -> pd.Series` (one value per bar date). Every
+primitive only ever looks BACKWARD (Ref = shift(n>=0), rolling windows end at
+the current row), so a factor value at date t depends only on data <= t —
+look-ahead is structurally impossible (there is no future-referencing node).
+
+See docs/superpowers/specs/2026-06-21-factor-pipeline-design.md.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+import numpy as np
+import pandas as pd
+
+_FIELDS = ("open", "high", "low", "close", "volume", "turnover")
+
+
+class EvalContext:
+    """Holds one stock's bars. Sorts ascending by `date` (and indexes by it
+    when present) so evaluated Series are date-aligned; missing columns yield
+    all-NaN. The framework only ever passes data <= as_of."""
+
+    def __init__(self, bars: pd.DataFrame) -> None:
+        df = bars
+        if "date" in df.columns:
+            df = df.sort_values("date").set_index("date")
+        self._df = df
+
+    def field(self, name: str) -> pd.Series:
+        if name not in self._df.columns:
+            return pd.Series(np.nan, index=self._df.index, dtype=float)
+        return self._df[name].astype(float)
+
+    @property
+    def index(self) -> pd.Index:
+        return self._df.index
+
+
+def _to_expr(x) -> "Expr":
+    return x if isinstance(x, Expr) else Constant(float(x))
+
+
+class Expr(ABC):
+    @abstractmethod
+    def evaluate(self, ctx: EvalContext) -> pd.Series: ...
+
+    def __add__(self, o): return BinaryOp("+", self, _to_expr(o))
+    def __radd__(self, o): return BinaryOp("+", _to_expr(o), self)
+    def __sub__(self, o): return BinaryOp("-", self, _to_expr(o))
+    def __rsub__(self, o): return BinaryOp("-", _to_expr(o), self)
+    def __mul__(self, o): return BinaryOp("*", self, _to_expr(o))
+    def __rmul__(self, o): return BinaryOp("*", _to_expr(o), self)
+    def __truediv__(self, o): return BinaryOp("/", self, _to_expr(o))
+    def __rtruediv__(self, o): return BinaryOp("/", _to_expr(o), self)
+    def __neg__(self): return UnaryOp("neg", self)
+
+
+class Constant(Expr):
+    def __init__(self, value: float) -> None:
+        self.value = float(value)
+
+    def evaluate(self, ctx: EvalContext) -> pd.Series:
+        return pd.Series(self.value, index=ctx.index, dtype=float)
+
+
+class Field(Expr):
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def evaluate(self, ctx: EvalContext) -> pd.Series:
+        return ctx.field(self.name)
+
+
+def Close() -> Field: return Field("close")
+def Open() -> Field: return Field("open")
+def High() -> Field: return Field("high")
+def Low() -> Field: return Field("low")
+def Volume() -> Field: return Field("volume")
+def Turnover() -> Field: return Field("turnover")
+
+
+class BinaryOp(Expr):
+    def __init__(self, op: str, left: Expr, right: Expr) -> None:
+        self.op, self.left, self.right = op, left, right
+
+    def evaluate(self, ctx: EvalContext) -> pd.Series:
+        a = self.left.evaluate(ctx)
+        b = self.right.evaluate(ctx)
+        if self.op == "+":
+            return a + b
+        if self.op == "-":
+            return a - b
+        if self.op == "*":
+            return a * b
+        if self.op == "/":
+            return a / b.replace(0, np.nan)
+        raise ValueError(f"unknown binary op {self.op!r}")
+
+
+class UnaryOp(Expr):
+    def __init__(self, op: str, operand: Expr) -> None:
+        self.op, self.operand = op, operand
+
+    def evaluate(self, ctx: EvalContext) -> pd.Series:
+        v = self.operand.evaluate(ctx)
+        if self.op == "neg":
+            return -v
+        raise ValueError(f"unknown unary op {self.op!r}")
