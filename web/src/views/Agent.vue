@@ -42,6 +42,7 @@
         <div class="stat-info">
           <span class="stat-label">运行模式</span>
           <span class="stat-value stat-value-sm">{{ modeLabel }}</span>
+          <span v-if="scheduleSubStr" class="stat-sub">{{ scheduleSubStr }}</span>
         </div>
       </div>
       <div class="stat-card" :class="pendingCardClass" v-if="(agent?.pending_orders ?? 0) > 0">
@@ -869,9 +870,32 @@ const uptimeStr = computed(() => {
 const lastTickStr = computed(() => _hhmm(agent.value?.last_tick_at ?? null));
 const nextTickStr = computed(() => {
   const a = agent.value;
-  if (!a || !a.running || !a.last_tick_at || !a.tick_interval_sec) return "—";
+  if (!a || !a.running) return "—";
+  // 每日定时模式：显示下一个 daily_run_time 时刻。
+  if (advParams.daily_schedule_enabled && advParams.daily_run_time) {
+    const parts = advParams.daily_run_time.split(":").map(Number);
+    const h = parts[0];
+    const m = parts[1];
+    if (h !== undefined && m !== undefined && !Number.isNaN(h) && !Number.isNaN(m)) {
+      const now = new Date(nowTs.value);
+      const next = new Date(now);
+      next.setHours(h, m, 0, 0);
+      if (next <= now) next.setDate(next.getDate() + 1);
+      const sameDay = next.getDate() === now.getDate();
+      const hh = String(next.getHours()).padStart(2, "0");
+      const mm = String(next.getMinutes()).padStart(2, "0");
+      return `${hh}:${mm}${sameDay ? "" : "(明天)"}`;
+    }
+  }
+  // 间隔模式（原逻辑不变）。
+  if (!a.last_tick_at || !a.tick_interval_sec) return "—";
   const next = new Date(Date.parse(a.last_tick_at) + a.tick_interval_sec * 1000);
   return `${String(next.getHours()).padStart(2, "0")}:${String(next.getMinutes()).padStart(2, "0")}`;
+});
+const scheduleSubStr = computed(() => {
+  if (!advParams.daily_schedule_enabled || !advParams.daily_run_time) return "";
+  const days = advParams.daily_trading_days_only ? "仅交易日" : "含周末";
+  return `每日 ${advParams.daily_run_time} · ${days}`;
 });
 
 // Lookup table: stable name → display label. Built reactively from the
