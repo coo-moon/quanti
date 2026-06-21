@@ -29,6 +29,8 @@ class BacktestRequest(BaseModel):
     initial_cash: float = 1_000_000.0
     params: dict = {}
     apply_risk: bool = True  # apply live exit policy (stop-loss/TP/caps)
+    survivorship_free: bool = False  # backtest the point-in-time universe instead of `codes`
+    max_universe: int = 300          # cap on the survivorship-free universe size
 
 
 class TradeResponse(BaseModel):
@@ -899,22 +901,29 @@ async def run_backtest(body: BacktestRequest, request: Request):
     db = request.app.state.db
     provider = request.app.state.provider
 
-    # Auto-sync: if any stock has no data, fetch it automatically
     try:
         start_d = date.fromisoformat(body.start)
         end_d = date.fromisoformat(body.end)
     except ValueError as e:
         raise HTTPException(status_code=422,
                             detail=f"invalid date (use YYYY-MM-DD): {e}")
-    for code in body.codes:
-        bars = provider.get_daily_bars(code, start_d, end_d)
-        if len(bars) == 0:
-            logger.info(f"No data for {code}, auto-syncing...")
-            try:
-                adapter = AkShareAdapter(db)
-                adapter.sync_daily_quotes(code, start=start_d, end=end_d, repair_gaps=False)
-            except Exception as e:
-                logger.warning(f"Auto-sync failed for {code}: {e}")
+    if body.survivorship_free:
+        codes = db.point_in_time_universe(start_d, end_d)[:body.max_universe]
+        logger.info(f"Survivorship-free universe: {len(codes)} stocks "
+                    f"(cap {body.max_universe})")
+    else:
+        codes = body.codes
+        # Auto-sync: if any stock has no data, fetch it automatically
+        for code in codes:
+            bars = provider.get_daily_bars(code, start_d, end_d)
+            if len(bars) == 0:
+                logger.info(f"No data for {code}, auto-syncing...")
+                try:
+                    adapter = AkShareAdapter(db)
+                    adapter.sync_daily_quotes(code, start=start_d, end=end_d,
+                                              repair_gaps=False)
+                except Exception as e:
+                    logger.warning(f"Auto-sync failed for {code}: {e}")
 
     # Find strategy by name via the dynamic loader. The user can plug a
     # strategy at any path via app.state.strategies_dir, so we no longer
@@ -943,7 +952,7 @@ async def run_backtest(body: BacktestRequest, request: Request):
                             risk_manager=risk, protection_manager=protections)
     result = engine.run(
         strategy=strategy,
-        codes=body.codes,
+        codes=codes,
         start=date.fromisoformat(body.start),
         end=date.fromisoformat(body.end),
     )

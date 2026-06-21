@@ -99,7 +99,22 @@ def cmd_backtest(args):
         sys.exit(1)
 
     strategy.init({})
-    codes = args.codes.split(",")
+    if getattr(args, "survivorship_free", False):
+        start_d = date.fromisoformat(args.start)
+        end_d = date.fromisoformat(args.end)
+        all_codes = db.point_in_time_universe(start_d, end_d)
+        max_u = getattr(args, "max_universe", 300)
+        codes = all_codes[:max_u]
+        logger.info(
+            f"Survivorship-free universe: {len(all_codes)} stocks in window, "
+            f"using {len(codes)} (cap {max_u})")
+        if len(all_codes) > len(codes):
+            logger.info(f"  dropped {len(all_codes) - len(codes)} over cap")
+    else:
+        if not args.codes:
+            logger.error("--codes is required unless --survivorship-free is set")
+            sys.exit(1)
+        codes = args.codes.split(",")
 
     from quanti.risk.manager import RiskConfig, RiskManager
     from quanti.risk.protections import ProtectionManager
@@ -342,10 +357,17 @@ def main():
     # backtest
     bt_parser = subparsers.add_parser("backtest", help="Run backtest")
     bt_parser.add_argument("--strategy", required=True)
-    bt_parser.add_argument("--codes", required=True)
+    bt_parser.add_argument("--codes", required=False, default=None)
     bt_parser.add_argument("--start", required=True)
     bt_parser.add_argument("--end", required=True)
     bt_parser.add_argument("--cash", type=float, default=1_000_000)
+    bt_parser.add_argument("--survivorship-free", action="store_true",
+                           dest="survivorship_free",
+                           help="Backtest over the point-in-time universe "
+                                "(incl. delisted) instead of --codes")
+    bt_parser.add_argument("--max-universe", type=int, default=300,
+                           dest="max_universe",
+                           help="Cap on survivorship-free universe size")
 
     # optimize
     opt_parser = subparsers.add_parser("optimize", help="走查式参数寻优(hyperopt)")
