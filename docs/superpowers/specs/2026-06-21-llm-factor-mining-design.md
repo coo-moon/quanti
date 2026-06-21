@@ -77,7 +77,11 @@ DB 方法：`save_generated_factor(...)`（upsert）、`list_generated_factors()
 
 - **CLI** `quanti mine-factors [--universe POOL] [--n N] [--end DATE]`：同步跑 `mine_factors`、落库、打印结果表。
 - **异步 API job**：`POST /agent/mine-factors/async`、`GET /agent/mine-factors/status`，复用现有 `sync_jobs` + executor 模式（同 ⑤ optimize job）；`GET /factors/generated` 返回 `list_generated_factors`；`POST /factors/generated/{name}/enabled` 切开关。
-- **前端**（`web/src/views/Agent.vue`）新增「**因子挖掘**」卡：运行按钮（异步 + 进度轮询）+ **因子库表**（name｜表达式｜train IC｜OOS IC｜采纳｜启用开关）。`client.ts` 加对应类型与调用。
+- **前端**（`web/src/views/Agent.vue`）新增「**因子挖掘**」卡：
+  - **运行按钮**（异步 + 进度轮询）。
+  - **实盘总开关「本账户实盘启用生成因子」**（醒目、默认关、带风险说明文案）——绑定 `goal.params.use_generated_factors`，经现有 `updateGoal` 或专用端点写回。这是"LLM 因子是否影响该账户真金白银"的总闸，必须 UI 可见可切。
+  - **因子库表**（name｜表达式｜train IC｜OOS IC｜采纳｜**每因子启用开关**｜**生效中?**）。"生效中" = `accepted ∧ enabled ∧ 总开关开`，让你一眼看出此刻哪些因子真在影响排名。
+  `client.ts` 加对应类型与调用（含读写总开关 + 每因子开关）。
 
 ## 7. 安全 / 防过拟合
 
