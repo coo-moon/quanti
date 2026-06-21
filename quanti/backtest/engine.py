@@ -22,7 +22,8 @@ from quanti.backtest.metrics import compute_metrics
 from quanti.backtest.slippage import SlippageModel, VolumeImpactSlippage, coerce
 from quanti.data.provider import DataProvider
 from quanti.models import BarData, Direction, Portfolio, Position, Signal
-from quanti.risk.manager import RiskManager
+from quanti.risk.manager import RiskManager, STOP_LOSS_REASON_PREFIX
+from quanti.risk.protections import ProtectionContext, ProtectionManager
 from quanti.strategy.base import BaseStrategy
 
 # A signal waits at most this many trading bars for a fillable (tradable, has a
@@ -94,6 +95,7 @@ class BacktestEngine:
         commission: AShareCommission | None = None,
         slippage: SlippageModel | float | None = None,
         risk_manager: RiskManager | None = None,
+        protection_manager: ProtectionManager | None = None,
     ):
         """Args:
             slippage: A `SlippageModel` (FlatSlippage / VolumeImpactSlippage),
@@ -111,6 +113,7 @@ class BacktestEngine:
         else:
             self._slippage = coerce(slippage)
         self._risk = risk_manager
+        self._protections = protection_manager
         # ADV20 cache (per-run); populated at the top of run().
         self._adv20: dict[str, dict[date, float]] = {}
 
@@ -143,6 +146,12 @@ class BacktestEngine:
                 all_dates.add(bar.date)
 
         sorted_dates = sorted(all_dates)
+
+        def _bt_td(a: date, b: date) -> int:
+            """Trading-day distance over (a, b] on the backtest's own calendar."""
+            if a >= b:
+                return 0
+            return sum(1 for d in sorted_dates if a < d <= b)
 
         # Precompute rolling 20-bar ADV (average daily turnover, in 元) per
         # (code, date) for the slippage model, and the prior close per
@@ -188,6 +197,26 @@ class BacktestEngine:
                 if code not in portfolio.positions:
                     peaks.pop(code, None)
 
+            # Per-day protection lock (global; only blocks new BUYs). Same pure
+            # ProtectionManager as live, fed from in-memory facts bounded to the
+            # fact window so the scan stays cheap on long backtests.
+            buy_locked = False
+            if self._protections is not None and self._protections.config.enabled:
+                cfg = self._protections.config
+                sg_span = cfg.sg_lock_days + cfg.sg_lookback_days
+                md_span = cfg.md_lock_days + cfg.md_lookback_days
+                sl_dates = [t.date for t in trades
+                            if t.strategy == "risk_exit"
+                            and t.reason.startswith(STOP_LOSS_REASON_PREFIX)
+                            and _bt_td(t.date, current_date) <= sg_span]
+                eq = sorted(equity_values.items())[-md_span:]
+                eq.append((current_date, portfolio.total_value))
+                ctx = ProtectionContext(
+                    today=current_date, stop_loss_exit_dates=sl_dates,
+                    equity_series=eq, trading_days_between=_bt_td)
+                allowed, _reason = self._protections.check_entry(ctx)
+                buy_locked = not allowed
+
             # 3) Generate today's signals → queue for next-open fill.
             pending_keys = {(p["signal"].stock_code, p["signal"].direction)
                             for p in pending}
@@ -212,6 +241,9 @@ class BacktestEngine:
                 for signal in strategy.on_bar(bar):
                     if signal.stock_code not in today_bars:
                         continue  # no price data for the target stock
+                    if signal.direction == Direction.BUY and buy_locked:
+                        skipped_signals += 1
+                        continue
                     if self._risk is not None:
                         ok, _ = self._risk.check(signal, portfolio)
                         if not ok:

@@ -896,6 +896,30 @@ class Database:
             for r in rows
         ]
 
+    def stop_loss_exit_dates(self, since: date) -> list[date]:
+        """Fill dates of stop-loss exits since `since`, for StoplossGuard.
+
+        A stop-loss exit is a FILLED SELL order tagged strategy_name
+        'risk_exit' whose reason starts with STOP_LOSS_REASON_PREFIX — the
+        double match excludes take-profit / strategy exits that share the
+        'risk_exit' tag. `since` is a generous calendar lower bound; the pure
+        protection logic filters precisely by trading days."""
+        from quanti.risk.manager import STOP_LOSS_REASON_PREFIX
+        rows = self.conn.execute(
+            "SELECT filled_at FROM orders "
+            "WHERE direction='sell' AND status='filled' "
+            "AND strategy_name='risk_exit' AND reason LIKE ? "
+            "AND filled_at IS NOT NULL AND filled_at >= ?",
+            (STOP_LOSS_REASON_PREFIX + "%", since.isoformat()),
+        ).fetchall()
+        out: list[date] = []
+        for r in rows:
+            try:
+                out.append(datetime.fromisoformat(r[0]).date())
+            except (ValueError, TypeError):
+                continue
+        return out
+
     def update_order_status(self, order_id: str, status: str,
                             reason: str | None = None) -> None:
         """Set an order's status (and optionally append a reason).

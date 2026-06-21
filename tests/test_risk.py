@@ -185,6 +185,44 @@ def test_check_portfolio_stop():
     assert rm.check_portfolio_stop(50_000, 0) is False         # no peak yet
 
 
+def test_check_exits_stop_loss_reason_uses_prefix():
+    """Stop-loss exits use the prefix; take-profit and strategy-exit do NOT."""
+    from quanti.models import Portfolio, Position
+    from quanti.risk.manager import (
+        RiskManager, RiskConfig, STOP_LOSS_REASON_PREFIX,
+    )
+    cfg = RiskConfig(stop_loss_pct=-0.08, take_profit_activate_pct=0.15,
+                     take_profit_trail_pct=0.10)
+    rm = RiskManager(cfg)
+
+    # 1. Stop-loss: position down -10% → emitted reason STARTS WITH prefix.
+    pf_sl = Portfolio(cash=0.0, positions={
+        "000001": Position(stock_code="000001", quantity=1000,
+                           avg_cost=10.0, current_price=9.0)})
+    sells_sl = rm.check_exits(pf_sl)
+    assert sells_sl and sells_sl[0].reason.startswith(STOP_LOSS_REASON_PREFIX)
+
+    # 2. Trailing take-profit: up +18%, peak 13.0, now 11.6 → -10.8% retrace.
+    #    Emitted reason must be non-empty and must NOT start with stop-loss prefix.
+    pf_tp = Portfolio(cash=0.0, positions={
+        "000002": Position(stock_code="000002", quantity=1000,
+                           avg_cost=10.0, current_price=11.6)})
+    sells_tp = rm.check_exits(pf_tp, peaks={"000002": 13.0})
+    assert sells_tp, "expected trailing take-profit exit"
+    assert sells_tp[0].reason  # non-empty
+    assert not sells_tp[0].reason.startswith(STOP_LOSS_REASON_PREFIX)
+
+    # 3. Strategy-exit: no loss, no TP threshold, but strategy says SELL.
+    #    Emitted reason must be non-empty and must NOT start with stop-loss prefix.
+    pf_se = Portfolio(cash=0.0, positions={
+        "000003": Position(stock_code="000003", quantity=1000,
+                           avg_cost=10.0, current_price=10.2)})
+    sells_se = rm.check_exits(pf_se, strategy_sell_codes={"000003"})
+    assert sells_se, "expected strategy-exit"
+    assert sells_se[0].reason  # non-empty
+    assert not sells_se[0].reason.startswith(STOP_LOSS_REASON_PREFIX)
+
+
 def test_daily_cap_auto_resets_on_new_calendar_day(monkeypatch):
     """Live/paper never call reset_daily(); the daily-trade cap must auto-roll
     when the calendar day changes, else it becomes a permanent lifetime lock

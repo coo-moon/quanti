@@ -23,7 +23,10 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import date, datetime, timedelta
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from quanti.risk.protections import ProtectionConfig
 
 from quanti.backtest.commission import AShareCommission
 from quanti.data.database import Database
@@ -57,6 +60,7 @@ class PaperBroker:
         commission: AShareCommission | None = None,
         slippage: float = 0.001,
         risk_config: RiskConfig | None = None,
+        protection_config: ProtectionConfig | None = None,
         sizer: Sizer | None = None,
         fill_mode: Literal["pending", "immediate"] = "immediate",
         pending_ttl_trading_days: int = 3,
@@ -64,6 +68,8 @@ class PaperBroker:
         strategies_dir: str = "strategies",
     ) -> None:
         """Args:
+            protection_config: ProtectionManager thresholds; None → default
+                ProtectionConfig() (enabled, fail-open with no history).
             sizer: Optional position sizer.
             fill_mode: "pending" (default) — signals are queued and filled
                 at the OPEN of the next trading bar via `try_fill_pending_orders`.
@@ -80,6 +86,10 @@ class PaperBroker:
         self._commission = commission or AShareCommission()
         self._slippage = slippage
         self._risk = RiskManager(risk_config)
+        from quanti.risk.protections import ProtectionConfig, ProtectionManager
+        self._protections = ProtectionManager(
+            protection_config if protection_config is not None
+            else ProtectionConfig())
         self._sizer = sizer
         self._fill_mode = fill_mode
         self._pending_ttl_days = pending_ttl_trading_days
@@ -88,6 +98,14 @@ class PaperBroker:
         self._strategy_cache: dict | None = None  # name → strategy instance
         # Idempotent — only writes if no row exists.
         self._db.ensure_portfolio(initial_cash)
+
+    def _entry_allowed(self, signal: Signal,
+                       portfolio) -> tuple[bool, str, str]:
+        """Risk caps + protections gate for an entry, via the shared helper.
+        Returns (ok, reason, reject_kind). Protections only gate BUY."""
+        from quanti.risk.protection_context import evaluate_entry
+        return evaluate_entry(self._risk, self._protections, self._db,
+                              self._provider, signal, portfolio)
 
     def _recent_bars(self, code: str, days: int = 90) -> list[BarData]:
         """Fetch the most recent `days` of bars for vol-targeting / impact.
@@ -194,13 +212,14 @@ class PaperBroker:
         """Old behavior: fill synchronously against latest close. Used by
         the backtest path and unit tests."""
         portfolio = self._build_runtime_portfolio()
-        ok, reason = self._risk.check(signal, portfolio)
+        ok, reason, kind = self._entry_allowed(signal, portfolio)
         if not ok:
             self._record_order(signal, strategy_name, status="rejected",
                                reason=reason)
             self._db.log_decision(
-                "risk_reject",
-                f"风控拒绝 {signal.direction.value} {signal.stock_code}: {reason}",
+                kind,
+                f"{'风控' if kind == 'risk_reject' else '保护层'}拒绝 "
+                f"{signal.direction.value} {signal.stock_code}: {reason}",
                 code=signal.stock_code,
                 details={"signal_reason": signal.reason},
             )
@@ -233,13 +252,14 @@ class PaperBroker:
         """
         # Early risk gate
         portfolio = self._build_runtime_portfolio()
-        ok, reason = self._risk.check(signal, portfolio)
+        ok, reason, kind = self._entry_allowed(signal, portfolio)
         if not ok:
             self._record_order(signal, strategy_name, status="rejected",
                                reason=reason)
             self._db.log_decision(
-                "risk_reject",
-                f"风控拒绝 {signal.direction.value} {signal.stock_code}: {reason}",
+                kind,
+                f"{'风控' if kind == 'risk_reject' else '保护层'}拒绝 "
+                f"{signal.direction.value} {signal.stock_code}: {reason}",
                 code=signal.stock_code,
                 details={"signal_reason": signal.reason, "stage": "queue"},
             )
@@ -328,13 +348,14 @@ class PaperBroker:
                 entry_strategy=o.get("entry_strategy", "") or "",
             )
             portfolio = self._build_runtime_portfolio()
-            ok, reason = self._risk.check(sig, portfolio)
+            ok, reason, kind = self._entry_allowed(sig, portfolio)
             if not ok:
                 self._db.update_order_status(o["order_id"], "rejected",
-                                             reason=f"risk at fill: {reason}")
+                                             reason=f"{kind}: {reason}")
                 self._db.log_decision(
-                    "risk_reject",
-                    f"风控拒绝 (成交时) {sig.direction.value} {sig.stock_code}: {reason}",
+                    kind,
+                    f"{'风控' if kind == 'risk_reject' else '保护层'}拒绝 (成交时) "
+                    f"{sig.direction.value} {sig.stock_code}: {reason}",
                     code=sig.stock_code,
                     details={"order_id": o["order_id"], "stage": "fill"})
                 out.rejected += 1
