@@ -22,10 +22,11 @@
 - **借鉴**: 给 `data/` 加一层 **point-in-time 标的池 + 退市股历史**（专业源 Tushare/聚宽补），仿 Qlib 数据层。
 - **对应**: 审计 look-ahead / survivorship。
 
-### ② 声明式、防前视的因子 Pipeline（zipline Pipeline + Qlib 表达式引擎）
+### ② 声明式、防前视的因子 Pipeline（zipline Pipeline + Qlib 表达式引擎）✅ 已实现
 - **问题**: 同-bar 前视已用命令式修掉，但 `factors/cross_sectional.py` 仍手写、易再引入前视。
 - **借鉴**: zipline Pipeline 模式（因子在"截至 t-1 窗口"算、t 执行，前视结构上不可能）+ Qlib 因子表达式 DSL（`Ref/Mean/Std` 组合，因子可组合 / 可单测 / 可批量回测）。
 - **对应**: `factors/`、`agent/signal_pipeline.py`。
+- **实现**: 见设计规范 [`docs/superpowers/specs/2026-06-21-factor-pipeline-design.md`](superpowers/specs/2026-06-21-factor-pipeline-design.md) 及实施计划；`factors/` 已按 DSL 重构，`cross_sectional.py` 全部因子改为声明式表达式（`Ref/Mean/Std/Sum/Max/Min/Log` 组合），结构上排除前视，向下兼容原接口。
 
 ### ③ vnpy 的 gateway / 回调模型 — 直接降低 phase ②/③ 风险
 - **问题**: 正在手搓 `qmt-bridge` + `QmtBroker`，异步成交靠轮询对账。

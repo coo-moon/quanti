@@ -40,6 +40,7 @@ import pandas as pd
 
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
+from quanti.factors.library import FACTOR_EXPRS, as_factor_fn
 
 logger = logging.getLogger(__name__)
 
@@ -52,55 +53,14 @@ FactorFn = Callable[[pd.DataFrame], float]
 
 # ---------------------------------------------------------- factor library
 
-def _cum_return(closes: pd.Series, start_offset: int, end_offset: int) -> float:
-    """Cumulative return from bars[-start_offset] to bars[-end_offset].
-
-    end_offset must be smaller than start_offset (more recent = smaller).
-    Both are expressed as "days back from today".
-    """
-    if len(closes) < start_offset + 1:
-        return float("nan")
-    p_start = closes.iloc[-start_offset - 1]
-    p_end = closes.iloc[-end_offset - 1]
-    if p_start <= 0:
-        return float("nan")
-    return float(p_end / p_start - 1.0)
-
-
-def factor_momentum_3m(bars: pd.DataFrame) -> float:
-    # 3 months ≈ 63 trading days. Skip the most recent month (21 days) to
-    # avoid contamination from short-term reversal.
-    return _cum_return(bars["close"], start_offset=63, end_offset=21)
-
-
-def factor_momentum_6m(bars: pd.DataFrame) -> float:
-    return _cum_return(bars["close"], start_offset=126, end_offset=21)
-
-
-def factor_reversal_1w(bars: pd.DataFrame) -> float:
-    r = _cum_return(bars["close"], start_offset=5, end_offset=0)
-    return -r if not np.isnan(r) else r
-
-
-def factor_turnover_20d(bars: pd.DataFrame) -> float:
-    if "turnover" not in bars.columns or len(bars) < 20:
-        return float("nan")
-    val = float(bars["turnover"].iloc[-20:].mean())
-    # Sign-flip so "higher is better" (low turnover = better expected return).
-    return -val
-
-
-def factor_realized_vol_20d(bars: pd.DataFrame) -> float:
-    closes = bars["close"]
-    if len(closes) < 21:
-        return float("nan")
-    last = closes.iloc[-21:]
-    rets = np.log(last / last.shift(1)).dropna()
-    if len(rets) < 2:
-        return float("nan")
-    vol = float(rets.std() * np.sqrt(252))
-    return -vol
-
+# DSL-backed factor functions (behavior-equivalent to the prior hand-written
+# versions; defined declaratively in quanti.factors.library). Names are kept
+# so existing imports (e.g. tests) and DEFAULT_FACTORS stay drop-in.
+factor_momentum_3m = as_factor_fn(FACTOR_EXPRS["momentum_3m"])
+factor_momentum_6m = as_factor_fn(FACTOR_EXPRS["momentum_6m"])
+factor_reversal_1w = as_factor_fn(FACTOR_EXPRS["reversal_1w"])
+factor_turnover_20d = as_factor_fn(FACTOR_EXPRS["turnover_20d"])
+factor_realized_vol_20d = as_factor_fn(FACTOR_EXPRS["realized_vol_20d"])
 
 DEFAULT_FACTORS: dict[str, FactorFn] = {
     "momentum_3m": factor_momentum_3m,
