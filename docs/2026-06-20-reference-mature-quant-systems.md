@@ -17,10 +17,11 @@
 
 ## 二、对 quanti 的借鉴点（按优先级，映射到模块 / 审计）
 
-### ① 点对点数据 + 幸存者偏差（Qlib / zipline+Norgate）— 最高杠杆
+### ① 点对点数据 + 幸存者偏差（Qlib / zipline+Norgate）— 最高杠杆 ✅ 已实现
 - **问题**: 审计里最深的研究正确性缺口——xtdata/akshare 只给"当前在市"标的，没有退市股历史、没有 point-in-time 指数成分，回测系统性高估。
 - **借鉴**: 给 `data/` 加一层 **point-in-time 标的池 + 退市股历史**（专业源 Tushare/聚宽补），仿 Qlib 数据层。
 - **对应**: 审计 look-ahead / survivorship。
+- **实现**: 见设计规范 [`docs/superpowers/specs/2026-06-21-survivorship-data-design.md`](superpowers/specs/2026-06-21-survivorship-data-design.md) 及实施计划 [`docs/superpowers/plans/2026-06-21-survivorship-data.md`](superpowers/plans/2026-06-21-survivorship-data.md)；`TushareAdapter` 拉含退市股名册 + qfq 历史 → `stocks.delist_date` + `db.point_in_time_universe`；回测支持 `--survivorship-free` 开关，默认关闭，开启时宇宙按日期时点正确含退市股。
 
 ### ② 声明式、防前视的因子 Pipeline（zipline Pipeline + Qlib 表达式引擎）✅ 已实现
 - **问题**: 同-bar 前视已用命令式修掉，但 `factors/cross_sectional.py` 仍手写、易再引入前视。

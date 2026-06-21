@@ -19,7 +19,6 @@ class NewHighScreener(BaseScreener):
             return 0.0
 
         latest_close = bars[-1].close
-        period_high = max(b.high for b in bars[-self.period :])
         prev_high = max(b.high for b in bars[-self.period : -1])
 
         # Current close must be at or near the period high
