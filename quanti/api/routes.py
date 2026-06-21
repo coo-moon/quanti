@@ -889,3 +889,105 @@ async def run_backtest(body: BacktestRequest, request: Request):
             for d, v in result.equity_curve.items()
         },
     )
+
+
+# --- Hyperopt async API ---
+
+
+@router.post("/agent/optimize/async")
+async def optimize_async(request: Request):
+    """Start an on-demand hyperopt run. Returns a job_id immediately.
+
+    Progress is tracked via /agent/optimize/status. Heavy work runs in a
+    thread executor so the event loop is not blocked (same pattern as the
+    quotes async sync).
+    """
+    db = request.app.state.db
+    loader = StrategyLoader()
+    strategies_dir = request.app.state.strategies_dir or "strategies"
+    classes = [type(s) for s in loader.load_directory(strategies_dir)]
+    n = len(classes)
+    job_id = f"opt_{str(uuid.uuid4())[:8]}"
+    db.create_sync_job(job_id, "_optimize", n)
+    asyncio.create_task(_run_optimize(job_id, classes, request.app.state))
+    return {"job_id": job_id}
+
+
+async def _run_optimize(job_id: str, classes: list, state) -> None:
+    """Worker coroutine: runs HyperOptimizer.optimize_all in a thread executor."""
+    from datetime import date as _date
+
+    from quanti.agent.hyperopt import HyperOptimizer
+    from quanti.backtest.engine import BacktestEngine
+    from quanti.data.provider import DataProvider
+    from quanti.agent.goal import load_goal
+    from quanti.risk.manager import RiskConfig, RiskManager
+
+    db = state.db
+    loop = asyncio.get_event_loop()
+
+    def work() -> None:
+        goal = load_goal(db)
+        provider = DataProvider(db)
+        pool = goal.universe_pool
+        if pool:
+            codes = [s.code for s in db.get_pool_stocks(pool)]
+        else:
+            codes = [s.code for s in db.list_stocks()]
+        max_universe = int((goal.params or {}).get("selector_max_universe", 100))
+        codes = codes[: max(20, max_universe)]
+
+        db.update_sync_job(job_id, 0, "running", {})
+
+        engine = BacktestEngine(
+            provider=provider,
+            initial_cash=1_000_000,
+            risk_manager=RiskManager(RiskConfig()),
+        )
+
+        def progress(done: int, total: int, name: str) -> None:
+            db.update_sync_job(job_id, done, "running", {"current_strategy": name})
+
+        results = HyperOptimizer(engine).optimize_all(
+            classes, codes, _date.today(), progress=progress
+        )
+        for r in results:
+            db.save_optimization(
+                r.strategy_name,
+                r.chosen_params,
+                r.tuned_oos_sharpe,
+                r.default_oos_sharpe,
+                r.accepted,
+                r.n_combos_tried,
+                len(codes),
+            )
+        db.update_sync_job(job_id, len(results), "done", {})
+
+    try:
+        await loop.run_in_executor(None, work)
+    except Exception as e:  # noqa: BLE001
+        db.update_sync_job(job_id, 0, "error", {"error": str(e)})
+
+
+@router.get("/agent/optimize/status")
+async def optimize_status(job_id: str, request: Request):
+    """Get hyperopt job progress and results so far."""
+    db = request.app.state.db
+    job = db.get_sync_job(job_id)
+    if job is None:
+        return {"error": f"Job '{job_id}' not found"}
+    current_strategy = job["errors"].get("current_strategy", "") if isinstance(job["errors"], dict) else ""
+    return {
+        "job_id": job["job_id"],
+        "current": job["current"],
+        "total": job["total"],
+        "status": job["status"],
+        "current_strategy": current_strategy,
+        "results": db.list_optimization_results(),
+    }
+
+
+@router.get("/agent/tuned-params")
+async def tuned_params(request: Request):
+    """Return all stored optimization results (tuned strategy parameters)."""
+    return request.app.state.db.list_optimization_results()
