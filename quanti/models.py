@@ -33,6 +33,7 @@ class StockInfo:
     exchange: str  # "SZ" or "SH"
     list_date: date
     industry: str = ""
+    delist_date: date | None = None  # None = still listed; set = delisting date
 
     @property
     def symbol(self) -> str:

@@ -177,6 +177,7 @@ class Database:
         adds = [
             ("positions", "entry_strategy", "TEXT DEFAULT ''"),
             ("orders", "entry_strategy", "TEXT DEFAULT ''"),
+            ("stocks", "delist_date", "TEXT"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -210,7 +211,8 @@ class Database:
                 name TEXT NOT NULL,
                 exchange TEXT NOT NULL,
                 list_date TEXT NOT NULL,
-                industry TEXT DEFAULT ''
+                industry TEXT DEFAULT '',
+                delist_date TEXT
             );
 
             CREATE TABLE IF NOT EXISTS {m}daily_quotes (
@@ -393,18 +395,27 @@ class Database:
         exchange: str,
         list_date: date,
         industry: str = "",
+        delist_date: date | None = None,
     ) -> None:
         self.conn.execute(
             """
-            INSERT INTO stocks (code, name, exchange, list_date, industry)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO stocks (code, name, exchange, list_date, industry, delist_date)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 name=excluded.name,
                 exchange=excluded.exchange,
                 list_date=excluded.list_date,
-                industry=excluded.industry
+                industry=excluded.industry,
+                delist_date=COALESCE(excluded.delist_date, stocks.delist_date)
             """,
-            (code, name, exchange, list_date.isoformat(), industry),
+            (
+                code,
+                name,
+                exchange,
+                list_date.isoformat(),
+                industry,
+                delist_date.isoformat() if delist_date else None,
+            ),
         )
         self.conn.commit()
 
@@ -426,9 +437,25 @@ class Database:
         except (ValueError, TypeError):
             return date(1990, 1, 1)
 
+    @staticmethod
+    def _safe_delist_date(v) -> date | None:
+        """Parse a stored delist_date. NULL / empty / garbage → None (treated as
+        still listed). Mirrors _safe_list_date's defensiveness but defaults to
+        None rather than an epoch date."""
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in ("none", "nan"):
+            return None
+        try:
+            return date.fromisoformat(s[:10])
+        except (ValueError, TypeError):
+            return None
+
     def get_stock(self, code: str) -> StockInfo | None:
         row = self.conn.execute(
-            "SELECT code, name, exchange, list_date, industry FROM stocks WHERE code=?",
+            "SELECT code, name, exchange, list_date, industry, delist_date "
+            "FROM stocks WHERE code=?",
             (code,),
         ).fetchone()
         if row is None:
@@ -439,11 +466,13 @@ class Database:
             exchange=row[2],
             list_date=self._safe_list_date(row[3]),
             industry=row[4],
+            delist_date=self._safe_delist_date(row[5]),
         )
 
     def list_stocks(self) -> list[StockInfo]:
         rows = self.conn.execute(
-            "SELECT code, name, exchange, list_date, industry FROM stocks ORDER BY code"
+            "SELECT code, name, exchange, list_date, industry, delist_date "
+            "FROM stocks ORDER BY code"
         ).fetchall()
         return [
             StockInfo(
@@ -452,6 +481,7 @@ class Database:
                 exchange=r[2],
                 list_date=self._safe_list_date(r[3]),
                 industry=r[4],
+                delist_date=self._safe_delist_date(r[5]),
             )
             for r in rows
         ]
