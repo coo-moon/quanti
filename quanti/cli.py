@@ -106,6 +106,7 @@ def cmd_optimize(args):
 
     from quanti.agent.goal import load_goal
     from quanti.agent.hyperopt import HyperOptimizer
+    from quanti.agent.universe import resolve_tradable_universe
     from quanti.backtest.engine import BacktestEngine
     from quanti.data.provider import DataProvider
     from quanti.risk.manager import RiskConfig, RiskManager
@@ -114,12 +115,12 @@ def cmd_optimize(args):
     db = _open_db()
     provider = DataProvider(db)
     goal = load_goal(db)
-    pool = args.universe or goal.universe_pool
-    codes = ([s.code for s in db.get_pool_stocks(pool)] if pool
-             else [s.code for s in db.list_stocks()])
-    max_universe = int((goal.params or {}).get("selector_max_universe", 100))
-    codes = codes[:max(20, max_universe)]
     end = date.fromisoformat(args.end) if args.end else date.today()
+    pool = args.universe or goal.universe_pool
+    # Same tradable-universe selection the live agent uses (ADV-ranked, with
+    # optional liquidity filter) as of `end` — not a dictionary-order slice.
+    codes = resolve_tradable_universe(db, provider, pool=pool,
+                                      params=goal.params, as_of=end)
 
     classes = [type(s) for s in StrategyLoader().load_directory("strategies")]
     engine = BacktestEngine(provider=provider, initial_cash=args.cash,
@@ -260,20 +261,18 @@ def cmd_mine_factors(args):
     from quanti.agent.factor_miner import mine_factors
     from quanti.agent.goal import load_goal
     from quanti.agent.llm_runtime import build_llm_client
+    from quanti.agent.universe import resolve_tradable_universe
     from quanti.data.provider import DataProvider
 
     db = _open_db()
     provider = DataProvider(db)
     goal = load_goal(db)
     params = goal.params or {}
-    pool = args.universe or goal.universe_pool
-    codes = (
-        [s.code for s in db.get_pool_stocks(pool)]
-        if pool
-        else [s.code for s in db.list_stocks()]
-    )
-    codes = codes[: max(20, int(params.get("selector_max_universe", 100)))]
     end = date.fromisoformat(args.end) if args.end else date.today()
+    pool = args.universe or goal.universe_pool
+    # Same tradable-universe selection the live agent uses, as of `end`.
+    codes = resolve_tradable_universe(db, provider, pool=pool,
+                                      params=goal.params, as_of=end)
     try:
         llm = build_llm_client(params)
     except Exception as e:  # noqa: BLE001
