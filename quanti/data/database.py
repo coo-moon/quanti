@@ -352,6 +352,17 @@ class Database:
                 ON orders(created_at);
             CREATE INDEX IF NOT EXISTS idx_decisions_ts
                 ON agent_decisions(ts);
+
+            CREATE TABLE IF NOT EXISTS strategy_params (
+                strategy_name TEXT PRIMARY KEY,
+                params_json TEXT NOT NULL,
+                oos_sharpe REAL,
+                baseline_oos_sharpe REAL,
+                accepted INTEGER NOT NULL,
+                n_combos INTEGER,
+                universe_size INTEGER,
+                tuned_at TEXT NOT NULL
+            );
             """
         )
 
@@ -658,6 +669,57 @@ class Database:
             "current": row[3], "status": row[4],
             "errors": json.loads(row[5]), "created_at": row[6],
         }
+
+    # --- Strategy hyperopt params ---
+
+    def save_optimization(self, strategy_name: str, params: dict,
+                          oos_sharpe: float, baseline_oos_sharpe: float,
+                          accepted: bool, n_combos: int,
+                          universe_size: int) -> None:
+        import json
+        from datetime import datetime
+        self.conn.execute(
+            "INSERT OR REPLACE INTO strategy_params "
+            "(strategy_name, params_json, oos_sharpe, baseline_oos_sharpe, "
+            " accepted, n_combos, universe_size, tuned_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (strategy_name, json.dumps(params), float(oos_sharpe),
+             float(baseline_oos_sharpe), 1 if accepted else 0, int(n_combos),
+             int(universe_size), datetime.now().isoformat()),
+        )
+        self.conn.commit()
+
+    def get_active_params(self, strategy_name: str) -> dict | None:
+        import json
+        row = self.conn.execute(
+            "SELECT params_json, accepted FROM strategy_params WHERE strategy_name=?",
+            (strategy_name,),
+        ).fetchone()
+        if row is None or not row[1]:
+            return None
+        try:
+            return json.loads(row[0])
+        except (ValueError, TypeError):
+            return None
+
+    def list_optimization_results(self) -> list[dict]:
+        import json
+        rows = self.conn.execute(
+            "SELECT strategy_name, params_json, oos_sharpe, baseline_oos_sharpe, "
+            "accepted, n_combos, universe_size, tuned_at FROM strategy_params "
+            "ORDER BY strategy_name",
+        ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                params = json.loads(r[1])
+            except (ValueError, TypeError):
+                params = {}
+            out.append({"strategy_name": r[0], "params": params,
+                        "oos_sharpe": r[2], "baseline_oos_sharpe": r[3],
+                        "accepted": bool(r[4]), "n_combos": r[5],
+                        "universe_size": r[6], "tuned_at": r[7]})
+        return out
 
     # --- Portfolio / positions / orders / trades ---
 
