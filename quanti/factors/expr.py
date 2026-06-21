@@ -110,3 +110,55 @@ class UnaryOp(Expr):
         if self.op == "neg":
             return -v
         raise ValueError(f"unknown unary op {self.op!r}")
+
+
+class Ref(Expr):
+    """Lag by n bars (look BACK n). n>=0; negative would reference the future
+    and is forbidden — the core of the no-look-ahead guarantee."""
+
+    def __init__(self, expr: Expr, n: int) -> None:
+        if int(n) < 0:
+            raise ValueError(f"Ref shift n must be >= 0 (no future refs), got {n}")
+        self.expr, self.n = expr, int(n)
+
+    def evaluate(self, ctx: EvalContext) -> pd.Series:
+        return self.expr.evaluate(ctx).shift(self.n)
+
+
+class _Rolling(Expr):
+    _agg = ""
+
+    def __init__(self, expr: Expr, n: int) -> None:
+        self.expr, self.n = expr, int(n)
+
+    def evaluate(self, ctx: EvalContext) -> pd.Series:
+        r = self.expr.evaluate(ctx).rolling(self.n)
+        return getattr(r, self._agg)()
+
+
+class Mean(_Rolling):
+    _agg = "mean"
+
+
+class Std(_Rolling):
+    _agg = "std"  # pandas default ddof=1
+
+
+class Sum(_Rolling):
+    _agg = "sum"
+
+
+class Max(_Rolling):
+    _agg = "max"
+
+
+class Min(_Rolling):
+    _agg = "min"
+
+
+class Log(Expr):
+    def __init__(self, expr: Expr) -> None:
+        self.expr = expr
+
+    def evaluate(self, ctx: EvalContext) -> pd.Series:
+        return np.log(self.expr.evaluate(ctx))

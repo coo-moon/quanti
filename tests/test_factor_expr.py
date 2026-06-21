@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
+import pytest
 
 from quanti.factors.expr import (
     Close, Constant, EvalContext, Field,
+    Log, Max, Mean, Min, Ref, Std, Sum,
 )
 
 
@@ -54,3 +57,55 @@ def test_evalcontext_sorts_by_date():
         "volume": [1, 1], "turnover": [1, 1]})
     s = Close().evaluate(EvalContext(df))
     assert list(s) == [11.0, 13.0]  # ascending by date
+
+
+def test_ref_lags_by_n():
+    ctx = _ctx([10.0, 11.0, 12.0, 13.0])
+    s = Ref(Close(), 1).evaluate(ctx)
+    assert np.isnan(s.iloc[0])
+    assert list(s.iloc[1:]) == [10.0, 11.0, 12.0]
+
+
+def test_ref_zero_is_identity():
+    ctx = _ctx([10.0, 11.0])
+    assert list(Ref(Close(), 0).evaluate(ctx)) == [10.0, 11.0]
+
+
+def test_ref_negative_raises():
+    with pytest.raises(ValueError):
+        Ref(Close(), -1)
+
+
+def test_rolling_ops():
+    ctx = _ctx([2.0, 4.0, 6.0, 8.0])
+    assert Mean(Close(), 2).evaluate(ctx).iloc[-1] == 7.0      # (6+8)/2
+    assert Sum(Close(), 2).evaluate(ctx).iloc[-1] == 14.0
+    assert Max(Close(), 3).evaluate(ctx).iloc[-1] == 8.0
+    assert Min(Close(), 3).evaluate(ctx).iloc[-1] == 4.0
+    # Std ddof=1 of [6,8] = std of sample = 1.41421...
+    assert Std(Close(), 2).evaluate(ctx).iloc[-1] == pytest.approx(np.std([6.0, 8.0], ddof=1))
+
+
+def test_rolling_insufficient_window_is_nan():
+    ctx = _ctx([2.0, 4.0])
+    assert np.isnan(Mean(Close(), 3).evaluate(ctx).iloc[-1])
+
+
+def test_log():
+    ctx = _ctx([1.0, np.e])
+    s = Log(Close()).evaluate(ctx)
+    assert s.iloc[0] == pytest.approx(0.0)
+    assert s.iloc[1] == pytest.approx(1.0)
+
+
+def test_no_lookahead_appending_future_bars_does_not_change_past():
+    """The structural guarantee: a factor's value at date t is invariant to
+    any bars added AFTER t."""
+    closes = [10.0, 11.0, 9.0, 12.0, 13.0, 11.0, 14.0, 15.0]
+    expr = Mean(Close(), 3) / Ref(Close(), 1) - 1
+    base = _ctx(closes)
+    s_base = expr.evaluate(base)
+    extended = _ctx(closes + [99.0, 1.0, 50.0])  # wild future bars
+    s_ext = expr.evaluate(extended)
+    # The first len(closes) positions must be identical.
+    assert np.allclose(s_base.values, s_ext.values[: len(closes)], equal_nan=True)
