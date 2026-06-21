@@ -98,6 +98,44 @@ def cmd_backtest(args):
     db.close()
 
 
+def cmd_optimize(args):
+    """Walk-forward hyperopt over all candidate strategies; persist tuned params."""
+    from datetime import date
+
+    from quanti.agent.goal import load_goal
+    from quanti.agent.hyperopt import HyperOptimizer
+    from quanti.backtest.engine import BacktestEngine
+    from quanti.data.provider import DataProvider
+    from quanti.risk.manager import RiskConfig, RiskManager
+    from quanti.strategy.loader import StrategyLoader
+
+    db = _open_db()
+    provider = DataProvider(db)
+    goal = load_goal(db)
+    pool = args.universe or goal.universe_pool
+    codes = ([s.code for s in db.get_pool_stocks(pool)] if pool
+             else [s.code for s in db.list_stocks()])
+    max_universe = int((goal.params or {}).get("selector_max_universe", 100))
+    codes = codes[:max(20, max_universe)]
+    end = date.fromisoformat(args.end) if args.end else date.today()
+
+    classes = [type(s) for s in StrategyLoader().load_directory("strategies")]
+    engine = BacktestEngine(provider=provider, initial_cash=args.cash,
+                            risk_manager=RiskManager(RiskConfig()))
+    results = HyperOptimizer(engine).optimize_all(classes, codes, end)
+
+    for r in results:
+        db.save_optimization(r.strategy_name, r.chosen_params, r.tuned_oos_sharpe,
+                             r.default_oos_sharpe, r.accepted, r.n_combos_tried,
+                             len(codes))
+        flag = "✓ 采纳" if r.accepted else "· 默认"
+        logger.info("%s %-16s tuned=%.2f default=%.2f combos=%d/%d — %s",
+                    flag, r.strategy_name, r.tuned_oos_sharpe,
+                    r.default_oos_sharpe, r.n_combos_tried, r.n_combos_total,
+                    r.reason)
+    db.close()
+
+
 def cmd_serve(args):
     """Start the web server only."""
     import uvicorn
@@ -238,6 +276,14 @@ def main():
     bt_parser.add_argument("--end", required=True)
     bt_parser.add_argument("--cash", type=float, default=1_000_000)
 
+    # optimize
+    opt_parser = subparsers.add_parser("optimize", help="走查式参数寻优(hyperopt)")
+    opt_parser.add_argument("--universe", type=str, default=None,
+                            help="股票池名；留空用 goal.universe_pool 或全市场")
+    opt_parser.add_argument("--end", type=str, default=None,
+                            help="优化截止日 YYYY-MM-DD；默认今天")
+    opt_parser.add_argument("--cash", type=float, default=1_000_000)
+
     # serve
     serve_parser = subparsers.add_parser("serve", help="Start web server (no agent)")
     serve_parser.add_argument("--host", default="127.0.0.1")
@@ -285,6 +331,8 @@ def main():
         cmd_sync(args)
     elif cmd == "backtest":
         cmd_backtest(args)
+    elif cmd == "optimize":
+        cmd_optimize(args)
     elif cmd == "serve":
         cmd_serve(args)
     elif cmd == "up":
