@@ -323,4 +323,34 @@ export const fetchAgentDecisions = (limit = 50, kind?: string) =>
 
 export const fetchStrategies = () => api.get<StrategyInfo[]>("/strategies");
 
+// --- Hyperopt / tuned params ---
+export interface OptimizeResultItem {
+  strategy_name: string;
+  params: Record<string, unknown>;
+  oos_sharpe: number;
+  baseline_oos_sharpe: number;
+  accepted: boolean;
+  n_combos: number;
+  universe_size: number;
+  tuned_at: string;
+}
+
+export interface OptimizeStatus {
+  job_id: string;
+  current: number;
+  total: number;
+  status: string; // "running" | "done" | "error"
+  current_strategy: string;
+  results: OptimizeResultItem[];
+}
+
+export const runOptimizeAsync = () =>
+  api.post<{ job_id: string }>("/agent/optimize/async");
+
+export const fetchOptimizeStatus = (jobId: string) =>
+  api.get<OptimizeStatus>("/agent/optimize/status", { params: { job_id: jobId } });
+
+export const fetchTunedParams = () =>
+  api.get<OptimizeResultItem[]>("/agent/tuned-params");
+
 export default api;
