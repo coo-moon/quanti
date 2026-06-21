@@ -95,6 +95,25 @@
           </select>
         </label>
       </div>
+      <div class="schedule-block">
+        <label class="schedule-toggle">
+          <input type="checkbox" v-model="advParams.daily_schedule_enabled" />
+          <span>每日定时运行</span>
+        </label>
+        <div v-if="advParams.daily_schedule_enabled" class="schedule-fields">
+          <label class="schedule-time">
+            <span>运行时间</span>
+            <input type="time" v-model="advParams.daily_run_time" />
+          </label>
+          <label class="schedule-toggle">
+            <input type="checkbox" v-model="advParams.daily_trading_days_only" />
+            <span>仅交易日运行（周末/节假日自动跳过）</span>
+          </label>
+          <p class="muted">
+            节假日精度需先运行 <code>quanti sync --calendar</code>；否则按周一~周五判定。
+          </p>
+        </div>
+      </div>
       <div class="actions">
         <button class="btn-primary" :disabled="saving" @click="saveGoal">
           {{ saving ? "保存中..." : "保存目标" }}
@@ -630,6 +649,17 @@ function syncParamsFromAdv() {
   goalDraft.params = params;
 }
 
+// 调度基线快照：用于 saveGoal 判断 daily_run_time/仅交易日是否变化，
+// 只有变化且 agent 在运行时才触发重启。
+let scheduleBaseline = { time: "", tradingOnly: true };
+function captureScheduleBaseline() {
+  const p = (goalDraft.params || {}) as Record<string, unknown>;
+  scheduleBaseline = {
+    time: typeof p.daily_run_time === "string" ? p.daily_run_time : "",
+    tradingOnly: p.daily_trading_days_only !== false,
+  };
+}
+
 function applyPreset(mode: AgentMode) {
   advParams.agent_mode = mode;
   if (mode === "rule") {
@@ -912,6 +942,7 @@ async function loadAll() {
   ]);
   Object.assign(goalDraft, g.data);
   syncAdvFromParams();
+  captureScheduleBaseline();
   portfolio.value = p.data;
   agent.value = a.data;
   decisions.value = d.data;
@@ -931,8 +962,20 @@ async function saveGoal() {
   try {
     // Push the mode/upgrade switches into goalDraft.params right before sending.
     syncParamsFromAdv();
+    const p = goalDraft.params as Record<string, unknown>;
+    const newTime = typeof p.daily_run_time === "string" ? p.daily_run_time : "";
+    const newTradingOnly = p.daily_trading_days_only !== false;
+    const scheduleChanged =
+      newTime !== scheduleBaseline.time ||
+      newTradingOnly !== scheduleBaseline.tradingOnly;
     await updateGoal(goalDraft);
-    setMessage("目标已保存");
+    if (scheduleChanged && agent.value?.running) {
+      await agentRestart();
+      setMessage("目标已保存；调度已更新，Agent 已重启");
+    } else {
+      setMessage("目标已保存");
+    }
+    await loadAll(); // 刷新状态并通过 captureScheduleBaseline 重置基线
   } catch (e: any) {
     setMessage("保存失败: " + (e?.message ?? e), true);
   } finally {
@@ -1511,5 +1554,29 @@ onUnmounted(() => {
   font-size: 13px;
   margin-bottom: 14px;
   cursor: pointer;
+}
+.schedule-block {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, #e5e7eb);
+}
+.schedule-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.schedule-fields {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.schedule-time {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.schedule-time input {
+  width: 140px;
 }
 </style>
