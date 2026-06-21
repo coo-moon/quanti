@@ -96,6 +96,9 @@ class TushareAdapter:
     def _bar_fn(self):
         if self._pro_bar_fn is not None:
             return self._pro_bar_fn
+        if ts is None:
+            raise RuntimeError(
+                "tushare not installed; run: pip install 'quanti[data]'")
         self._ensure_pro()  # ensures ts present + token registered
         return ts.pro_bar
 

@@ -86,3 +86,14 @@ def test_methods_raise_clearly_without_token(db, monkeypatch):
     adapter = TushareAdapter(db)
     with pytest.raises(RuntimeError):
         adapter.sync_stock_list()
+
+
+def test_bar_fn_raises_clearly_when_tushare_absent(db, monkeypatch):
+    # pro injected but pro_bar NOT injected, and tushare package absent →
+    # _bar_fn must raise the clear RuntimeError, not an AttributeError.
+    import quanti.data.tushare_adapter as mod
+    monkeypatch.setattr(mod, "ts", None)
+    adapter = TushareAdapter(db, pro=FakePro())  # no pro_bar
+    with pytest.raises(RuntimeError):
+        adapter.sync_daily_quotes("600001", start=date(2010, 1, 1),
+                                  end=date(2010, 1, 31))
