@@ -38,6 +38,12 @@ dev = [
 llm = [
     "anthropic>=0.40",
 ]
+# Install via `pip install -e '.[data]'` to enable the Tushare adapter
+# (delisted-stock roster + history → survivorship-free backtests). Without it,
+# TushareAdapter still imports but its methods raise a clear error.
+data = [
+    "tushare>=1.2",
+]
 
 [project.scripts]
 quanti = "quanti.cli:main"
