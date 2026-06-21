@@ -204,7 +204,22 @@ class MyScreener(BaseScreener):
 | `quanti sync --stocks` | 同步全A股列表（名称/行业/交易所） |
 | `quanti sync --calendar` | 同步交易日历 |
 | `quanti sync --quotes --codes 000001,600519` | 同步指定股票K线 |
+| `quanti sync --tushare-stocks` | 同步含退市股的全量名册（需 `TUSHARE_TOKEN`，可选依赖 `.[data]`） |
+| `quanti sync --tushare-quotes --delisted-only` | 补拉退市股历史行情（用于无幸存者偏差回测） |
 | `quanti serve` | 启动 API 服务（端口 8000） |
+
+### 无幸存者偏差回测 (survivorship-free)
+
+```bash
+# 1) 拉含退市股的全量名册 + 退市股历史（需 TUSHARE_TOKEN，可选依赖 .[data]）
+# PowerShell: $env:TUSHARE_TOKEN="..."
+export TUSHARE_TOKEN=...
+quanti sync --tushare-stocks
+quanti sync --tushare-quotes --delisted-only
+
+# 2) 在"按日期时点正确、含退市股"的宇宙上回测
+quanti backtest --strategy my_strat --start 2021-01-01 --end 2022-12-31 --survivorship-free
+```
 
 手动同步通常不需要：服务启动后**后台同步守护**（`BackgroundQuoteSyncer`）会持续维护数据新鲜度——
 

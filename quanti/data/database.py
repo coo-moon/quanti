@@ -177,6 +177,7 @@ class Database:
         adds = [
             ("positions", "entry_strategy", "TEXT DEFAULT ''"),
             ("orders", "entry_strategy", "TEXT DEFAULT ''"),
+            ("stocks", "delist_date", "TEXT"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -210,7 +211,8 @@ class Database:
                 name TEXT NOT NULL,
                 exchange TEXT NOT NULL,
                 list_date TEXT NOT NULL,
-                industry TEXT DEFAULT ''
+                industry TEXT DEFAULT '',
+                delist_date TEXT
             );
 
             CREATE TABLE IF NOT EXISTS {m}daily_quotes (
@@ -393,18 +395,27 @@ class Database:
         exchange: str,
         list_date: date,
         industry: str = "",
+        delist_date: date | None = None,
     ) -> None:
         self.conn.execute(
             """
-            INSERT INTO stocks (code, name, exchange, list_date, industry)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO stocks (code, name, exchange, list_date, industry, delist_date)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 name=excluded.name,
                 exchange=excluded.exchange,
                 list_date=excluded.list_date,
-                industry=excluded.industry
+                industry=excluded.industry,
+                delist_date=COALESCE(excluded.delist_date, stocks.delist_date)
             """,
-            (code, name, exchange, list_date.isoformat(), industry),
+            (
+                code,
+                name,
+                exchange,
+                list_date.isoformat(),
+                industry,
+                delist_date.isoformat() if delist_date else None,
+            ),
         )
         self.conn.commit()
 
@@ -426,9 +437,25 @@ class Database:
         except (ValueError, TypeError):
             return date(1990, 1, 1)
 
+    @staticmethod
+    def _safe_delist_date(v) -> date | None:
+        """Parse a stored delist_date. NULL / empty / garbage → None (treated as
+        still listed). Mirrors _safe_list_date's defensiveness but defaults to
+        None rather than an epoch date."""
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in ("none", "nan"):
+            return None
+        try:
+            return date.fromisoformat(s[:10])
+        except (ValueError, TypeError):
+            return None
+
     def get_stock(self, code: str) -> StockInfo | None:
         row = self.conn.execute(
-            "SELECT code, name, exchange, list_date, industry FROM stocks WHERE code=?",
+            "SELECT code, name, exchange, list_date, industry, delist_date "
+            "FROM stocks WHERE code=?",
             (code,),
         ).fetchone()
         if row is None:
@@ -439,11 +466,13 @@ class Database:
             exchange=row[2],
             list_date=self._safe_list_date(row[3]),
             industry=row[4],
+            delist_date=self._safe_delist_date(row[5]),
         )
 
     def list_stocks(self) -> list[StockInfo]:
         rows = self.conn.execute(
-            "SELECT code, name, exchange, list_date, industry FROM stocks ORDER BY code"
+            "SELECT code, name, exchange, list_date, industry, delist_date "
+            "FROM stocks ORDER BY code"
         ).fetchall()
         return [
             StockInfo(
@@ -452,9 +481,30 @@ class Database:
                 exchange=r[2],
                 list_date=self._safe_list_date(r[3]),
                 industry=r[4],
+                delist_date=self._safe_delist_date(r[5]),
             )
             for r in rows
         ]
+
+    def point_in_time_universe(self, start: date, end: date) -> list[str]:
+        """Codes that were alive at some point within [start, end] — the
+        survivorship-bias-free backtest universe.
+
+        A stock qualifies if it had listed on/before the window end AND had not
+        yet delisted at the window start (delist_date NULL = still listed).
+        list_date/delist_date are stored as ISO YYYY-MM-DD, so lexicographic
+        string comparison equals date comparison.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT code FROM stocks
+            WHERE list_date <= ?
+              AND (delist_date IS NULL OR delist_date >= ?)
+            ORDER BY code
+            """,
+            (end.isoformat(), start.isoformat()),
+        ).fetchall()
+        return [r[0] for r in rows]
 
     # --- Daily quote operations ---
 
@@ -665,7 +715,7 @@ class Database:
     def get_pool_stocks(self, pool_name: str) -> list[StockInfo]:
         rows = self.conn.execute(
             """
-            SELECT s.code, s.name, s.exchange, s.list_date, s.industry
+            SELECT s.code, s.name, s.exchange, s.list_date, s.industry, s.delist_date
             FROM pool_stocks ps
             JOIN stocks s ON ps.code = s.code
             WHERE ps.pool_name = ?
@@ -674,7 +724,7 @@ class Database:
             (pool_name,),
         ).fetchall()
         return [
-            StockInfo(code=r[0], name=r[1], exchange=r[2], list_date=self._safe_list_date(r[3]), industry=r[4])
+            StockInfo(code=r[0], name=r[1], exchange=r[2], list_date=self._safe_list_date(r[3]), industry=r[4], delist_date=self._safe_delist_date(r[5]))
             for r in rows
         ]
 
