@@ -831,6 +831,14 @@ async def agent_stop(request: Request):
     return {"status": "stopped"}
 
 
+@router.post("/agent/restart")
+async def agent_restart(request: Request):
+    """Stop the agent loop thread and start a fresh one so a changed daily
+    schedule takes effect immediately. Persisted goal.enabled is untouched."""
+    request.app.state.agent.restart()
+    return {"status": "restarted"}
+
+
 @router.post("/agent/tick")
 async def agent_tick(request: Request):
     return request.app.state.agent.tick()
