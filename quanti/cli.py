@@ -213,6 +213,43 @@ def cmd_agent(args):
     db.close()
 
 
+def cmd_mine_factors(args):
+    """LLM factor mining: propose → IC gate → persist to generated_factors."""
+    from datetime import date
+
+    from quanti.agent.factor_miner import mine_factors
+    from quanti.agent.goal import load_goal
+    from quanti.agent.llm_runtime import build_llm_client
+    from quanti.data.provider import DataProvider
+
+    db = _open_db()
+    provider = DataProvider(db)
+    goal = load_goal(db)
+    params = goal.params or {}
+    pool = args.universe or goal.universe_pool
+    codes = (
+        [s.code for s in db.get_pool_stocks(pool)]
+        if pool
+        else [s.code for s in db.list_stocks()]
+    )
+    codes = codes[: max(20, int(params.get("selector_max_universe", 100)))]
+    end = date.fromisoformat(args.end) if args.end else date.today()
+    try:
+        llm = build_llm_client(params)
+    except Exception as e:  # noqa: BLE001
+        logger.error("LLM unavailable for mining: %s", e)
+        db.close()
+        return
+    results = mine_factors(llm, db, provider, codes, end, n_candidates=args.n)
+    for r in results:
+        flag = "adopted" if r.accepted else "dropped"
+        logger.info(
+            "%s %-16s train_ic=%.3f oos_ic=%.3f — %s",
+            flag, r.name, r.train_ic, r.oos_ic, r.reason,
+        )
+    db.close()
+
+
 def cmd_mcp(_args):
     """Launch the MCP stdio server."""
     from quanti.mcp_server import main as run_mcp
@@ -276,6 +313,13 @@ def main():
                            type=int, default=90,
                            help="prune: 保留多少天内的决策日志")
 
+    # mine-factors
+    mine_parser = subparsers.add_parser("mine-factors", help="LLM 因子挖掘")
+    mine_parser.add_argument("--universe", type=str, default=None)
+    mine_parser.add_argument("--n", type=int, default=10)
+    mine_parser.add_argument("--end", type=str, default=None)
+    mine_parser.add_argument("--cash", type=float, default=1_000_000)
+
     # mcp
     subparsers.add_parser("mcp", help="启动 MCP server（stdio）供 OpenClaw 接入")
 
@@ -293,6 +337,8 @@ def main():
         cmd_agent(args)
     elif cmd == "mcp":
         cmd_mcp(args)
+    elif cmd == "mine-factors":
+        cmd_mine_factors(args)
     else:
         parser.print_help()
 

@@ -407,6 +407,45 @@
       </div>
     </div>
 
+    <!-- Factor Mining (LLM) -->
+    <div class="card">
+      <div class="card-header">
+        <h2>因子挖掘 (LLM)</h2>
+        <button class="btn-secondary" :disabled="mining" @click="startMine">
+          {{ mining ? `挖掘中 ${mineProgress.current}/${mineProgress.total}` : "运行挖掘" }}
+        </button>
+      </div>
+      <label class="master-toggle">
+        <input type="checkbox" v-model="useGenerated" @change="toggleMaster" />
+        本账户实盘启用生成因子（默认关；开启后已采纳且启用的因子参与下单排名）
+      </label>
+      <table v-if="generated.length">
+        <thead>
+          <tr>
+            <th>因子</th>
+            <th>表达式</th>
+            <th>训练IC</th>
+            <th>OOS IC</th>
+            <th>采纳</th>
+            <th>启用</th>
+            <th>生效中</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="f in generated" :key="f.name">
+            <td>{{ f.name }}</td>
+            <td><code>{{ f.expr_str }}</code></td>
+            <td>{{ f.train_ic?.toFixed(3) }}</td>
+            <td>{{ f.oos_ic?.toFixed(3) }}</td>
+            <td>{{ f.accepted ? "✓" : "—" }}</td>
+            <td><input type="checkbox" v-model="f.enabled" @change="toggleFactor(f)" /></td>
+            <td>{{ f.accepted && f.enabled && useGenerated ? "● 生效" : "—" }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">尚未挖掘。点击"运行挖掘"让 LLM 提因子，IC 闸门筛选后入库。</p>
+    </div>
+
     <!-- Decision log -->
     <div class="card">
       <div class="card-header">
@@ -451,8 +490,13 @@ import {
   manualOrder,
   resetPortfolio,
   updateGoal,
+  runMineAsync,
+  fetchMineStatus,
+  fetchGeneratedFactors,
+  setFactorEnabled,
   type AgentStatus,
   type DecisionRecord,
+  type GeneratedFactor,
   type Goal,
   type OrderRecord,
   type PendingOrderDetail,
@@ -562,6 +606,49 @@ const strategies = ref<StrategyInfo[]>([]);
 const screeners = ref<ScreenerInfo[]>([]);
 const pendingOrders = ref<PendingOrderDetail[]>([]);
 const orders = ref<OrderRecord[]>([]);
+
+// ── Factor Mining ──────────────────────────────────────────────────────────
+const generated = ref<GeneratedFactor[]>([]);
+const mining = ref(false);
+const mineProgress = ref<{ current: number; total: number }>({ current: 0, total: 0 });
+let mineTimer: number | undefined;
+const useGenerated = ref(false); // master switch: goal.params.use_generated_factors
+
+const loadGenerated = async () => {
+  generated.value = (await fetchGeneratedFactors()).data;
+};
+const loadMaster = async () => {
+  const g = (await fetchGoal()).data;
+  useGenerated.value = Boolean((g.params || {})["use_generated_factors"]);
+};
+const toggleMaster = async () => {
+  const g = (await fetchGoal()).data;
+  const params = { ...(g.params || {}), use_generated_factors: useGenerated.value };
+  await updateGoal({ params });
+};
+const toggleFactor = async (f: GeneratedFactor) => {
+  await setFactorEnabled(f.name, f.enabled);
+  await loadGenerated();
+};
+const startMine = async () => {
+  mining.value = true;
+  try {
+    const jid = (await runMineAsync()).data.job_id;
+    mineTimer = window.setInterval(async () => {
+      const s = (await fetchMineStatus(jid)).data;
+      mineProgress.value = { current: s.current, total: s.total };
+      generated.value = s.results;
+      if (s.status === "done" || s.status === "error") {
+        window.clearInterval(mineTimer);
+        mining.value = false;
+        if (s.status === "done") await loadGenerated();
+      }
+    }, 2000);
+  } catch (e) {
+    console.error(e);
+    mining.value = false;
+  }
+};
 
 // Exits = sells. risk_exit is the stop-loss/take-profit/strategy-exit path;
 // other sells (manual, etc.) still count as an exit worth showing.
@@ -856,6 +943,8 @@ async function sellOne(code: string) {
 
 onMounted(() => {
   loadAll();
+  loadGenerated();
+  loadMaster();
   timer = window.setInterval(loadAll, 15000);
   clockTimer = window.setInterval(() => (nowTs.value = Date.now()), 20000);
 });
@@ -863,6 +952,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (timer !== null) window.clearInterval(timer);
   if (clockTimer !== null) window.clearInterval(clockTimer);
+  if (mineTimer !== undefined) window.clearInterval(mineTimer);
 });
 </script>
 
@@ -1330,5 +1420,15 @@ onUnmounted(() => {
   border: 1px solid rgba(0, 0, 0, 0.12);
   border-radius: 6px;
   font-size: 13px;
+}
+
+/* Factor mining card */
+.master-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  margin-bottom: 14px;
+  cursor: pointer;
 }
 </style>

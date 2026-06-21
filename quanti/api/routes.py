@@ -741,6 +741,84 @@ async def manual_order(body: ManualOrderBody, request: Request):
     return {"filled": filled, "snapshot": broker.snapshot_portfolio()}
 
 
+@router.post("/agent/mine-factors/async")
+async def mine_factors_async(request: Request):
+    """Start an async LLM factor-mining job. Returns job_id immediately."""
+    db = request.app.state.db
+    n = 10
+    job_id = f"mine_{str(uuid.uuid4())[:8]}"
+    db.create_sync_job(job_id, "_mine", n)
+    asyncio.create_task(_run_mine(job_id, request.app.state, n))
+    return {"job_id": job_id}
+
+
+async def _run_mine(job_id: str, state, n: int) -> None:
+    """Background worker: build LLM client, run mine_factors in a thread pool."""
+    from quanti.agent import factor_miner
+    from quanti.agent.goal import load_goal
+    from quanti.agent.llm_runtime import build_llm_client
+    from quanti.data.provider import DataProvider
+
+    db = state.db
+    loop = asyncio.get_event_loop()
+
+    def work() -> None:
+        goal = load_goal(db)
+        params = goal.params or {}
+        provider = DataProvider(db)
+        pool = goal.universe_pool
+        codes = (
+            [s.code for s in db.get_pool_stocks(pool)]
+            if pool
+            else [s.code for s in db.list_stocks()]
+        )
+        codes = codes[: max(20, int(params.get("selector_max_universe", 100)))]
+        llm = build_llm_client(params)
+        db.update_sync_job(job_id, 0, "running", {})
+        results = factor_miner.mine_factors(
+            llm, db, provider, codes, date.today(), n_candidates=n
+        )
+        db.update_sync_job(job_id, len(results), "done", {})
+
+    try:
+        await loop.run_in_executor(None, work)
+    except Exception as e:  # noqa: BLE001
+        db.update_sync_job(job_id, 0, "error", {"error": str(e)})
+
+
+@router.get("/agent/mine-factors/status")
+async def mine_factors_status(job_id: str, request: Request):
+    """Get async mine-factors job progress and results."""
+    db = request.app.state.db
+    job = db.get_sync_job(job_id)
+    if job is None:
+        return {"error": f"Job '{job_id}' not found"}
+    return {
+        "job_id": job["job_id"],
+        "current": job["current"],
+        "total": job["total"],
+        "status": job["status"],
+        "results": db.list_generated_factors(),
+    }
+
+
+@router.get("/factors/generated")
+async def generated_factors(request: Request):
+    """List all generated (LLM-mined) factors."""
+    return request.app.state.db.list_generated_factors()
+
+
+class _EnabledBody(BaseModel):
+    enabled: bool
+
+
+@router.post("/factors/generated/{name}/enabled")
+async def set_generated_enabled(name: str, body: _EnabledBody, request: Request):
+    """Enable or disable a generated factor by name."""
+    request.app.state.db.set_factor_enabled(name, body.enabled)
+    return {"ok": True, "name": name, "enabled": body.enabled}
+
+
 @router.post("/agent/start")
 async def agent_start(request: Request):
     request.app.state.agent.start()
