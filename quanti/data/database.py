@@ -666,7 +666,7 @@ class Database:
     def get_pool_stocks(self, pool_name: str) -> list[StockInfo]:
         rows = self.conn.execute(
             """
-            SELECT s.code, s.name, s.exchange, s.list_date, s.industry
+            SELECT s.code, s.name, s.exchange, s.list_date, s.industry, s.delist_date
             FROM pool_stocks ps
             JOIN stocks s ON ps.code = s.code
             WHERE ps.pool_name = ?
@@ -675,7 +675,7 @@ class Database:
             (pool_name,),
         ).fetchall()
         return [
-            StockInfo(code=r[0], name=r[1], exchange=r[2], list_date=self._safe_list_date(r[3]), industry=r[4])
+            StockInfo(code=r[0], name=r[1], exchange=r[2], list_date=self._safe_list_date(r[3]), industry=r[4], delist_date=self._safe_delist_date(r[5]))
             for r in rows
         ]
 

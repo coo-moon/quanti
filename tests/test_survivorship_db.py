@@ -67,3 +67,13 @@ def test_legacy_db_migrates_delist_date(tmp_path):
         assert s is not None and s.delist_date is None  # legacy row reads as listed
     finally:
         d.close()
+
+
+def test_get_pool_stocks_carries_delist_date(db):
+    db.upsert_stock("600001", "退市", "SH", date(2000, 1, 1), "",
+                    delist_date=date(2019, 1, 1))
+    db.create_pool("p1")
+    db.add_stocks_to_pool("p1", ["600001"])
+    pooled = db.get_pool_stocks("p1")
+    assert len(pooled) == 1
+    assert pooled[0].delist_date == date(2019, 1, 1)
