@@ -285,13 +285,23 @@ def test_optimize_skips_empty_param_space(monkeypatch):
     assert r.accepted is False and r.n_combos_total == 0 and "param_space" in r.reason
 
 
+# Train-search ranks combos by compute_metrics(curve)["sharpe_ratio"]. The stub
+# _Engine encodes the param `p` in the curve's last value (higher p → higher),
+# so we stub compute_metrics to read that last value — making the train winner
+# deterministically the highest-p combo (p=3), without depending on real
+# Sharpe math over a 2-point curve.
+def _patch_train_score(monkeypatch):
+    monkeypatch.setattr("quanti.agent.hyperopt.compute_metrics",
+                        lambda c: {"sharpe_ratio": float(c.iloc[-1])})
+
+
 def test_optimize_accepts_when_tuned_beats_default(monkeypatch):
-    # Make OOS validation return a high sharpe for the tuned combo (p=3) and a
-    # low one for the default ({}), with enough folds/trades to pass guards.
+    _patch_train_score(monkeypatch)  # train winner = p=3
+    # OOS validation: high sharpe for the tuned combo (p=3), low for default ({}→p=1).
     def fake_wf(engine, factory, codes, end, **kw):
         inst = factory()
         p = getattr(inst, "p", 1)
-        sharpe = 2.0 if p == 3 else 0.1  # default ({}) → p=1 → 0.1
+        sharpe = 2.0 if p == 3 else 0.1
         return wf.WalkForwardResult(
             folds=[wf.FoldResult(fold=None, metrics={"sharpe_ratio": sharpe},
                                  n_trades_oos=10)] * 3,
@@ -304,6 +314,7 @@ def test_optimize_accepts_when_tuned_beats_default(monkeypatch):
 
 
 def test_optimize_rejects_when_tuned_not_better(monkeypatch):
+    _patch_train_score(monkeypatch)
     def fake_wf(engine, factory, codes, end, **kw):
         return wf.WalkForwardResult(
             folds=[wf.FoldResult(fold=None, metrics={"sharpe_ratio": 0.5},
@@ -315,6 +326,7 @@ def test_optimize_rejects_when_tuned_not_better(monkeypatch):
 
 
 def test_optimize_rejects_on_thin_trades(monkeypatch):
+    _patch_train_score(monkeypatch)
     def fake_wf(engine, factory, codes, end, **kw):
         inst = factory(); p = getattr(inst, "p", 1)
         sharpe = 2.0 if p == 3 else 0.1
