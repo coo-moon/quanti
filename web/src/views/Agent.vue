@@ -372,6 +372,31 @@
       <div class="muted">strength（0~1）：仅买入有效，作为现金的目标占比</div>
     </div>
 
+    <!-- Hyperopt: parameter optimize card -->
+    <div class="card">
+      <div class="card-header">
+        <h2>参数优化</h2>
+        <button class="btn-secondary" :disabled="optimizing" @click="startOptimize">
+          {{ optimizing ? `优化中 ${optProgress.current}/${optProgress.total} ${optProgress.strategy}` : "运行优化" }}
+        </button>
+      </div>
+      <table v-if="tuned.length">
+        <thead><tr><th>策略</th><th>默认 OOS</th><th>调优 OOS</th><th>采纳</th><th>参数</th><th>组合</th><th>时间</th></tr></thead>
+        <tbody>
+          <tr v-for="t in tuned" :key="t.strategy_name">
+            <td>{{ t.strategy_name }}</td>
+            <td>{{ t.baseline_oos_sharpe?.toFixed(2) }}</td>
+            <td>{{ t.oos_sharpe?.toFixed(2) }}</td>
+            <td>{{ t.accepted ? "✓" : "—" }}</td>
+            <td>{{ t.accepted ? JSON.stringify(t.params) : "默认" }}</td>
+            <td>{{ t.n_combos }}</td>
+            <td>{{ t.tuned_at?.slice(0, 16).replace("T", " ") }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">尚未优化。点击"运行优化"在样本外验证各策略参数。</p>
+    </div>
+
     <!-- Last evaluation -->
     <div class="card" v-if="agent && agent.last_evaluations.length > 0">
       <div class="card-header">
@@ -395,6 +420,7 @@
             <td>
               <b v-if="e.strategy_name === agent.last_strategy">{{ displayStrategy(e.strategy_name) }}</b>
               <span v-else>{{ displayStrategy(e.strategy_name) }}</span>
+              <span v-if="tunedNames.has(e.strategy_name)" class="count-badge">已调优</span>
             </td>
             <td :class="e.annual_return >= 0 ? 'up' : 'down'">{{ formatPct(e.annual_return) }}</td>
             <td class="down">{{ formatPct(e.max_drawdown) }}</td>
@@ -451,9 +477,13 @@ import {
   manualOrder,
   resetPortfolio,
   updateGoal,
+  runOptimizeAsync,
+  fetchOptimizeStatus,
+  fetchTunedParams,
   type AgentStatus,
   type DecisionRecord,
   type Goal,
+  type OptimizeResultItem,
   type OrderRecord,
   type PendingOrderDetail,
   type Portfolio,
@@ -562,6 +592,37 @@ const strategies = ref<StrategyInfo[]>([]);
 const screeners = ref<ScreenerInfo[]>([]);
 const pendingOrders = ref<PendingOrderDetail[]>([]);
 const orders = ref<OrderRecord[]>([]);
+
+// Optimize (walk-forward hyperopt) state
+const tuned = ref<OptimizeResultItem[]>([]);
+const optimizing = ref(false);
+const optProgress = ref<{ current: number; total: number; strategy: string }>(
+  { current: 0, total: 0, strategy: "" });
+let optTimer: number | undefined;
+
+const tunedNames = computed(() =>
+  new Set(tuned.value.filter(t => t.accepted).map(t => t.strategy_name)));
+
+const loadTuned = async () => { tuned.value = (await fetchTunedParams()).data; };
+const startOptimize = async () => {
+  optimizing.value = true;
+  try {
+    const { data } = await runOptimizeAsync();
+    const jobId = data.job_id;
+    optTimer = window.setInterval(async () => {
+      const s = (await fetchOptimizeStatus(jobId)).data;
+      optProgress.value = { current: s.current, total: s.total, strategy: s.current_strategy };
+      tuned.value = s.results;
+      if (s.status === "done" || s.status === "error") {
+        window.clearInterval(optTimer);
+        optimizing.value = false;
+      }
+    }, 1500);
+  } catch (e) {
+    console.error("optimize launch failed", e);
+    optimizing.value = false;
+  }
+};
 
 // Exits = sells. risk_exit is the stop-loss/take-profit/strategy-exit path;
 // other sells (manual, etc.) still count as an exit worth showing.
@@ -856,6 +917,7 @@ async function sellOne(code: string) {
 
 onMounted(() => {
   loadAll();
+  loadTuned();
   timer = window.setInterval(loadAll, 15000);
   clockTimer = window.setInterval(() => (nowTs.value = Date.now()), 20000);
 });
@@ -863,6 +925,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (timer !== null) window.clearInterval(timer);
   if (clockTimer !== null) window.clearInterval(clockTimer);
+  if (optTimer !== undefined) window.clearInterval(optTimer);
 });
 </script>
 

@@ -37,10 +37,11 @@
 - **借鉴**: 可插拔保护层——连续止损 N 次冷却、单票/全局回撤锁、低胜率锁仓，比单一熔断更细腻。
 - **对应**: `risk/manager.py`。
 
-### ⑤ 走查式参数寻优（freqtrade hyperopt）
+### ⑤ 走查式参数寻优（freqtrade hyperopt）✅ 已实现
 - **现状**: 有 `StrategySelector`（选策略）+ walk_forward，但无调参。
 - **借鉴**: 在已有 walk-forward 框架上加参数搜索（stoploss/窗口/阈值），**用 OOS 验证防过拟合**（刚加的 min-fold / 短窗口不外推年化正好兜底）。
 - **对应**: `agent/selector.py`、`agent/walk_forward.py`。
+- **实现**: 见设计文档 `docs/superpowers/specs/2026-06-21-walk-forward-hyperopt-design.md` 及实现计划；`HyperOptimizer`（网格搜索 + OOS 验证门控）+ `resolve_params` 接线 + CLI `quanti optimize` + 异步 API + 前端优化卡均已落地（feat/strategy-hyperopt）。
 
 ### ⑥ LLM 因子/策略挖掘闭环（Qlib RD-Agent / QuantaAlpha）— 差异化方向
 - **契合**: quanti "规则验证、LLM 只做加法"的哲学。

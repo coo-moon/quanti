@@ -10,6 +10,7 @@ class MAVolumeStrategy(BaseStrategy):
     name = "ma_volume"
     name_zh = "量价确认均线"
     description = "均线金叉同时成交量放大才确认买入,过滤假突破"
+    param_space = {"short_period": [5, 8], "long_period": [20, 30], "vol_ratio": [1.2, 1.5, 2.0]}
 
     def init(self, config: dict) -> None:
         self.short_period = config.get("short_period", 5)

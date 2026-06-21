@@ -10,6 +10,7 @@ class RSIOverboughtOversoldStrategy(BaseStrategy):
     name = "rsi_ob_os"
     name_zh = "RSI 超买超卖"
     description = "RSI < 30 触发买入(超卖反弹),RSI > 70 触发卖出(超买回落)"
+    param_space = {"period": [7, 14], "oversold": [20, 30], "overbought": [70, 80]}
 
     def init(self, config: dict) -> None:
         self.period = config.get("period", 14)
@@ -31,9 +32,9 @@ class RSIOverboughtOversoldStrategy(BaseStrategy):
         gains = np.where(deltas > 0, deltas, 0.0)
         losses = np.where(deltas < 0, -deltas, 0.0)
 
-        def _rsi(g, l):
+        def _rsi(g, loss):
             avg_g = np.mean(g)
-            avg_l = np.mean(l)
+            avg_l = np.mean(loss)
             if avg_l == 0:
                 return 100.0
             return 100.0 - 100.0 / (1 + avg_g / avg_l)

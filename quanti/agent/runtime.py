@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from quanti.agent.goal import Goal, load_goal, save_goal
+from quanti.agent.params import resolve_params
 from quanti.agent.selector import StrategySelector
 from quanti.agent.signal_pipeline import (
     collect_signals_per_strategy,
@@ -473,7 +474,7 @@ class AgentRuntime:
 
         prepared: list[tuple] = []
         for strat, weight in pairs:
-            strat.init(dict(params))
+            strat.init(resolve_params(self._db, strat.name, goal))
             prepared.append((strat, weight))
 
         per_strategy, weights = collect_signals_per_strategy(
@@ -762,7 +763,7 @@ class AgentRuntime:
                 summary = f"指定策略 {goal.strategy_name} 未找到"
                 self._db.log_decision("cycle_skip", summary)
                 return {"ok": False, "reason": summary}
-            strategy.init(goal.params or {})
+            strategy.init(resolve_params(self._db, strategy.name, goal))
             strategy_name = strategy.name
             self._db.log_decision(
                 "strategy_pin",
@@ -788,7 +789,7 @@ class AgentRuntime:
                                           details={"evaluations": evaluations})
                     return {"ok": False, "reason": summary}
                 self._selector_cache = (now_ts, strategy.name, evaluations)
-                strategy.init(goal.params or {})
+                strategy.init(resolve_params(self._db, strategy.name, goal))
                 self._db.log_decision(
                     "strategy_pick",
                     f"选定策略：{strategy.name}",
@@ -807,7 +808,7 @@ class AgentRuntime:
                     # Strategy file got removed — invalidate cache and recurse.
                     self._selector_cache = None
                     return self._run_one_cycle()
-                strategy.init(goal.params or {})
+                strategy.init(resolve_params(self._db, strategy.name, goal))
             strategy_name = strategy.name
             signals = self._single_strategy_signals(strategy, candidates)
 
