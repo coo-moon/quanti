@@ -68,17 +68,54 @@ def seeded_db(tmp_path):
 
 def test_selector_factory_uses_tuned_params(monkeypatch, seeded_db):
     """The Selector's walk-forward factory must init strategies with tuned
-    params when present (so ranking reflects what live will trade)."""
+    params when present (so ranking reflects what live will trade).
+
+    Two-part assertion:
+    1. resolve_params was consulted at all (spy on module-level function).
+    2. The factory instantiates a strategy whose short_period attribute equals
+       the tuned sentinel 999 — proving the tuned cfg, not goal.params,
+       reached init. Verified by calling the factory directly (intercepted from
+       run_walk_forward) and inspecting the instance attribute.
+       Fails if the factory reverts to ``cfg = goal.params or {}``.
+    """
     import quanti.agent.selector as sel
-    captured = {}
-    real = sel.resolve_params
+
+    # Seed an ACCEPTED tuned row for ma_cross with a sentinel value.
+    seeded_db.save_optimization(
+        "ma_cross",
+        {"short_period": 999},
+        oos_sharpe=1.0,
+        baseline_oos_sharpe=0.0,
+        accepted=True,
+        n_combos=1,
+        universe_size=1,
+    )
+
+    # Spy on resolve_params to confirm it was consulted.
+    captured_resolve: dict[str, dict] = {}
+    real_resolve = sel.resolve_params
 
     def _spy(db, name, goal):
-        out = real(db, name, goal)
-        captured[name] = out
+        out = real_resolve(db, name, goal)
+        captured_resolve[name] = out
         return out
 
     monkeypatch.setattr(sel, "resolve_params", _spy)
+
+    # Intercept run_walk_forward to get access to the factory callable.
+    # We call the factory once ourselves to inspect the instance it creates,
+    # then delegate to the real run_walk_forward so the rest of evaluate() works.
+    factory_instances: list = []
+    real_rwf = sel.run_walk_forward
+
+    def _intercepting_rwf(engine, factory, codes, end, **kwargs):
+        # Call the factory once to capture what it produces.
+        inst = factory()
+        factory_instances.append(inst)
+        # Delegate so the overall evaluate() result is still valid.
+        return real_rwf(engine, factory, codes, end, **kwargs)
+
+    monkeypatch.setattr(sel, "run_walk_forward", _intercepting_rwf)
 
     provider = DataProvider(seeded_db)
     from quanti.agent.selector import StrategySelector
@@ -88,4 +125,22 @@ def test_selector_factory_uses_tuned_params(monkeypatch, seeded_db):
     goal = Goal(params={"wf_enabled": True, "wf_n_folds": 2,
                         "wf_warmup_days": 60, "wf_test_days": 14})
     selector.evaluate(goal, codes=["000001"])
-    assert captured, "resolve_params was not consulted by the selector factory"
+
+    # 1. resolve_params was consulted by the selector factory.
+    assert captured_resolve, "resolve_params was not consulted by the selector factory"
+
+    # 2. At least one factory-produced instance has short_period == 999.
+    #    If the factory ignores resolve_params's return and falls back to
+    #    goal.params (which has no short_period key), the instance gets the
+    #    strategy's default (5), not 999 — and this assertion fails.
+    ma_cross_tuned = [
+        inst for inst in factory_instances
+        if getattr(inst, "name", None) == "ma_cross"
+        and getattr(inst, "short_period", None) == 999
+    ]
+    assert ma_cross_tuned, (
+        f"No ma_cross factory instance had short_period=999. "
+        f"Got instances: {[(getattr(i, 'name', '?'), getattr(i, 'short_period', '?')) for i in factory_instances]}. "
+        "The selector factory is ignoring resolve_params's return value and "
+        "falling back to goal.params instead of the tuned cfg."
+    )
