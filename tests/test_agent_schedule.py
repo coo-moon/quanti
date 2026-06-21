@@ -97,3 +97,33 @@ def test_daily_runs_only_on_trading_days(tmp_path, monkeypatch):
     goal.params = {**goal.params, "daily_trading_days_only": False}
     save_goal(db, goal)
     assert rt._daily_runs_today() is True
+
+
+def test_restart_spawns_new_thread_and_keeps_enabled(tmp_path):
+    db, rt = _runtime(tmp_path)
+    # Daily mode → start() 不会立即跑一轮 cycle（避免触网/耗时）。
+    goal = load_goal(db)
+    goal.params = {**(goal.params or {}), "daily_run_time": "23:59"}
+    save_goal(db, goal)
+    rt.start()
+    try:
+        assert rt.status().running is True
+        first_thread = rt._thread
+        rt.restart()
+        assert rt.status().running is True
+        assert rt._thread is not first_thread        # 换了新线程
+        assert load_goal(db).enabled is True         # enabled 被保留
+    finally:
+        rt.stop()
+
+
+def test_restart_when_not_running_behaves_like_start(tmp_path):
+    db, rt = _runtime(tmp_path)
+    goal = load_goal(db)
+    goal.params = {**(goal.params or {}), "daily_run_time": "23:59"}
+    save_goal(db, goal)
+    rt.restart()  # 从未 start 过 → 等价于 start()
+    try:
+        assert rt.status().running is True
+    finally:
+        rt.stop()

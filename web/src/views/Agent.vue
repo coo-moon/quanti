@@ -42,6 +42,7 @@
         <div class="stat-info">
           <span class="stat-label">运行模式</span>
           <span class="stat-value stat-value-sm">{{ modeLabel }}</span>
+          <span v-if="scheduleSubStr" class="stat-sub">{{ scheduleSubStr }}</span>
         </div>
       </div>
       <div class="stat-card" :class="pendingCardClass" v-if="(agent?.pending_orders ?? 0) > 0">
@@ -94,6 +95,25 @@
             </option>
           </select>
         </label>
+      </div>
+      <div class="schedule-block">
+        <label class="schedule-toggle">
+          <input type="checkbox" v-model="advParams.daily_schedule_enabled" />
+          <span>每日定时运行</span>
+        </label>
+        <div v-if="advParams.daily_schedule_enabled" class="schedule-fields">
+          <label class="schedule-time">
+            <span>运行时间</span>
+            <input type="time" v-model="advParams.daily_run_time" />
+          </label>
+          <label class="schedule-toggle">
+            <input type="checkbox" v-model="advParams.daily_trading_days_only" />
+            <span>仅交易日运行（周末/节假日自动跳过）</span>
+          </label>
+          <p class="muted">
+            节假日精度需先运行 <code>quanti sync --calendar</code>；否则按周一~周五判定。
+          </p>
+        </div>
       </div>
       <div class="actions">
         <button class="btn-primary" :disabled="saving" @click="saveGoal">
@@ -504,6 +524,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import {
   agentStart,
   agentStop,
+  agentRestart,
   agentTick,
   fetchAgentDecisions,
   fetchAgentStatus,
@@ -567,6 +588,11 @@ const advParams = reactive({
   llm_debate_rounds: 1,
   llm_risk_debate: false,
   llm_reflection: false,
+  // 每日定时调度（cron-lite）：开启后每天在 daily_run_time 跑一次，
+  // 否则按 tick_interval_sec 间隔跑。daily_schedule_enabled 仅 UI 本地状态。
+  daily_schedule_enabled: false,
+  daily_run_time: "09:35",
+  daily_trading_days_only: true,
 });
 
 function syncAdvFromParams() {
@@ -587,12 +613,16 @@ function syncAdvFromParams() {
     typeof p.llm_debate_rounds === "number" ? p.llm_debate_rounds : 1;
   advParams.llm_risk_debate = !!p.llm_risk_debate;
   advParams.llm_reflection = !!p.llm_reflection;
+  const drt = typeof p.daily_run_time === "string" ? p.daily_run_time : "";
+  advParams.daily_schedule_enabled = drt !== "";
+  if (drt) advParams.daily_run_time = drt;
+  advParams.daily_trading_days_only = p.daily_trading_days_only !== false;
 }
 
 function syncParamsFromAdv() {
   // Preserve any unknown keys the user may have set via API/MCP.
   const existing = (goalDraft.params || {}) as Record<string, unknown>;
-  goalDraft.params = {
+  const params: Record<string, unknown> = {
     ...existing,
     agent_mode: advParams.agent_mode === "llm" ? "llm" : "",
     ensemble_enabled:
@@ -609,6 +639,28 @@ function syncParamsFromAdv() {
     llm_debate_rounds: advParams.llm_debate_rounds,
     llm_risk_debate: advParams.llm_risk_debate,
     llm_reflection: advParams.llm_reflection,
+  };
+  if (advParams.daily_schedule_enabled && advParams.daily_run_time) {
+    params.daily_run_time = advParams.daily_run_time;
+    params.daily_trading_days_only = advParams.daily_trading_days_only;
+  } else {
+    delete params.daily_run_time;
+    delete params.daily_trading_days_only;
+  }
+  goalDraft.params = params;
+}
+
+// 服务端确认的调度快照（只在 loadAll 里从已拉取的 goalDraft.params 写入）。
+// 顶部状态卡（下次运行时刻 / 模式副标）读它 = 反映正在运行的 agent；
+// 编辑表单读 advParams = 草稿。saveGoal 也用它做「调度是否变化」判断。
+const activeSchedule = ref({ enabled: false, time: "", tradingOnly: true });
+function captureActiveSchedule() {
+  const p = (goalDraft.params || {}) as Record<string, unknown>;
+  const time = typeof p.daily_run_time === "string" ? p.daily_run_time : "";
+  activeSchedule.value = {
+    enabled: time !== "",
+    time,
+    tradingOnly: p.daily_trading_days_only !== false,
   };
 }
 
@@ -821,9 +873,32 @@ const uptimeStr = computed(() => {
 const lastTickStr = computed(() => _hhmm(agent.value?.last_tick_at ?? null));
 const nextTickStr = computed(() => {
   const a = agent.value;
-  if (!a || !a.running || !a.last_tick_at || !a.tick_interval_sec) return "—";
+  if (!a || !a.running) return "—";
+  // 每日定时模式：显示下一个 daily_run_time 时刻（服务端确认的调度，非草稿）。
+  if (activeSchedule.value.enabled && activeSchedule.value.time) {
+    const parts = activeSchedule.value.time.split(":");
+    const h = Number(parts[0]);
+    const m = Number(parts[1]);
+    if (parts[1] !== undefined && !Number.isNaN(h) && !Number.isNaN(m)) {
+      const now = new Date(nowTs.value);
+      const next = new Date(now);
+      next.setHours(h, m, 0, 0);
+      if (next <= now) next.setDate(next.getDate() + 1); // 已过则滚到明天
+      const sameDay = next.getDate() === now.getDate();  // 滚动后日期不同 => 明天
+      const hh = String(next.getHours()).padStart(2, "0");
+      const mm = String(next.getMinutes()).padStart(2, "0");
+      return `${hh}:${mm}${sameDay ? "" : "(明天)"}`;
+    }
+  }
+  // 间隔模式（原逻辑不变）。
+  if (!a.last_tick_at || !a.tick_interval_sec) return "—";
   const next = new Date(Date.parse(a.last_tick_at) + a.tick_interval_sec * 1000);
   return `${String(next.getHours()).padStart(2, "0")}:${String(next.getMinutes()).padStart(2, "0")}`;
+});
+const scheduleSubStr = computed(() => {
+  if (!activeSchedule.value.enabled || !activeSchedule.value.time) return "";
+  const days = activeSchedule.value.tradingOnly ? "仅交易日" : "含周末";
+  return `每日 ${activeSchedule.value.time} · ${days}`;
 });
 
 // Lookup table: stable name → display label. Built reactively from the
@@ -894,6 +969,7 @@ async function loadAll() {
   ]);
   Object.assign(goalDraft, g.data);
   syncAdvFromParams();
+  captureActiveSchedule();
   portfolio.value = p.data;
   agent.value = a.data;
   decisions.value = d.data;
@@ -913,8 +989,20 @@ async function saveGoal() {
   try {
     // Push the mode/upgrade switches into goalDraft.params right before sending.
     syncParamsFromAdv();
+    const p = goalDraft.params as Record<string, unknown>;
+    const newTime = typeof p.daily_run_time === "string" ? p.daily_run_time : "";
+    const newTradingOnly = p.daily_trading_days_only !== false;
+    const scheduleChanged =
+      newTime !== activeSchedule.value.time ||
+      newTradingOnly !== activeSchedule.value.tradingOnly;
     await updateGoal(goalDraft);
-    setMessage("目标已保存");
+    if (scheduleChanged && agent.value?.running) {
+      await agentRestart();
+      setMessage("目标已保存；调度已更新，Agent 已重启");
+    } else {
+      setMessage("目标已保存");
+    }
+    await loadAll(); // 刷新状态并通过 captureActiveSchedule 更新服务端确认调度快照
   } catch (e: any) {
     setMessage("保存失败: " + (e?.message ?? e), true);
   } finally {
@@ -1493,5 +1581,29 @@ onUnmounted(() => {
   font-size: 13px;
   margin-bottom: 14px;
   cursor: pointer;
+}
+.schedule-block {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, #e5e7eb);
+}
+.schedule-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.schedule-fields {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.schedule-time {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.schedule-time input {
+  width: 140px;
 }
 </style>

@@ -170,6 +170,14 @@ class AgentRuntime:
         except Exception:
             pass
 
+    def restart(self) -> None:
+        """Reschedule cleanly: stop the running loop thread (joining it) then
+        start a fresh one, WITHOUT flipping persisted goal.enabled. Used when
+        the daily schedule changes so a new daily_run_time takes effect
+        immediately. Safe to call when not running (acts like start())."""
+        self.shutdown()
+        self.start()
+
     def status(self) -> AgentStatus:
         with self._lock:
             snap = self._broker.snapshot_portfolio()
