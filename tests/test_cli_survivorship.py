@@ -53,7 +53,9 @@ def test_cmd_sync_tushare_stocks(tmp_path, monkeypatch):
     from quanti.data.database import Database
 
     dbp = str(tmp_path / "paper.db")
-    Database(dbp).initialize()
+    seed = Database(dbp)
+    seed.initialize()
+    seed.close()
 
     monkeypatch.setattr(cli, "_open_db",
                         lambda: _init(Database(dbp)))

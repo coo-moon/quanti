@@ -57,7 +57,7 @@ def cmd_sync(args):
 
     if getattr(args, "tushare_quotes", False):
         from quanti.data.tushare_adapter import TushareAdapter
-        adapter = TushareAdapter(db)
+        ta = TushareAdapter(db)
         stocks = db.list_stocks()
         if getattr(args, "delisted_only", False):
             stocks = [s for s in stocks if s.delist_date is not None]
@@ -65,7 +65,7 @@ def cmd_sync(args):
         logger.info(f"Syncing Tushare quotes for {len(codes)} stocks...")
         for i, code in enumerate(codes):
             try:
-                adapter.sync_daily_quotes(code)
+                ta.sync_daily_quotes(code)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"  {code}: {e}")
             if (i + 1) % 50 == 0:
