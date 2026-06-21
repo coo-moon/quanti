@@ -297,16 +297,9 @@ class AgentRuntime:
         builder filtered everything out (config too strict), fall back to
         the unfiltered list so the agent doesn't deadlock.
         """
-        from quanti.agent.universe import UniverseBuilder, UniverseConfig
+        from quanti.agent.universe import UniverseBuilder, universe_config_from_params
 
-        cfg = UniverseConfig(
-            min_adv20_yuan=float(params.get("universe_min_adv20",
-                                             UniverseConfig.min_adv20_yuan)),
-            min_active_days_60=int(params.get("universe_min_active_days",
-                                              UniverseConfig.min_active_days_60)),
-            min_age_days=int(params.get("universe_min_age_days",
-                                        UniverseConfig.min_age_days)),
-        )
+        cfg = universe_config_from_params(params)
         today = date.today()
         cfg_key = (cfg.min_adv20_yuan, cfg.min_active_days_60, cfg.min_age_days,
                    len(codes))

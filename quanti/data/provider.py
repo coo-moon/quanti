@@ -47,3 +47,12 @@ class DataProvider:
     def get_all_codes(self) -> list[str]:
         """Get all stock codes."""
         return [s.code for s in self._db.list_stocks()]
+
+    def get_adv20_map(self, start: date, end: date,
+                      window: int = 20) -> dict[str, float]:
+        """20-day ADV per code over [start, end], batched in one query.
+
+        See Database.get_adv20_map — used by `sort_by_adv20` to rank a whole
+        universe without one round-trip per code.
+        """
+        return self._db.get_adv20_map(start, end, window)

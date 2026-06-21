@@ -515,6 +515,35 @@ class Database:
             df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
 
+    def get_adv20_map(self, start: date, end: date,
+                      window: int = 20) -> dict[str, float]:
+        """Mean turnover (`amount`) over each code's most-recent `window` bars
+        within [start, end], for every code that traded in the window — in a
+        SINGLE query.
+
+        `sort_by_adv20` used to read bars per code: ranking the whole ~5500-name
+        universe took ~22s of N round-trips. This batches it into one windowed
+        aggregate (codes absent from the window simply don't appear → the caller
+        treats them as ADV 0). Semantics match the old `bars[-20:]` mean: the
+        most recent `window` bars by date, or all of them if fewer exist.
+        """
+        with self._db_lock:
+            rows = self._raw_conn.execute(
+                """
+                SELECT code, AVG(amount) AS adv FROM (
+                    SELECT code, amount,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY code ORDER BY date DESC) AS rn
+                    FROM daily_quotes
+                    WHERE date >= ? AND date <= ?
+                )
+                WHERE rn <= ?
+                GROUP BY code
+                """,
+                (start.isoformat(), end.isoformat(), window),
+            ).fetchall()
+        return {r[0]: float(r[1] or 0.0) for r in rows}
+
     @staticmethod
     def _safe_quote_date(v) -> date | None:
         """Tolerant parse of a stored quote date. Garbage → None ("no usable

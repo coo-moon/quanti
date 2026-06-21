@@ -757,6 +757,7 @@ async def _run_mine(job_id: str, state, n: int) -> None:
     from quanti.agent import factor_miner
     from quanti.agent.goal import load_goal
     from quanti.agent.llm_runtime import build_llm_client
+    from quanti.agent.universe import resolve_tradable_universe
     from quanti.data.provider import DataProvider
 
     db = state.db
@@ -766,13 +767,10 @@ async def _run_mine(job_id: str, state, n: int) -> None:
         goal = load_goal(db)
         params = goal.params or {}
         provider = DataProvider(db)
-        pool = goal.universe_pool
-        codes = (
-            [s.code for s in db.get_pool_stocks(pool)]
-            if pool
-            else [s.code for s in db.list_stocks()]
-        )
-        codes = codes[: max(20, int(params.get("selector_max_universe", 100)))]
+        # Same tradable-universe selection the live agent uses, as of today.
+        codes = resolve_tradable_universe(
+            db, provider, pool=goal.universe_pool,
+            params=goal.params, as_of=date.today())
         llm = build_llm_client(params)
         db.update_sync_job(job_id, 0, "running", {})
         results = factor_miner.mine_factors(
@@ -998,6 +996,7 @@ async def _run_optimize(job_id: str, classes: list, state) -> None:
     from datetime import date as _date
 
     from quanti.agent.hyperopt import HyperOptimizer
+    from quanti.agent.universe import resolve_tradable_universe
     from quanti.backtest.engine import BacktestEngine
     from quanti.data.provider import DataProvider
     from quanti.agent.goal import load_goal
@@ -1009,13 +1008,11 @@ async def _run_optimize(job_id: str, classes: list, state) -> None:
     def work() -> None:
         goal = load_goal(db)
         provider = DataProvider(db)
-        pool = goal.universe_pool
-        if pool:
-            codes = [s.code for s in db.get_pool_stocks(pool)]
-        else:
-            codes = [s.code for s in db.list_stocks()]
-        max_universe = int((goal.params or {}).get("selector_max_universe", 100))
-        codes = codes[: max(20, max_universe)]
+        # Same tradable-universe selection the live agent uses (ADV-ranked,
+        # optional liquidity filter) — not a dictionary-order slice.
+        codes = resolve_tradable_universe(
+            db, provider, pool=goal.universe_pool,
+            params=goal.params, as_of=_date.today())
 
         db.update_sync_job(job_id, 0, "running", {})
 
