@@ -606,17 +606,22 @@ const tunedNames = computed(() =>
 const loadTuned = async () => { tuned.value = (await fetchTunedParams()).data; };
 const startOptimize = async () => {
   optimizing.value = true;
-  const { data } = await runOptimizeAsync();
-  const jobId = data.job_id;
-  optTimer = window.setInterval(async () => {
-    const s = (await fetchOptimizeStatus(jobId)).data;
-    optProgress.value = { current: s.current, total: s.total, strategy: s.current_strategy };
-    tuned.value = s.results;
-    if (s.status === "done" || s.status === "error") {
-      window.clearInterval(optTimer);
-      optimizing.value = false;
-    }
-  }, 1500);
+  try {
+    const { data } = await runOptimizeAsync();
+    const jobId = data.job_id;
+    optTimer = window.setInterval(async () => {
+      const s = (await fetchOptimizeStatus(jobId)).data;
+      optProgress.value = { current: s.current, total: s.total, strategy: s.current_strategy };
+      tuned.value = s.results;
+      if (s.status === "done" || s.status === "error") {
+        window.clearInterval(optTimer);
+        optimizing.value = false;
+      }
+    }, 1500);
+  } catch (e) {
+    console.error("optimize launch failed", e);
+    optimizing.value = false;
+  }
 };
 
 // Exits = sells. risk_exit is the stop-loss/take-profit/strategy-exit path;
