@@ -1002,7 +1002,7 @@ async function saveGoal() {
     } else {
       setMessage("目标已保存");
     }
-    await loadAll(); // 刷新状态并通过 captureScheduleBaseline 重置基线
+    await loadAll(); // 刷新状态并通过 captureActiveSchedule 更新服务端确认调度快照
   } catch (e: any) {
     setMessage("保存失败: " + (e?.message ?? e), true);
   } finally {
