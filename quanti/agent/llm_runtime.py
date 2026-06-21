@@ -136,6 +136,24 @@ class LLMClient(Protocol):
         ...
 
 
+def build_llm_client(params: dict) -> LLMClient:
+    """Build an LLM client from goal params.
+
+    Checks ``params["llm_provider"]`` (default: ``"anthropic"``).
+    ``"deepseek"`` or ``"openai_compat"`` → :class:`DeepSeekLLMClient`;
+    anything else → :class:`AnthropicLLMClient`.
+
+    Raises if the required SDK / API key is missing — callers should wrap in
+    try/except and fall back gracefully.
+    """
+    provider = str(params.get("llm_provider", "anthropic")).lower()
+    if provider in ("deepseek", "openai_compat"):
+        from quanti.agent.openai_compat import DeepSeekLLMClient  # noqa: PLC0415
+
+        return DeepSeekLLMClient()
+    return AnthropicLLMClient()
+
+
 class AnthropicLLMClient:
     """Thin wrapper around the official Anthropic SDK with prompt caching.
 

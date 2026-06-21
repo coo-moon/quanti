@@ -353,4 +353,34 @@ export const fetchOptimizeStatus = (jobId: string) =>
 export const fetchTunedParams = () =>
   api.get<OptimizeResultItem[]>("/agent/tuned-params");
 
+// --- LLM factor mining ---
+export interface GeneratedFactor {
+  name: string;
+  expr_str: string;
+  train_ic: number | null;
+  oos_ic: number | null;
+  accepted: boolean;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface MineStatus {
+  job_id: string;
+  current: number;
+  total: number;
+  status: string; // "running" | "done" | "error"
+  results: GeneratedFactor[];
+}
+
+export const runMineAsync = () =>
+  api.post<{ job_id: string }>("/agent/mine-factors/async");
+export const fetchMineStatus = (jobId: string) =>
+  api.get<MineStatus>("/agent/mine-factors/status", { params: { job_id: jobId } });
+export const fetchGeneratedFactors = () =>
+  api.get<GeneratedFactor[]>("/factors/generated");
+export const setFactorEnabled = (name: string, enabled: boolean) =>
+  api.post<{ ok: boolean; name: string; enabled: boolean }>(
+    `/factors/generated/${encodeURIComponent(name)}/enabled`, { enabled });
+
 export default api;
+

@@ -482,7 +482,8 @@ class AgentRuntime:
 
         panel = compute_factor_panel(
             self._provider, self._db, candidates,
-            config=FactorConfig(industry_neutralize=industry_neutral))
+            config=FactorConfig(industry_neutralize=industry_neutral),
+            include_generated=bool(params.get("use_generated_factors", False)))
 
         sentiment_scores = None
         if sentiment_enabled and sentiment_blend > 0:

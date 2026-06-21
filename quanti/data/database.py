@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -12,6 +14,12 @@ from quanti.models import StockInfo
 
 
 import threading
+
+logger = logging.getLogger(__name__)
+
+
+def _nan_to_none(x):
+    return None if x is None or (isinstance(x, float) and math.isnan(x)) else float(x)
 
 
 class _Result:
@@ -362,6 +370,16 @@ class Database:
                 n_combos INTEGER,
                 universe_size INTEGER,
                 tuned_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS generated_factors (
+                name TEXT PRIMARY KEY,
+                expr_str TEXT NOT NULL,
+                train_ic REAL,
+                oos_ic REAL,
+                accepted INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -1139,3 +1157,49 @@ class Database:
              datetime.now().isoformat()),
         )
         self.conn.commit()
+
+    # ----- generated factors --------------------------------------------
+
+    def save_generated_factor(self, name: str, expr_str: str, train_ic: float,
+                              oos_ic: float, accepted: bool,
+                              enabled: bool = True) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO generated_factors "
+            "(name, expr_str, train_ic, oos_ic, accepted, enabled, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, expr_str, _nan_to_none(train_ic), _nan_to_none(oos_ic),
+             1 if accepted else 0, 1 if enabled else 0,
+             datetime.now().isoformat()),
+        )
+        self.conn.commit()
+
+    def list_generated_factors(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT name, expr_str, train_ic, oos_ic, accepted, enabled, "
+            "created_at FROM generated_factors ORDER BY oos_ic DESC"
+        ).fetchall()
+        return [{"name": r[0], "expr_str": r[1], "train_ic": r[2],
+                 "oos_ic": r[3], "accepted": bool(r[4]), "enabled": bool(r[5]),
+                 "created_at": r[6]} for r in rows]
+
+    def set_factor_enabled(self, name: str, enabled: bool) -> None:
+        self.conn.execute(
+            "UPDATE generated_factors SET enabled=? WHERE name=?",
+            (1 if enabled else 0, name))
+        self.conn.commit()
+
+    def load_active_factor_fns(self) -> dict:
+        from quanti.factors.library import as_factor_fn
+        from quanti.factors.parser import FactorParseError, parse_expr
+        rows = self.conn.execute(
+            "SELECT name, expr_str FROM generated_factors "
+            "WHERE accepted=1 AND enabled=1"
+        ).fetchall()
+        out = {}
+        for name, expr_str in rows:
+            try:
+                out[name] = as_factor_fn(parse_expr(expr_str))
+            except FactorParseError:
+                logger.warning("skipping unparseable generated factor %s: %s",
+                               name, expr_str)
+        return out
