@@ -23,7 +23,7 @@ router = APIRouter()
 
 class BacktestRequest(BaseModel):
     strategy_name: str
-    codes: list[str]
+    codes: list[str] = []
     start: str  # YYYY-MM-DD
     end: str
     initial_cash: float = 1_000_000.0

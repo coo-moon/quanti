@@ -77,3 +77,51 @@ async def test_backtest_survivorship_free_consults_pit_universe(client, monkeypa
     assert r.status_code == 200
     # The PIT universe for this window includes the delisted 600001.
     assert captured["codes"] == ["000001", "600001"]
+
+
+@pytest.mark.asyncio
+async def test_backtest_survivorship_free_caps_universe(client, monkeypatch):
+    ac, db = client
+    import quanti.api.routes as mod
+
+    captured = {}
+
+    class FakeResult:
+        metrics = {}
+        skip_reason = ""
+        trades = []
+        equity_curve = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, strategy, codes, start, end):
+            captured["codes"] = list(codes)
+            return FakeResult()
+
+    class FakeStrategy:
+        name = "dummy"
+
+        def init(self, params):
+            pass
+
+    class FakeLoader:
+        def load_directory(self, _d):
+            return [FakeStrategy()]
+
+    monkeypatch.setattr(mod, "BacktestEngine", FakeEngine)
+    monkeypatch.setattr(mod, "StrategyLoader", FakeLoader)
+
+    async with ac as c:
+        r = await c.post("/api/backtest/run", json={
+            "strategy_name": "dummy",
+            "codes": [],
+            "start": "2021-06-01",
+            "end": "2022-01-01",
+            "survivorship_free": True,
+            "max_universe": 1,
+        })
+    assert r.status_code == 200
+    # PIT universe for this window is ["000001", "600001"]; cap=1 keeps only the first.
+    assert captured["codes"] == ["000001"]
