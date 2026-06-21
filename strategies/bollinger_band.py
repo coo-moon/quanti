@@ -10,6 +10,7 @@ class BollingerBandStrategy(BaseStrategy):
     name = "bollinger_band"
     name_zh = "布林带突破"
     description = "价格触及布林带下轨(超卖)→ 买入,触及上轨(超买)→ 卖出"
+    param_space = {"period": [15, 20, 25], "std_dev": [1.5, 2.0, 2.5]}
 
     def init(self, config: dict) -> None:
         self.period = config.get("period", 20)

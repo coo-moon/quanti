@@ -24,6 +24,10 @@ class BaseStrategy(ABC):
     name: str = "unnamed"
     name_zh: str = ""       # display label, optional but recommended
     description: str = ""   # 1-line summary of what it does
+    param_space: dict[str, list] = {}
+    """Optional grid for walk-forward hyperopt: param name → candidate values.
+    Empty = not tuned (strategy always uses init() defaults). Include the
+    built-in defaults as candidates so the default config is in the grid."""
 
     @abstractmethod
     def init(self, config: dict) -> None:

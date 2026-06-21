@@ -1,6 +1,5 @@
 """Moving Average Crossover Strategy."""
 
-from quanti.factors.technical import compute_ma
 from quanti.models import BarData, Direction, Signal
 from quanti.strategy.base import BaseStrategy
 
@@ -11,6 +10,7 @@ class MACrossStrategy(BaseStrategy):
     name = "ma_cross"
     name_zh = "均线交叉"
     description = "短期 MA 上穿长期 MA → 金叉买入;短期 MA 下穿长期 MA → 死叉卖出"
+    param_space = {"short_period": [3, 5, 8, 10], "long_period": [20, 30, 60]}
 
     def init(self, config: dict) -> None:
         self.short_period = config.get("short_period", 5)

@@ -10,6 +10,7 @@ class MACDCrossStrategy(BaseStrategy):
     name = "macd_cross"
     name_zh = "MACD 金叉"
     description = "MACD 金叉(DIF 上穿 DEA)买入,死叉(DIF 下穿 DEA)卖出"
+    param_space = {"fast": [8, 12], "slow": [21, 26, 30]}
 
     def init(self, config: dict) -> None:
         self.fast = config.get("fast", 12)
