@@ -49,6 +49,29 @@ def cmd_sync(args):
                 logger.info(f"  Progress: {i + 1}/{len(codes)}")
         logger.info("Quote sync complete")
 
+    if getattr(args, "tushare_stocks", False):
+        from quanti.data.tushare_adapter import TushareAdapter
+        logger.info("Syncing Tushare stock list (incl. delisted)...")
+        n = TushareAdapter(db).sync_stock_list()
+        logger.info(f"Synced {n} stocks from Tushare")
+
+    if getattr(args, "tushare_quotes", False):
+        from quanti.data.tushare_adapter import TushareAdapter
+        adapter = TushareAdapter(db)
+        stocks = db.list_stocks()
+        if getattr(args, "delisted_only", False):
+            stocks = [s for s in stocks if s.delist_date is not None]
+        codes = [s.code for s in stocks]
+        logger.info(f"Syncing Tushare quotes for {len(codes)} stocks...")
+        for i, code in enumerate(codes):
+            try:
+                adapter.sync_daily_quotes(code)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"  {code}: {e}")
+            if (i + 1) % 50 == 0:
+                logger.info(f"  Progress: {i + 1}/{len(codes)}")
+        logger.info("Tushare quote sync complete")
+
     db.close()
 
 
@@ -306,6 +329,15 @@ def main():
     sync_parser.add_argument("--quotes", action="store_true")
     sync_parser.add_argument("--calendar", action="store_true")
     sync_parser.add_argument("--codes", type=str)
+    sync_parser.add_argument("--tushare-stocks", action="store_true",
+                             dest="tushare_stocks",
+                             help="Sync full roster incl. delisted via Tushare")
+    sync_parser.add_argument("--tushare-quotes", action="store_true",
+                             dest="tushare_quotes",
+                             help="Sync daily history via Tushare")
+    sync_parser.add_argument("--delisted-only", action="store_true",
+                             dest="delisted_only",
+                             help="With --tushare-quotes: only delisted stocks")
 
     # backtest
     bt_parser = subparsers.add_parser("backtest", help="Run backtest")
