@@ -200,3 +200,17 @@ class TestComposite:
                                      ["A_trend", "B_trend", "C_choppy", "D_decline"])
         rk = rank_by_composite(panel, top_n=2)
         assert len(rk) == 2
+
+
+def test_generated_factor_enters_panel_only_when_included(panel_db):
+    from quanti.data.provider import DataProvider
+    from quanti.factors.cross_sectional import compute_factor_panel
+    provider = DataProvider(panel_db)
+    # An accepted+enabled generated factor.
+    panel_db.save_generated_factor("llm_x", "-Mean(close,5)", 0.05, 0.04,
+                                   accepted=True)
+    codes = ["A_trend", "B_trend", "C_choppy", "D_decline"]
+    base = compute_factor_panel(provider, panel_db, codes)
+    incl = compute_factor_panel(provider, panel_db, codes, include_generated=True)
+    assert "llm_x" not in base.columns
+    assert "llm_x" in incl.columns

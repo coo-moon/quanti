@@ -134,6 +134,7 @@ def compute_factor_panel(
     codes: list[str],
     as_of: date | None = None,
     config: FactorConfig | None = None,
+    include_generated: bool = False,
 ) -> pd.DataFrame:
     """Compute the cross-sectional factor panel for `codes` as of `as_of`.
 
@@ -148,7 +149,9 @@ def compute_factor_panel(
     """
     cfg = config or FactorConfig()
     as_of = as_of or date.today()
-    factor_fns = cfg.resolved()
+    factor_fns = dict(cfg.resolved())
+    if include_generated:
+        factor_fns.update(db.load_active_factor_fns())
     start = as_of - timedelta(days=cfg.lookback_days)
 
     rows: dict[str, dict[str, float]] = {}
