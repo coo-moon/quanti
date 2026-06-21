@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Iterable
 
 from quanti.agent.goal import Goal, RiskTolerance
+from quanti.agent.params import resolve_params
 from quanti.agent.walk_forward import run_walk_forward
 from quanti.backtest.engine import BacktestEngine
 from quanti.data.database import Database
@@ -148,7 +149,7 @@ class StrategySelector:
                     # Fresh instance per fold via factory. `copy.copy` is
                     # enough because BaseStrategy state is cleared in init().
                     cls = type(strat)
-                    cfg = goal.params or {}
+                    cfg = resolve_params(self._db, strat.name, goal)
                     def factory(_cls=cls, _cfg=cfg) -> BaseStrategy:
                         inst = _cls()
                         inst.init(dict(_cfg))
