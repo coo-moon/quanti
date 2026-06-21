@@ -158,7 +158,12 @@ class TushareAdapter:
             start = latest if latest else date(2010, 1, 1)
 
         bar = self._bar_fn()
-        ts_code = self._code_to_ts_code(code)
+        # Prefer the exchange stored by sync_stock_list (parsed from the real
+        # ts_code suffix); the bare-prefix heuristic mis-maps BSE 92x (→.BJ)
+        # and SH B-shares 90x (→.SH) to .SZ. Fall back only when not in roster.
+        stock = self._db.get_stock(code)
+        ts_code = (f"{code}.{stock.exchange}" if stock is not None
+                   else self._code_to_ts_code(code))
         raw = self._retry(
             bar, ts_code=ts_code, asset="E", adj="qfq",
             start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"))

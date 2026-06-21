@@ -78,6 +78,43 @@ def test_sync_daily_quotes_lands_with_zero_turnover(db):
     assert (out["turnover"] == 0).all()  # free tier has no turnover
 
 
+def test_sync_daily_quotes_uses_stored_exchange_for_ts_code(db):
+    # 92x is a Beijing Stock Exchange range and 90x a Shanghai B-share range;
+    # the bare-prefix heuristic mis-maps both to .SZ. sync_daily_quotes must
+    # instead build the ts_code from the exchange stored by sync_stock_list.
+    db.upsert_stock("920000", "京 BSE", "BJ", date(2021, 11, 15), "")
+    db.upsert_stock("900901", "沪 B股", "SH", date(1992, 5, 6), "")
+
+    captured: list[str] = []
+
+    def capturing_pro_bar(ts_code, asset, adj, start_date, end_date):
+        captured.append(ts_code)
+        return _fake_pro_bar(ts_code, asset, adj, start_date, end_date)
+
+    adapter = TushareAdapter(db, pro=FakePro(), pro_bar=capturing_pro_bar)
+    adapter.sync_daily_quotes("920000", start=date(2021, 11, 15),
+                              end=date(2021, 12, 31))
+    adapter.sync_daily_quotes("900901", start=date(1992, 5, 6),
+                              end=date(1992, 12, 31))
+
+    assert captured == ["920000.BJ", "900901.SH"]
+
+
+def test_sync_daily_quotes_falls_back_to_heuristic_when_not_in_roster(db):
+    # Stock absent from the roster → fall back to the bare-prefix heuristic.
+    captured: list[str] = []
+
+    def capturing_pro_bar(ts_code, asset, adj, start_date, end_date):
+        captured.append(ts_code)
+        return _fake_pro_bar(ts_code, asset, adj, start_date, end_date)
+
+    adapter = TushareAdapter(db, pro=FakePro(), pro_bar=capturing_pro_bar)
+    adapter.sync_daily_quotes("600519", start=date(2010, 1, 1),
+                              end=date(2010, 1, 31))
+
+    assert captured == ["600519.SH"]
+
+
 def test_methods_raise_clearly_without_token(db, monkeypatch):
     # No pro injected, no TUSHARE_TOKEN → clear error, no token leak.
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
