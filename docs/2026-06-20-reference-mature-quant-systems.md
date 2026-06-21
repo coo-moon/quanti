@@ -43,10 +43,11 @@
 - **借鉴**: 在已有 walk-forward 框架上加参数搜索（stoploss/窗口/阈值），**用 OOS 验证防过拟合**（刚加的 min-fold / 短窗口不外推年化正好兜底）。
 - **对应**: `agent/selector.py`、`agent/walk_forward.py`。
 
-### ⑥ LLM 因子/策略挖掘闭环（Qlib RD-Agent / QuantaAlpha）— 差异化方向
+### ⑥ LLM 因子/策略挖掘闭环（Qlib RD-Agent / QuantaAlpha）— 差异化方向 ✅ 已实现
 - **契合**: quanti "规则验证、LLM 只做加法"的哲学。
 - **借鉴**: 让 LLM **提因子 / 选股器（代码生成）→ 自动回测 + walk-forward 闸门 → 跑赢基线才采纳**，形成自进化因子库。
 - **对应**: `agent/llm_runtime.py` + `factors/` + `screeners/`。
+- **实现**: 见设计规范 [`docs/superpowers/specs/2026-06-21-llm-factor-mining-design.md`](superpowers/specs/2026-06-21-llm-factor-mining-design.md) 及实施计划；**factors-only**（策略生成延后至声明式 DSL 路线）；LLM 输出经 **AST-whitelist parse**（无 eval/exec）安全解析；因子进入生产须通过 **OOS-IC gate**（walk-forward 闸门）；实盘默认关闭（**live-default-off**，需双开关：账户主开关 + 单因子开关）。
 
 ### ⑦ dry-run 纪律：paper↔live 同一条代码路径（freqtrade）
 - **现状**: `Broker` 协议（PaperBroker/QmtBroker 同接口）已在做。
