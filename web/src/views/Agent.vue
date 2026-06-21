@@ -650,13 +650,16 @@ function syncParamsFromAdv() {
   goalDraft.params = params;
 }
 
-// 调度基线快照：用于 saveGoal 判断 daily_run_time/仅交易日是否变化，
-// 只有变化且 agent 在运行时才触发重启。
-let scheduleBaseline = { time: "", tradingOnly: true };
-function captureScheduleBaseline() {
+// 服务端确认的调度快照（只在 loadAll 里从已拉取的 goalDraft.params 写入）。
+// 顶部状态卡（下次运行时刻 / 模式副标）读它 = 反映正在运行的 agent；
+// 编辑表单读 advParams = 草稿。saveGoal 也用它做「调度是否变化」判断。
+const activeSchedule = ref({ enabled: false, time: "", tradingOnly: true });
+function captureActiveSchedule() {
   const p = (goalDraft.params || {}) as Record<string, unknown>;
-  scheduleBaseline = {
-    time: typeof p.daily_run_time === "string" ? p.daily_run_time : "",
+  const time = typeof p.daily_run_time === "string" ? p.daily_run_time : "";
+  activeSchedule.value = {
+    enabled: time !== "",
+    time,
     tradingOnly: p.daily_trading_days_only !== false,
   };
 }
@@ -871,17 +874,17 @@ const lastTickStr = computed(() => _hhmm(agent.value?.last_tick_at ?? null));
 const nextTickStr = computed(() => {
   const a = agent.value;
   if (!a || !a.running) return "—";
-  // 每日定时模式：显示下一个 daily_run_time 时刻。
-  if (advParams.daily_schedule_enabled && advParams.daily_run_time) {
-    const parts = advParams.daily_run_time.split(":").map(Number);
-    const h = parts[0];
-    const m = parts[1];
-    if (h !== undefined && m !== undefined && !Number.isNaN(h) && !Number.isNaN(m)) {
+  // 每日定时模式：显示下一个 daily_run_time 时刻（服务端确认的调度，非草稿）。
+  if (activeSchedule.value.enabled && activeSchedule.value.time) {
+    const parts = activeSchedule.value.time.split(":");
+    const h = Number(parts[0]);
+    const m = Number(parts[1]);
+    if (parts[1] !== undefined && !Number.isNaN(h) && !Number.isNaN(m)) {
       const now = new Date(nowTs.value);
       const next = new Date(now);
       next.setHours(h, m, 0, 0);
-      if (next <= now) next.setDate(next.getDate() + 1);
-      const sameDay = next.getDate() === now.getDate();
+      if (next <= now) next.setDate(next.getDate() + 1); // 已过则滚到明天
+      const sameDay = next.getDate() === now.getDate();  // 滚动后日期不同 => 明天
       const hh = String(next.getHours()).padStart(2, "0");
       const mm = String(next.getMinutes()).padStart(2, "0");
       return `${hh}:${mm}${sameDay ? "" : "(明天)"}`;
@@ -893,9 +896,9 @@ const nextTickStr = computed(() => {
   return `${String(next.getHours()).padStart(2, "0")}:${String(next.getMinutes()).padStart(2, "0")}`;
 });
 const scheduleSubStr = computed(() => {
-  if (!advParams.daily_schedule_enabled || !advParams.daily_run_time) return "";
-  const days = advParams.daily_trading_days_only ? "仅交易日" : "含周末";
-  return `每日 ${advParams.daily_run_time} · ${days}`;
+  if (!activeSchedule.value.enabled || !activeSchedule.value.time) return "";
+  const days = activeSchedule.value.tradingOnly ? "仅交易日" : "含周末";
+  return `每日 ${activeSchedule.value.time} · ${days}`;
 });
 
 // Lookup table: stable name → display label. Built reactively from the
@@ -966,7 +969,7 @@ async function loadAll() {
   ]);
   Object.assign(goalDraft, g.data);
   syncAdvFromParams();
-  captureScheduleBaseline();
+  captureActiveSchedule();
   portfolio.value = p.data;
   agent.value = a.data;
   decisions.value = d.data;
@@ -990,8 +993,8 @@ async function saveGoal() {
     const newTime = typeof p.daily_run_time === "string" ? p.daily_run_time : "";
     const newTradingOnly = p.daily_trading_days_only !== false;
     const scheduleChanged =
-      newTime !== scheduleBaseline.time ||
-      newTradingOnly !== scheduleBaseline.tradingOnly;
+      newTime !== activeSchedule.value.time ||
+      newTradingOnly !== activeSchedule.value.tradingOnly;
     await updateGoal(goalDraft);
     if (scheduleChanged && agent.value?.running) {
       await agentRestart();
