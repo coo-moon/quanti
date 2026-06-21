@@ -744,8 +744,6 @@ async def manual_order(body: ManualOrderBody, request: Request):
 @router.post("/agent/mine-factors/async")
 async def mine_factors_async(request: Request):
     """Start an async LLM factor-mining job. Returns job_id immediately."""
-    import uuid
-
     db = request.app.state.db
     n = 10
     job_id = f"mine_{str(uuid.uuid4())[:8]}"

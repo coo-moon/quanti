@@ -85,7 +85,9 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
                  ) -> list[MineResult]:
     cfg = cfg or LLMConfig()
     oos_start = end - timedelta(days=oos_days)
-    train_end = oos_start - timedelta(days=1)
+    # Gap >= fwd_days so the training forward-return labels (shift(-fwd_days)) do not
+    # reach into the OOS window — keeps train and OOS truly disjoint.
+    train_end = oos_start - timedelta(days=fwd_days * 2 + 3)
     train_start = train_end - timedelta(days=train_days)
 
     try:
@@ -108,22 +110,24 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
                              fwd_days=fwd_days)
         oos_ic = factor_ic(expr, provider, codes, oos_start, end,
                            fwd_days=fwd_days)
-        reason, accepted = _gate(expr, provider, codes, end, train_ic, oos_ic,
-                                 accepted_xs, oos_ic_threshold, min_train_ic,
-                                 redundancy_max)
+        reason, accepted, xs = _gate(expr, provider, codes, end, train_ic, oos_ic,
+                                    accepted_xs, oos_ic_threshold, min_train_ic,
+                                    redundancy_max)
         if accepted:
-            accepted_xs.append(_cross_section(expr, provider, codes, end))
+            accepted_xs.append(xs if xs is not None else _cross_section(expr, provider, codes, end))
         db.save_generated_factor(name, expr_str, train_ic, oos_ic, accepted)
         results.append(MineResult(name, expr_str, train_ic, oos_ic, accepted, reason))
     return results
 
 
 def _gate(expr, provider, codes, end, train_ic, oos_ic, accepted_xs,
-          oos_ic_threshold, min_train_ic, redundancy_max) -> tuple[str, bool]:
+          oos_ic_threshold, min_train_ic, redundancy_max) -> tuple[str, bool, dict | None]:
     if np.isnan(train_ic) or abs(train_ic) < min_train_ic:
-        return f"train_ic {train_ic:.3f} below {min_train_ic}", False
+        return f"train_ic {train_ic:.3f} below {min_train_ic}", False, None
     if np.isnan(oos_ic) or oos_ic < oos_ic_threshold:
-        return f"oos_ic {oos_ic:.3f} below {oos_ic_threshold}", False
+        return f"oos_ic {oos_ic:.3f} below {oos_ic_threshold}", False, None
+    if not accepted_xs:
+        return f"accepted (oos_ic={oos_ic:.3f})", True, None
     xs = _cross_section(expr, provider, codes, end)
     for prev in accepted_xs:
         common = [c for c in xs if c in prev]
@@ -131,5 +135,5 @@ def _gate(expr, provider, codes, end, train_ic, oos_ic, accepted_xs,
             a = pd.Series([xs[c] for c in common]).rank()
             b = pd.Series([prev[c] for c in common]).rank()
             if a.std() and b.std() and abs(np.corrcoef(a, b)[0, 1]) >= redundancy_max:
-                return f"redundant (|corr|>={redundancy_max})", False
-    return f"accepted (oos_ic={oos_ic:.3f})", True
+                return f"redundant (|corr|>={redundancy_max})", False, None
+    return f"accepted (oos_ic={oos_ic:.3f})", True, xs
