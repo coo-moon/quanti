@@ -37,6 +37,7 @@ from quanti.data.provider import DataProvider
 from quanti.execution.base import BrokerResult, PendingFillResult
 from quanti.models import Direction, Portfolio, Position, PriceType, Signal
 from quanti.risk.manager import RiskConfig, RiskManager
+from quanti.risk.sizer import compute_buy_target_value
 
 if TYPE_CHECKING:
     from quanti.risk.protections import ProtectionConfig
@@ -99,8 +100,7 @@ class QmtBroker:
             if vol <= 0:
                 continue
             avg = float(p.get("avg_price", 0.0))
-            mv = float(p.get("market_value", avg * vol))
-            cur = mv / vol if vol else avg
+            cur = self._current_price(p, vol, avg)
             stock = self._db.get_stock(p["code"])
             pf.positions[p["code"]] = Position(
                 stock_code=p["code"], quantity=vol, avg_cost=avg,
@@ -108,6 +108,20 @@ class QmtBroker:
                 industry=stock.industry if stock else "")
             sellable[p["code"]] = int(p.get("can_use_volume", 0))
         return pf, sellable
+
+    @staticmethod
+    def _current_price(p: dict, vol: int, avg: float) -> float:
+        """Current per-share price for a venue position row. Prefer the live
+        last price; fall back to market_value/vol, then cost. Reverse-deriving
+        from a cost-based market_value used to pin current_price ≡ avg → pnl 0
+        → stop-loss never fired (audit C5)."""
+        last = float(p.get("last_price", 0) or 0)
+        if last > 0:
+            return last
+        mv = float(p.get("market_value", 0) or 0)
+        if mv > 0 and vol:
+            return mv / vol
+        return avg
 
     def snapshot_portfolio(self) -> dict:
         """Reconciled cash/positions/pnl from the broker, in the same shape
@@ -123,14 +137,13 @@ class QmtBroker:
             if vol <= 0:
                 continue
             avg = float(p.get("avg_price", 0.0))
-            mv = float(p.get("market_value", avg * vol))
-            cur = mv / vol if vol else avg
+            cur = self._current_price(p, vol, avg)
             stock = self._db.get_stock(p["code"])
             enriched.append({
                 "code": p["code"],
                 "name": stock.name if stock else p["code"],
                 "quantity": vol, "avg_cost": avg, "current_price": cur,
-                "price_date": None, "market_value": mv,
+                "price_date": None, "market_value": cur * vol,
                 "sellable": int(p.get("can_use_volume", 0)),  # T+1-free qty
                 "pnl": (cur - avg) * vol,
                 "pnl_pct": (cur - avg) / avg if avg else 0.0,
@@ -224,7 +237,12 @@ class QmtBroker:
                     code=signal.stock_code, details={"venue": "qmt"})
                 return False, "rejected", r
             volume = can_sell
-            price = pos.current_price * (1 - self._slippage)
+            # Price off the live quote (like BUY via _latest_price), not the
+            # position's current_price — which, before C5, was the cost basis.
+            # Falls back to the reconciled current_price if the quote is down.
+            last = self._latest_price(signal.stock_code)
+            ref = last if last > 0 else pos.current_price
+            price = ref * (1 - self._slippage)
 
         res = self._client.post("/trader/order", {
             "code": signal.stock_code, "direction": signal.direction.value,
@@ -267,8 +285,10 @@ class QmtBroker:
         # RiskManager so paper/live/backtest can't drift apart.
         room = self._risk.max_additional_buy_value(
             portfolio, signal.stock_code, stock.industry if stock else "")
-        cash_cap = cash * 0.95 * max(min(signal.strength, 1.0), 0.1)
-        target_value = min(cash_cap, room)
+        # Shared sizing helper (same as paper + backtest) so the paths agree.
+        target_value = compute_buy_target_value(
+            cash=cash, total_value=portfolio.total_value,
+            strength=signal.strength, size_cap=room, code=signal.stock_code)
         lots = int(target_value / (price * 100)) if price > 0 else 0
         return lots * 100, price * (1 + self._slippage)
 
@@ -404,10 +424,14 @@ class QmtBroker:
 
     def enforce_portfolio_stop(self) -> bool:
         """Portfolio drawdown circuit breaker (live): flatten + signal halt when
-        equity is down past portfolio_stop_loss_pct from its high-water mark."""
-        snap = self.snapshot_portfolio()  # persists a snapshot for the peak
+        equity is down past portfolio_stop_loss_pct from its high-water mark.
+
+        Reads the high-water mark BEFORE snapshot_portfolio() overwrites today's
+        snapshot row, so a same-day top-then-drop still trips it (audit G3/L2)."""
+        prior_peak = self._db.get_peak_total_value()
+        snap = self.snapshot_portfolio()  # persists today's snapshot (overwrite)
         total = snap["total_value"]
-        peak = max(self._db.get_peak_total_value(), total)
+        peak = max(prior_peak, total)
         if not self._risk.check_portfolio_stop(total, peak):
             return False
         self.cancel_all_pending()

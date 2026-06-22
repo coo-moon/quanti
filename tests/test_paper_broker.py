@@ -75,7 +75,8 @@ def test_t_plus_one_blocks_same_day_sell(setup):
 
 def test_risk_rejects_oversize_position(setup):
     db, provider, _ = setup
-    tight = RiskConfig(max_position_pct=0.001, max_total_position_pct=0.001)
+    # 0.1% per-stock cap → room below a 100-share lot → rejected by sizing.
+    tight = RiskConfig(max_position_pct=0.001)
     broker = PaperBroker(db, provider, initial_cash=200_000, risk_config=tight)
     sig = Signal(stock_code="000001", direction=Direction.BUY,
                  strength=0.9, reason="oversized")
@@ -174,6 +175,31 @@ def test_portfolio_stop_flattens_on_drawdown(tmp_path):
     # total = 20k + 60k = 80k vs peak 100k → -20% → fire.
     assert broker.enforce_portfolio_stop() is True
     assert db.list_positions() == []
+
+
+def test_portfolio_stop_fires_on_same_day_peak_then_drop(tmp_path):
+    """Same-day top-then-drop must still trip the breaker. The peak is recorded
+    via the REAL snapshot_portfolio() API (today's row), then equity drops and
+    enforce runs. Regression for the INSERT-OR-REPLACE overwrite that deflated
+    the high-water mark when peak and trough fell on the same calendar day
+    (audit G3/L2): enforce must read the peak BEFORE overwriting today's row."""
+    from quanti.risk.manager import RiskConfig
+    db = _seed_drawdown_env(tmp_path, "ps_same_day.db", 10.0)  # marks to 10.0
+    provider = DataProvider(db)
+    broker = PaperBroker(db, provider, initial_cash=100_000, fill_mode="immediate",
+                         risk_config=RiskConfig(portfolio_stop_loss_pct=-0.15))
+    # Establish today's high-water mark via the normal API: 40k cash + 60k mv.
+    db.update_cash(40_000.0)
+    db.upsert_position("000001", 6000, 10.0, 10.0, date(2020, 1, 1))  # mv 60k
+    peak_snap = broker.snapshot_portfolio()
+    assert peak_snap["total_value"] == pytest.approx(100_000.0)
+
+    # Same calendar day: book a loss to cash → equity 82k = -18% from peak.
+    db.update_cash(22_000.0)
+    assert broker.enforce_portfolio_stop() is True
+    assert db.list_positions() == []  # flattened
+    assert any(d["kind"] == "portfolio_stop"
+               for d in db.list_decisions(limit=10))
 
 
 def test_portfolio_stop_holds_within_tolerance(tmp_path):

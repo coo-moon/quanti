@@ -50,9 +50,10 @@ class TestRiskManager:
         assert allowed is False
         assert "position" in reason.lower()
 
-    def test_rejects_at_max_total_position(self, config):
-        """Total position exceeds max_total_position_pct."""
-        config.max_total_position_pct = 0.5
+    def test_no_total_position_cap(self, config):
+        """Total-position (80%) cap removed: a fresh BUY of a new name passes
+        even when the book is already ~92% invested — only the per-stock /
+        per-industry caps remain (enforced post-trade in sizing)."""
         rm = RiskManager(config)
         portfolio = Portfolio(
             cash=20_000.0,
@@ -61,11 +62,10 @@ class TestRiskManager:
                 "600519": Position("600519", 100, 1800.0, 1800.0),
             },
         )
-        # Total position = 50000 + 180000 = 230000, total = 250000
-        # Position ratio = 92%, exceeds 50%
+        # 230000/250000 = 92% invested — would have tripped the old 80% cap.
         signal = Signal("000002", Direction.BUY, 0.5, "test")
         allowed, reason = rm.check(signal, portfolio)
-        assert allowed is False
+        assert allowed is True, reason
 
     def test_allows_sell_always(self, portfolio, config):
         """Sell signals should always pass risk check."""
@@ -146,8 +146,7 @@ class TestCheckExits:
 
 
 def test_max_additional_buy_value_enforces_all_caps():
-    rm = RiskManager(RiskConfig(max_position_pct=0.10, max_industry_pct=0.30,
-                                max_total_position_pct=0.80))
+    rm = RiskManager(RiskConfig(max_position_pct=0.10, max_industry_pct=0.30))
     # Fresh buy, nothing held: single-stock cap binds → 10% of 100k.
     pf = Portfolio(cash=100_000.0)
     assert rm.max_additional_buy_value(pf, "000001", "银行") == pytest.approx(10_000.0)
@@ -165,14 +164,16 @@ def test_max_additional_buy_value_enforces_all_caps():
     # …but a candidate in a DIFFERENT industry isn't bound by 银行's exposure.
     assert rm.max_additional_buy_value(pf_ind, "000002", "地产") == pytest.approx(10_000.0)
 
-    # Total cap binds: 78% invested → only 2% total room regardless of name.
+    # Total-position cap removed: at 78% invested a candidate in a FRESH
+    # industry is bounded only by the single-stock 10% cap (10k), not by any
+    # 80% total ceiling.
     pf_total = Portfolio(cash=22_000.0, positions={
         "600000": Position("600000", 3900, 10.0, 10.0, industry="银行"),
         "000002": Position("000002", 3900, 10.0, 10.0, industry="地产")})
     assert pf_total.market_value == pytest.approx(78_000.0)
-    assert rm.max_additional_buy_value(pf_total, "300001", "科技") == pytest.approx(2_000.0)
+    assert rm.max_additional_buy_value(pf_total, "300001", "科技") == pytest.approx(10_000.0)
 
-    # Already over a cap → 0 room.
+    # A name already over the single-stock cap still has 0 room.
     assert rm.max_additional_buy_value(pf_total, "600000", "银行") == 0.0
 
 

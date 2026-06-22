@@ -24,39 +24,13 @@ from quanti.data.provider import DataProvider
 from quanti.models import BarData, Direction, Portfolio, Position, Signal
 from quanti.risk.manager import RiskManager, STOP_LOSS_REASON_PREFIX
 from quanti.risk.protections import ProtectionContext, ProtectionManager
+from quanti.risk.sizer import Sizer, compute_buy_target_value
 from quanti.strategy.base import BaseStrategy
+from quanti.utils.market import tradable_at_open
 
 # A signal waits at most this many trading bars for a fillable (tradable, has a
 # bar) day before being abandoned — mirrors PaperBroker's pending TTL.
 _PENDING_TTL_BARS = 3
-
-
-def _limit_pct(code: str) -> float:
-    """A-share daily price-limit by board (best-effort by code prefix).
-
-    STAR (688/689) + ChiNext (300/301): 20%; Beijing Exchange (8../4../920): 30%;
-    main board: 10%. ST (±5%) can't be detected from the code alone, so it falls
-    back to the board limit (conservative — won't over-block)."""
-    if code.startswith(("688", "689", "300", "301")):
-        return 0.20
-    if code.startswith(("8", "4", "920", "92")):
-        return 0.30
-    return 0.10
-
-
-def _tradable_at_open(direction: Direction, bar: BarData,
-                      prev_close: float | None) -> bool:
-    """Whether an order can realistically fill at this bar's open.
-
-    Blocks buying into a limit-up open and selling into a limit-down open (incl.
-    一字板 locked-limit days). Without a prior close to reference, allow it."""
-    if prev_close is None or prev_close <= 0:
-        return True
-    lim = _limit_pct(bar.code)
-    eps = 0.005
-    if direction == Direction.BUY:
-        return bar.open < prev_close * (1 + lim) - eps
-    return bar.open > prev_close * (1 - lim) + eps
 
 
 @dataclass
@@ -96,6 +70,7 @@ class BacktestEngine:
         slippage: SlippageModel | float | None = None,
         risk_manager: RiskManager | None = None,
         protection_manager: ProtectionManager | None = None,
+        sizer: Sizer | None = None,
     ):
         """Args:
             slippage: A `SlippageModel` (FlatSlippage / VolumeImpactSlippage),
@@ -104,6 +79,11 @@ class BacktestEngine:
                 which calibrates to ~10 bps at 1% participation — equivalent
                 to the old 0.1% flat for small orders, but penalizes the
                 kind of large orders that lie about real fills in backtest.
+            sizer: Optional `Sizer`. Buys are sized by the SAME shared
+                `compute_buy_target_value` the live brokers use, so backtest
+                and live agree. With no sizer (the production default), a buy
+                deploys ``cash*0.95*clamp(signal.strength, 0.1, 1.0)`` capped
+                by the per-stock cap — matching PaperBroker's no-sizer path.
         """
         self._provider = provider
         self._initial_cash = initial_cash
@@ -114,8 +94,12 @@ class BacktestEngine:
             self._slippage = coerce(slippage)
         self._risk = risk_manager
         self._protections = protection_manager
+        self._sizer = sizer
         # ADV20 cache (per-run); populated at the top of run().
         self._adv20: dict[str, dict[date, float]] = {}
+        # All bars (per-run); populated at the top of run() so the sizer can
+        # estimate vol point-in-time without re-querying the provider.
+        self._all_bars: dict[str, list[BarData]] = {}
 
     def run(
         self,
@@ -144,8 +128,14 @@ class BacktestEngine:
             all_bars[code] = bars
             for bar in bars:
                 all_dates.add(bar.date)
+        self._all_bars = all_bars
 
         sorted_dates = sorted(all_dates)
+
+        # Portfolio drawdown circuit breaker state (mirrors the live path):
+        # equity high-water mark + a one-way halt latch once -15% from peak.
+        peak_equity = portfolio.total_value
+        halted = False
 
         def _bt_td(a: date, b: date) -> int:
             """Trading-day distance over (a, b] on the backtest's own calendar."""
@@ -229,27 +219,46 @@ class BacktestEngine:
                                 "strategy_name": sname})
                 pending_keys.add(key)
 
-            # Risk-driven exits (stop-loss + trailing take-profit). The
-            # strategy's OWN sells still flow through on_bar, so we leave
-            # strategy_sell_codes empty to avoid double-counting.
-            if self._risk is not None:
-                for sl in self._risk.check_exits(portfolio, peaks=peaks):
-                    if sl.stock_code in today_bars:
-                        _queue(sl, "risk_exit")
+            # Portfolio drawdown circuit breaker — mirrors the live path
+            # (PaperBroker.enforce_portfolio_stop / runtime tick). Track an
+            # equity high-water mark; once equity draws down past
+            # portfolio_stop_loss_pct (default -15%), queue a flatten at the
+            # next open and HALT — no new entries or strategy trading for the
+            # rest of the run. Without this the backtest rides drawdowns the
+            # live agent would have cut, mis-stating tail risk (audit C1).
+            peak_equity = max(peak_equity, portfolio.total_value)
+            if (not halted and self._risk is not None
+                    and self._risk.check_portfolio_stop(
+                        portfolio.total_value, peak_equity)):
+                halted = True
+                for hc in list(portfolio.positions):
+                    if hc in today_bars:
+                        _queue(Signal(stock_code=hc, direction=Direction.SELL,
+                                      strength=1.0, reason="组合回撤熔断"),
+                               "portfolio_stop")
 
-            for code, bar in today_bars.items():
-                for signal in strategy.on_bar(bar):
-                    if signal.stock_code not in today_bars:
-                        continue  # no price data for the target stock
-                    if signal.direction == Direction.BUY and buy_locked:
-                        skipped_signals += 1
-                        continue
-                    if self._risk is not None:
-                        ok, _ = self._risk.check(signal, portfolio)
-                        if not ok:
+            if not halted:
+                # Risk-driven exits (stop-loss + trailing take-profit). The
+                # strategy's OWN sells still flow through on_bar, so we leave
+                # strategy_sell_codes empty to avoid double-counting.
+                if self._risk is not None:
+                    for sl in self._risk.check_exits(portfolio, peaks=peaks):
+                        if sl.stock_code in today_bars:
+                            _queue(sl, "risk_exit")
+
+                for code, bar in today_bars.items():
+                    for signal in strategy.on_bar(bar):
+                        if signal.stock_code not in today_bars:
+                            continue  # no price data for the target stock
+                        if signal.direction == Direction.BUY and buy_locked:
                             skipped_signals += 1
                             continue
-                    _queue(signal, strategy.name)
+                        if self._risk is not None:
+                            ok, _ = self._risk.check(signal, portfolio)
+                            if not ok:
+                                skipped_signals += 1
+                                continue
+                        _queue(signal, strategy.name)
 
             # 4) Record equity (marked to today's close).
             equity_values[current_date] = portfolio.total_value
@@ -296,7 +305,7 @@ class BacktestEngine:
                     survivors.append(p)
                 continue
             pc = prev_close.get(code, {}).get(current_date)
-            if not _tradable_at_open(sig.direction, bar, pc):  # limit-locked
+            if not tradable_at_open(sig.direction, bar, pc):  # limit-locked
                 if not expired:
                     survivors.append(p)
                 continue
@@ -323,7 +332,8 @@ class BacktestEngine:
 
         if signal.direction == Direction.BUY:
             filled = self._execute_buy(code, bar, portfolio, trades, current_date,
-                                       strategy_name, signal.reason)
+                                       strategy_name, signal.reason,
+                                       signal.strength)
         elif signal.direction == Direction.SELL:
             filled = self._execute_sell(code, bar, portfolio, trades, current_date,
                                         strategy_name, signal.reason)
@@ -332,6 +342,11 @@ class BacktestEngine:
         if filled and self._risk is not None:
             self._risk.record_trade()
         return filled
+
+    def _recent_bars_asof(self, code: str, as_of: date) -> list[BarData]:
+        """Bars for `code` with date <= as_of, for the sizer's vol estimate —
+        point-in-time correct (never sees future bars)."""
+        return [b for b in self._all_bars.get(code, []) if b.date <= as_of]
 
     def _execute_buy(
         self,
@@ -342,6 +357,7 @@ class BacktestEngine:
         current_date: date,
         strategy_name: str,
         reason: str = "",
+        strength: float = 1.0,
     ) -> bool:
         adv = self._adv20.get(code, {}).get(current_date, 0.0)
 
@@ -353,21 +369,27 @@ class BacktestEngine:
             direction=Direction.BUY, adv20=adv)
         price_est = bar.open * (1 + est_frac)
 
-        max_spend = portfolio.cash * 0.95  # Keep 5% cash buffer
+        # Size via the SAME shared helper the live brokers use, so backtest and
+        # live agree (audit C2). size_cap = the post-trade single-stock /
+        # industry cap (industry is "" — not available in the backtest provider,
+        # so the single-stock cap still binds). No more arbitrary 10000-share
+        # cap, and signal.strength now scales the buy exactly as live does.
+        size_cap = float("inf")
         if self._risk is not None:
-            # Same hard caps as the live path (single-stock / industry / total),
-            # post-trade — otherwise the backtest over-concentrates vs live.
-            # Industry data isn't in the backtest provider, so industry is ""
-            # (single + total still bind).
-            max_spend = min(max_spend, self._risk.max_additional_buy_value(
-                portfolio, code, ""))
+            size_cap = self._risk.max_additional_buy_value(portfolio, code, "")
+        recent = (self._recent_bars_asof(code, current_date)
+                  if self._sizer is not None else None)
+        target_value = compute_buy_target_value(
+            cash=portfolio.cash, total_value=portfolio.total_value,
+            strength=strength, size_cap=size_cap, code=code,
+            sizer=self._sizer, recent_bars=recent)
         commission_est = self._commission.calculate(price_est, 100, Direction.BUY)
-        affordable = int(max_spend / (price_est * 100 + commission_est)) * 100
+        affordable = int(target_value / (price_est * 100 + commission_est)) * 100
 
         if affordable < 100:
-            return False  # Not enough cash
+            return False  # Not enough cash / capped out
 
-        quantity = min(affordable, 10000)  # Cap at 10000 shares per trade
+        quantity = affordable
 
         # Now apply the real slippage at the actual quantity.
         real_frac = self._slippage.adjust(

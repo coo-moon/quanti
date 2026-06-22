@@ -174,6 +174,166 @@ def test_backtest_risk_exit_tags_reason(tmp_path):
     db.close()
 
 
+class BuyOnceStrategy(BaseStrategy):
+    """Buys a single named code once, at a configurable strength."""
+
+    name = "buy_once"
+
+    def init(self, config):
+        self._code = config.get("code", "000001")
+        self._strength = config.get("strength", 1.0)
+        self._done = False
+
+    def on_bar(self, bar):
+        if bar.code == self._code and not self._done:
+            self._done = True
+            return [Signal(stock_code=bar.code, direction=Direction.BUY,
+                           strength=self._strength, reason="buy once")]
+        return []
+
+
+def _flat_provider(tmp_path, name, closes, code="000001"):
+    """A single-stock provider with the given close path (open==close)."""
+    db = Database(str(tmp_path / name))
+    db.initialize()
+    dates = pd.bdate_range("2024-01-02", periods=len(closes))
+    df = pd.DataFrame({
+        "code": code, "date": [d.date() for d in dates],
+        "open": closes, "high": [c + 0.01 for c in closes],
+        "low": [c - 0.01 for c in closes], "close": closes,
+        "volume": 5e6, "amount": [c * 5e6 for c in closes], "turnover": 1.0,
+    })
+    db.save_daily_quotes(df)
+    db.save_trade_calendar([d.date() for d in dates])
+    return db, DataProvider(db), [code]
+
+
+def test_backtest_buy_respects_signal_strength(tmp_path):
+    """C2: a buy is sized by signal.strength (cash*0.95*clamp(strength)) just
+    like the live PaperBroker no-sizer path — half-strength deploys ~half the
+    capital. Previously the engine ignored strength and spent ~95% of cash."""
+    from quanti.risk.manager import RiskConfig, RiskManager
+
+    # 12 flat bars at 10.0 so price doesn't move; per-stock cap lifted to 100%
+    # so cash (not the 10% cap) is the binding constraint we're measuring.
+    closes = [10.0] * 12
+
+    def risk():
+        return RiskManager(RiskConfig(max_position_pct=1.0))
+
+    db, provider, codes = _flat_provider(tmp_path, "s_full.db", closes)
+    s_full = BuyOnceStrategy()
+    s_full.init({"strength": 1.0})
+    full = BacktestEngine(provider, 1_000_000.0, risk_manager=risk(),
+                          slippage=0.0).run(s_full, codes,
+                                            date(2024, 1, 1), date(2024, 2, 1))
+    db.close()
+
+    db2, provider2, codes2 = _flat_provider(tmp_path, "s_half.db", closes)
+    s_half = BuyOnceStrategy()
+    s_half.init({"strength": 0.5})
+    half = BacktestEngine(provider2, 1_000_000.0, risk_manager=risk(),
+                          slippage=0.0).run(s_half, codes2,
+                                            date(2024, 1, 1), date(2024, 2, 1))
+    db2.close()
+
+    full_qty = next(t.quantity for t in full.trades if t.direction == Direction.BUY)
+    half_qty = next(t.quantity for t in half.trades if t.direction == Direction.BUY)
+    # strength 0.5 → ~half the shares of strength 1.0 (within one 100-lot).
+    assert half_qty == pytest.approx(full_qty * 0.5, abs=100)
+    # And full strength buys far more than the old hard 10000-share cap allowed.
+    assert full_qty > 10_000
+
+
+def test_backtest_no_10000_share_cap(tmp_path):
+    """C2: the arbitrary 10000-share/trade cap is gone — a cheap stock with
+    ample cash fills the full risk-capped size in one go."""
+    from quanti.risk.manager import RiskConfig, RiskManager
+
+    closes = [2.0] * 8  # cheap stock: 10% of 1M / 2元 = 50000 shares
+    db, provider, codes = _flat_provider(tmp_path, "cheap.db", closes)
+    s = BuyOnceStrategy()
+    s.init({"strength": 1.0})
+    res = BacktestEngine(provider, 1_000_000.0,
+                         risk_manager=RiskManager(RiskConfig()),
+                         slippage=0.0).run(s, codes,
+                                           date(2024, 1, 1), date(2024, 2, 1))
+    db.close()
+    qty = next(t.quantity for t in res.trades if t.direction == Direction.BUY)
+    # The old hard 10000-share/trade cap is gone…
+    assert qty > 10_000
+    # …and the fill is bounded instead by the 10% single-stock notional cap
+    # (100k 元 of a ~2元 stock, net of commission ≈ 48700 shares).
+    assert qty * 2.0 <= 100_000
+    assert qty * 2.0 > 95_000
+
+
+def test_backtest_portfolio_circuit_breaker(tmp_path):
+    """C1: equity drawdown past -15% from the high-water mark flattens the book
+    at next open and halts — no positions held afterwards, mirroring live."""
+    from quanti.risk.manager import RiskConfig, RiskManager
+
+    # Buy at 10, drift up to 11 (new HWM), then crash to 8 (-27% from peak).
+    closes = [10.0, 10.5, 11.0, 11.0, 9.5, 8.0, 8.0, 8.0, 8.0]
+    db, provider, codes = _flat_provider(tmp_path, "cb.db", closes)
+    s = BuyOnceStrategy()
+    s.init({"strength": 1.0})
+    res = BacktestEngine(
+        provider, 1_000_000.0,
+        risk_manager=RiskManager(RiskConfig(
+            portfolio_stop_loss_pct=-0.15, stop_loss_pct=-0.50,
+            max_position_pct=1.0)),
+        slippage=0.0,
+    ).run(s, codes, date(2024, 1, 1), date(2024, 2, 1))
+    db.close()
+    # The breaker fired: a flatten SELL tagged portfolio_stop was recorded…
+    cb_sells = [t for t in res.trades
+                if t.strategy == "portfolio_stop" and t.direction == Direction.SELL]
+    assert cb_sells, "expected a 组合回撤熔断 flatten sell"
+    assert any("熔断" in t.reason for t in cb_sells)
+
+
+def test_backtest_can_invest_beyond_80pct(tmp_path):
+    """Removed 80% total cap: across many names the book can deploy well past
+    80% of equity (bounded only by the per-stock 10% cap)."""
+    from quanti.risk.manager import RiskConfig, RiskManager
+
+    db = Database(str(tmp_path / "many.db"))
+    db.initialize()
+    dates = pd.bdate_range("2024-01-02", periods=6)
+    codes = [f"00000{i}" for i in range(1, 10)]  # 9 names → up to ~90% at 10% each
+    frames = []
+    for c in codes:
+        frames.append(pd.DataFrame({
+            "code": c, "date": [d.date() for d in dates],
+            "open": 10.0, "high": 10.01, "low": 9.99, "close": 10.0,
+            "volume": 5e6, "amount": 5e7, "turnover": 1.0}))
+    db.save_daily_quotes(pd.concat(frames, ignore_index=True))
+    db.save_trade_calendar([d.date() for d in dates])
+    provider = DataProvider(db)
+
+    class BuyAll(BaseStrategy):
+        name = "buy_all"
+        def init(self, config): self._done = set()
+        def on_bar(self, bar):
+            if bar.code in self._done:
+                return []
+            self._done.add(bar.code)
+            return [Signal(bar.code, Direction.BUY, 1.0, "b")]
+
+    s = BuyAll()
+    s.init({})
+    res = BacktestEngine(provider, 1_000_000.0,
+                         risk_manager=RiskManager(RiskConfig()),
+                         slippage=0.0).run(s, codes,
+                                           date(2024, 1, 1), date(2024, 2, 1))
+    invested = sum(t.price * t.quantity for t in res.trades
+                   if t.direction == Direction.BUY)
+    db.close()
+    # Old 80% cap would have stopped near 800k; now it deploys past it.
+    assert invested > 850_000
+
+
 class BuyEveryBarStrategy(BaseStrategy):
     """Buys on EVERY bar (no memory), so the protection gate has signals to block."""
 

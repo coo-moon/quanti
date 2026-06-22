@@ -128,12 +128,18 @@ class QmtGateway:
 
     def positions(self) -> dict:
         if self.mock:
-            return {"positions": [
-                {"code": code, "volume": p["volume"],
-                 "can_use_volume": p["can_use"], "avg_price": p["avg_price"],
-                 "market_value": round(p["volume"] * p["avg_price"], 2)}
-                for code, p in self._mock_positions.items() if p["volume"] > 0
-            ]}
+            out = []
+            for code, p in self._mock_positions.items():
+                if p["volume"] <= 0:
+                    continue
+                last = float(self.quote(code).get("last", 0) or 0)
+                cur = last if last > 0 else p["avg_price"]
+                out.append({
+                    "code": code, "volume": p["volume"],
+                    "can_use_volume": p["can_use"], "avg_price": p["avg_price"],
+                    "last_price": round(cur, 3),
+                    "market_value": round(p["volume"] * cur, 2)})
+            return {"positions": out}
         return self._backend.positions()
 
     def submit_order(self, body: dict) -> dict:

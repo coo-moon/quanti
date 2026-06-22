@@ -21,7 +21,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 
 from quanti.data.provider import DataProvider
-from quanti.models import BarData
+from quanti.models import BarData, Direction
 
 
 # Beijing is UTC+8 with no DST. Hard-coded because A-shares only trade there.
@@ -140,3 +140,59 @@ def count_trading_days_between(start: date, end: date,
             n += 1
         d += timedelta(days=1)
     return n
+
+
+# --- Daily price-limit (涨跌停) tradability gate -----------------------------
+# Shared by the backtest engine AND the live brokers so "what can actually
+# fill" is defined in exactly one place — the divergence the 2026-06-22 audit
+# flagged as C3 (paper/live filled into 一字板 that the backtest correctly
+# skipped). QMT live is gated by the venue itself; this covers paper + backtest.
+
+def board_limit_pct(code: str) -> float:
+    """A-share daily price-limit by board (best-effort by code prefix).
+
+    STAR (688/689) + ChiNext (300/301): 20%; Beijing Exchange (8../4../920):
+    30%; main board: 10%. ST (±5%) can't be detected from the code alone, so it
+    falls back to the board limit (conservative — won't over-block)."""
+    if code.startswith(("688", "689", "300", "301")):
+        return 0.20
+    if code.startswith(("8", "4", "920", "92")):
+        return 0.30
+    return 0.10
+
+
+def _within_limit(direction: Direction, code: str, fill_price: float,
+                  prev_close: float | None) -> bool:
+    """Whether a fill at `fill_price` is realistic given the daily price limit:
+    a BUY can't fill at/above limit-up, a SELL can't fill at/below limit-down.
+    Without a prior close to reference, allow it (conservative)."""
+    if prev_close is None or prev_close <= 0:
+        return True
+    lim = board_limit_pct(code)
+    eps = 0.005
+    if direction == Direction.BUY:
+        return fill_price < prev_close * (1 + lim) - eps
+    return fill_price > prev_close * (1 - lim) + eps
+
+
+def tradable_at_open(direction: Direction, bar: BarData,
+                     prev_close: float | None) -> bool:
+    """Tradability for an OPEN-fill (backtest + pending brokers): blocks buying
+    into a limit-up open and selling into a limit-down open (incl. 一字板)."""
+    return _within_limit(direction, bar.code, bar.open, prev_close)
+
+
+def tradable_at_close(direction: Direction, bar: BarData,
+                      prev_close: float | None) -> bool:
+    """Tradability for a CLOSE-fill (immediate broker mode): blocks buying when
+    the close is sealed at limit-up and selling when sealed at limit-down."""
+    return _within_limit(direction, bar.code, bar.close, prev_close)
+
+
+def prev_bar_close(provider: DataProvider, code: str,
+                   before_date: date) -> float | None:
+    """Close of the most recent bar strictly before `before_date` — the prior
+    close the daily price-limit is computed from. None when unavailable."""
+    bars = provider.get_daily_bars(
+        code, before_date - timedelta(days=20), before_date - timedelta(days=1))
+    return bars[-1].close if bars else None
