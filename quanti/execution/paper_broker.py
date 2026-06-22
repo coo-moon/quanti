@@ -37,6 +37,7 @@ from quanti.risk.manager import RiskConfig, RiskManager
 from quanti.risk.sizer import Sizer, compute_buy_target_value
 from quanti.utils.market import (
     count_trading_days_between,
+    max_fill_shares,
     next_trading_bar,
     next_trading_day,
     prev_bar_close,
@@ -259,8 +260,10 @@ class PaperBroker:
             return False
 
         if signal.direction == Direction.BUY:
-            return self._fill_buy(signal, ref_price, bar_date, strategy_name)
-        return self._fill_sell(signal, ref_price, bar_date, strategy_name)
+            return self._fill_buy(signal, ref_price, bar_date, strategy_name,
+                                  bar_amount=float(bar.amount or 0))
+        return self._fill_sell(signal, ref_price, bar_date, strategy_name,
+                               bar_amount=float(bar.amount or 0))
 
     # ------------------------------ pending (queued) execution path
     def _queue_pending_signal(self, signal: Signal,
@@ -417,7 +420,8 @@ class PaperBroker:
             # Pick the price.
             ref_price = float(bar.open if self._fill_basis == "open"
                               else bar.close)
-            filled = self._fill_pending(sig, ref_price, bar.date, o)
+            filled = self._fill_pending(sig, ref_price, bar.date, o,
+                                        bar_amount=float(bar.amount or 0))
             if filled:
                 out.filled += 1
             else:
@@ -561,12 +565,14 @@ class PaperBroker:
         return True
 
     def _fill_pending(self, signal: Signal, ref_price: float,
-                      bar_date: date, order_row: dict) -> bool:
+                      bar_date: date, order_row: dict,
+                      bar_amount: float = 0.0) -> bool:
         """Fill an existing pending order row at the given price.
 
         Mirrors _fill_buy / _fill_sell but updates the existing order row
         instead of inserting a new one. On any failure (no cash, T+1,
-        no position), the order is moved to 'rejected'.
+        no position), the order is moved to 'rejected'. `bar_amount` (成交额,
+        元) caps the single-bar fill to a share of turnover (B1).
         """
         order_id = order_row["order_id"]
         strategy_name = order_row.get("strategy_name", "") or ""
@@ -601,6 +607,14 @@ class PaperBroker:
                     reason="cash or position cap too tight")
                 return False
             quantity = affordable_lots * 100
+            # Capacity cap (B1): ≤ participation of the bar's turnover.
+            vcap = max_fill_shares(bar_amount, price)
+            if vcap is not None:
+                quantity = min(quantity, vcap)
+            if quantity < 100:
+                self._db.update_order_status(
+                    order_id, "rejected", reason="bar volume cap too tight")
+                return False
             cost = price * quantity
             commission = self._commission.calculate(price, quantity, Direction.BUY)
             if cost + commission > cash:
@@ -669,6 +683,15 @@ class PaperBroker:
         if quantity <= 0:
             self._db.update_order_status(order_id, "rejected",
                                          reason="T+1 restriction at fill")
+            return False
+        # Capacity cap (B1): can't dump more than participation of turnover in
+        # one bar. Remainder carries; a re-emitted SELL clears it next session.
+        vcap = max_fill_shares(bar_amount, ref_price)
+        if vcap is not None:
+            quantity = min(quantity, vcap)
+        if quantity < 100:
+            self._db.update_order_status(order_id, "rejected",
+                                         reason="bar volume cap too tight")
             return False
 
         price = ref_price * (1 - self._slippage)
@@ -765,7 +788,8 @@ class PaperBroker:
         return order_id
 
     def _fill_buy(self, signal: Signal, ref_price: float,
-                  bar_date: date, strategy_name: str) -> bool:
+                  bar_date: date, strategy_name: str,
+                  bar_amount: float = 0.0) -> bool:
         state = self._db.get_portfolio_state()
         if state is None:
             return False
@@ -811,6 +835,14 @@ class PaperBroker:
                                status="rejected", reason="cash too low")
             return False
         quantity = affordable_lots * 100
+        # Capacity cap (B1): ≤ participation of the bar's turnover.
+        vcap = max_fill_shares(bar_amount, price)
+        if vcap is not None:
+            quantity = min(quantity, vcap)
+        if quantity < 100:
+            self._record_order(signal, strategy_name, status="rejected",
+                               reason="bar volume cap too tight")
+            return False
         cost = price * quantity
         commission = self._commission.calculate(price, quantity, Direction.BUY)
         if cost + commission > cash:
@@ -867,7 +899,8 @@ class PaperBroker:
         return True
 
     def _fill_sell(self, signal: Signal, ref_price: float,
-                   bar_date: date, strategy_name: str) -> bool:
+                   bar_date: date, strategy_name: str,
+                   bar_amount: float = 0.0) -> bool:
         positions = {p["code"]: p for p in self._db.list_positions()}
         pos = positions.get(signal.stock_code)
         if pos is None or pos["quantity"] <= 0:
@@ -880,6 +913,15 @@ class PaperBroker:
         if quantity <= 0:
             self._record_order(signal, strategy_name,
                                status="rejected", reason="T+1 restriction")
+            return False
+        # Capacity cap (B1): ≤ participation of the bar's turnover; remainder
+        # carries in the position and is re-sold next session.
+        vcap = max_fill_shares(bar_amount, ref_price)
+        if vcap is not None:
+            quantity = min(quantity, vcap)
+        if quantity < 100:
+            self._record_order(signal, strategy_name, status="rejected",
+                               reason="bar volume cap too tight")
             return False
 
         price = ref_price * (1 - self._slippage)

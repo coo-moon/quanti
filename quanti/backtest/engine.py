@@ -26,7 +26,7 @@ from quanti.risk.manager import RiskManager, STOP_LOSS_REASON_PREFIX
 from quanti.risk.protections import ProtectionContext, ProtectionManager
 from quanti.risk.sizer import Sizer, compute_buy_target_value
 from quanti.strategy.base import BaseStrategy
-from quanti.utils.market import tradable_at_open
+from quanti.utils.market import max_fill_shares, tradable_at_open
 
 # A signal waits at most this many trading bars for a fillable (tradable, has a
 # bar) day before being abandoned — mirrors PaperBroker's pending TTL.
@@ -393,6 +393,15 @@ class BacktestEngine:
 
         quantity = affordable
 
+        # Capacity cap: don't fill more than `participation` of the bar's
+        # turnover in one bar (audit B1; 成交额-based, A3-safe). Remainder isn't
+        # acquired this bar — a realistic limit on instant fills in thin names.
+        cap = max_fill_shares(bar.amount, bar.open)
+        if cap is not None:
+            quantity = min(quantity, cap)
+        if quantity < 100:
+            return False
+
         # Now apply the real slippage at the actual quantity.
         real_frac = self._slippage.adjust(
             code=code, price=bar.open, qty=quantity,
@@ -463,7 +472,13 @@ class BacktestEngine:
         if pos.buy_date == current_date:
             return False
 
-        quantity = pos.quantity
+        # Capacity cap (B1): can't dump more than `participation` of the bar's
+        # turnover in one bar. Sell what the bar allows; the remainder carries
+        # in the position and is re-sold next bar (the strategy/stop re-fires).
+        cap = max_fill_shares(bar.amount, bar.open)
+        quantity = pos.quantity if cap is None else min(pos.quantity, cap)
+        if quantity < 100:
+            return False  # too illiquid to move a lot this bar — retry next bar
         adv = self._adv20.get(code, {}).get(current_date, 0.0)
         slip_frac = self._slippage.adjust(
             code=code, price=bar.open, qty=quantity,
@@ -475,7 +490,10 @@ class BacktestEngine:
         net_revenue = revenue - commission
 
         portfolio.cash += net_revenue
-        del portfolio.positions[code]
+        if quantity >= pos.quantity:
+            del portfolio.positions[code]
+        else:
+            pos.quantity -= quantity
 
         trades.append(
             TradeRecord(

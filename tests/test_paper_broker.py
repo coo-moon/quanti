@@ -260,6 +260,27 @@ def test_protection_blocks_buy_after_stop_loss_cluster(tmp_path):
     assert ok2 is True
 
 
+def test_volume_cap_limits_immediate_buy(tmp_path):
+    """B1: PaperBroker's fill is capped at 25% of the bar's turnover too, so
+    backtest and paper agree on capacity (not just the backtest)."""
+    db = Database(str(tmp_path / "vc.db"))
+    db.initialize()
+    db.upsert_stock("000001", "x", "SZ", date(1991, 4, 3), "银行")
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=10)
+    df = pd.DataFrame({
+        "code": "000001", "date": [d.date() for d in dates],
+        "open": 10.0, "high": 10.01, "low": 9.99, "close": 10.0,
+        "volume": 1e4, "amount": 100_000.0, "turnover": 1.0})  # thin: cap=2500
+    db.save_daily_quotes(df)
+    provider = DataProvider(db)
+    broker = PaperBroker(db, provider, initial_cash=1_000_000,
+                         fill_mode="immediate", slippage=0.0)
+    assert broker.execute_signal(
+        Signal("000001", Direction.BUY, 1.0, "buy"), "t") is True
+    # Same 2500 cap as the backtest engine test → backtest≡paper on capacity.
+    assert db.list_positions()[0]["quantity"] == 2500  # turnover-capped
+
+
 # --- T+1 frozen-lot tracking (audit F1) ----------------------------------
 
 def _sell(broker, code="000001"):

@@ -268,6 +268,33 @@ def test_backtest_no_10000_share_cap(tmp_path):
     assert qty * 2.0 > 95_000
 
 
+def test_backtest_volume_cap_limits_single_bar_fill(tmp_path):
+    """B1: a buy can't take more than 25% of the bar's turnover in one bar —
+    so a thin-turnover name fills far below the 10% single-stock cap."""
+    from quanti.risk.manager import RiskConfig, RiskManager
+
+    db = Database(str(tmp_path / "vc.db"))
+    db.initialize()
+    dates = pd.bdate_range("2024-01-02", periods=8)
+    # price 10, tiny turnover 100k 元/bar → 25% = 25k → cap = 2500 shares,
+    # well below the 10% single-stock cap (100k/10 = 10000 shares).
+    df = pd.DataFrame({
+        "code": "000001", "date": [d.date() for d in dates],
+        "open": 10.0, "high": 10.01, "low": 9.99, "close": 10.0,
+        "volume": 1e4, "amount": 100_000.0, "turnover": 1.0})
+    db.save_daily_quotes(df)
+    db.save_trade_calendar([d.date() for d in dates])
+    provider = DataProvider(db)
+    s = BuyOnceStrategy()
+    s.init({"strength": 1.0})
+    res = BacktestEngine(provider, 1_000_000.0,
+                         risk_manager=RiskManager(RiskConfig()),
+                         slippage=0.0).run(s, ["000001"],
+                                           date(2024, 1, 1), date(2024, 2, 1))
+    qty = next(t.quantity for t in res.trades if t.direction == Direction.BUY)
+    assert qty == 2500  # capped by turnover, not the 10% single-stock cap
+
+
 def test_backtest_portfolio_circuit_breaker(tmp_path):
     """C1: equity drawdown past -15% from the high-water mark flattens the book
     at next open and halts — no positions held afterwards, mirroring live."""

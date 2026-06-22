@@ -196,3 +196,25 @@ def prev_bar_close(provider: DataProvider, code: str,
     bars = provider.get_daily_bars(
         code, before_date - timedelta(days=20), before_date - timedelta(days=1))
     return bars[-1].close if bars else None
+
+
+# --- Single-bar capacity cap (成交量上限) --------------------------------
+# Max share of a bar's turnover one order may take. A single order can't
+# realistically be the whole day's volume — backtest/paper that fill a huge
+# order instantly overstate fills (audit B1). zipline's default is 2.5%; 25%
+# here is generous (we already trade a liquidity-filtered universe), bounding
+# only the egregious "buy 100% of a thin day's turnover" case.
+DEFAULT_PARTICIPATION = 0.25
+
+
+def max_fill_shares(bar_amount: float, price: float,
+                    participation: float = DEFAULT_PARTICIPATION) -> int | None:
+    """Largest lot-rounded (×100) share quantity fillable in ONE bar without
+    taking more than `participation` of that bar's turnover (成交额, 元).
+
+    Uses 成交额 (元) not volume (shares), so it is free of the akshare-手 /
+    xtdata-股 volume-unit mismatch (A3). Returns None when turnover/price are
+    unavailable (caller then applies no cap)."""
+    if not bar_amount or bar_amount <= 0 or price <= 0:
+        return None
+    return int(participation * bar_amount / (price * 100)) * 100
