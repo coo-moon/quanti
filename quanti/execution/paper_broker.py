@@ -620,13 +620,20 @@ class PaperBroker:
                 total_qty = existing["quantity"] + quantity
                 avg = (existing["avg_cost"] * existing["quantity"]
                        + price * quantity) / total_qty
+                # Today's frozen lot = prior same-day frozen (if any) + this buy;
+                # a frozen lot from an earlier day has settled, so it resets.
+                prev_frozen = (existing.get("frozen_qty") or 0) \
+                    if existing.get("frozen_date") == bar_date else 0
                 # entry_strategy=None preserves the original owner on add-ons.
                 self._db.upsert_position(signal.stock_code, total_qty, avg,
                                          ref_price,
-                                         existing["buy_date"] or bar_date)
+                                         existing["buy_date"] or bar_date,
+                                         frozen_qty=int(prev_frozen) + quantity,
+                                         frozen_date=bar_date)
             else:
                 self._db.upsert_position(signal.stock_code, quantity, price,
                                          ref_price, bar_date,
+                                         frozen_qty=quantity, frozen_date=bar_date,
                                          entry_strategy=signal.entry_strategy)
             self._db.update_order_filled(order_id, "filled", price, quantity)
             trade_id = "t_" + uuid.uuid4().hex[:10]
@@ -655,17 +662,15 @@ class PaperBroker:
             self._db.update_order_status(order_id, "rejected",
                                          reason="no position at fill")
             return False
-        # T+1: if the position was opened on the same day the fill bar
-        # is for, the SELL can't execute. In pending mode this is rare
-        # (queued SELLs always wait for next bar), but a manual same-day
-        # BUY immediate-fill could create this edge case.
-        if pos["buy_date"] and isinstance(pos["buy_date"], date) \
-                and pos["buy_date"] == bar_date:
+        # T+1: only the settled portion (holding minus today's frozen lot) can
+        # be sold; a same-day add-on stays frozen. Caps the SELL like the live
+        # venue's can_use_volume instead of dumping the whole position (F1).
+        quantity = self._sellable_qty(pos, bar_date)
+        if quantity <= 0:
             self._db.update_order_status(order_id, "rejected",
                                          reason="T+1 restriction at fill")
             return False
 
-        quantity = pos["quantity"]
         price = ref_price * (1 - self._slippage)
         revenue = price * quantity
         commission = self._commission.calculate(price, quantity, Direction.SELL)
@@ -677,7 +682,15 @@ class PaperBroker:
                                          reason="no portfolio")
             return False
         self._db.update_cash(state["cash"] + net)
-        self._db.delete_position(signal.stock_code)
+        remaining = pos["quantity"] - quantity
+        if remaining > 0:
+            # Frozen (today-bought) remainder stays — sellable next session.
+            self._db.upsert_position(
+                signal.stock_code, remaining, pos["avg_cost"],
+                pos["current_price"] or pos["avg_cost"], pos["buy_date"],
+                frozen_qty=remaining, frozen_date=bar_date)
+        else:
+            self._db.delete_position(signal.stock_code)
         self._db.update_order_filled(order_id, "filled", price, quantity)
         trade_id = "t_" + uuid.uuid4().hex[:10]
         self._db.insert_trade({
@@ -717,6 +730,16 @@ class PaperBroker:
     def _stock_industry(self, code: str) -> str:
         stock = self._db.get_stock(code)
         return stock.industry if stock else ""
+
+    @staticmethod
+    def _sellable_qty(pos: dict, bar_date: date) -> int:
+        """T+1-sellable quantity = holding minus the lot bought *today* (still
+        frozen). Mirrors QmtBroker's `can_use_volume` so a same-day add-on can't
+        be over-sold (audit F1). A frozen lot dated before today has settled."""
+        frozen = pos.get("frozen_qty") or 0
+        if pos.get("frozen_date") != bar_date:
+            frozen = 0
+        return int(pos["quantity"]) - int(frozen)
 
     def _record_order(self, signal: Signal, strategy_name: str, *,
                       status: str, reason: str = "",
@@ -807,12 +830,17 @@ class PaperBroker:
         if existing:
             total_qty = existing["quantity"] + quantity
             avg = (existing["avg_cost"] * existing["quantity"] + price * quantity) / total_qty
+            prev_frozen = (existing.get("frozen_qty") or 0) \
+                if existing.get("frozen_date") == bar_date else 0
             # entry_strategy=None preserves the original owner on add-ons.
             self._db.upsert_position(signal.stock_code, total_qty, avg,
-                                     ref_price, existing["buy_date"] or bar_date)
+                                     ref_price, existing["buy_date"] or bar_date,
+                                     frozen_qty=int(prev_frozen) + quantity,
+                                     frozen_date=bar_date)
         else:
             self._db.upsert_position(signal.stock_code, quantity, price,
                                      ref_price, bar_date,
+                                     frozen_qty=quantity, frozen_date=bar_date,
                                      entry_strategy=signal.entry_strategy)
 
         order_id = self._record_order(
@@ -846,13 +874,14 @@ class PaperBroker:
             self._record_order(signal, strategy_name,
                                status="rejected", reason="no position")
             return False
-        # T+1: cannot sell if bought today
-        if pos["buy_date"] and isinstance(pos["buy_date"], date) and pos["buy_date"] == bar_date:
+        # T+1: only the settled portion can be sold today; today's frozen lot
+        # stays. Caps like the live venue's can_use_volume (audit F1).
+        quantity = self._sellable_qty(pos, bar_date)
+        if quantity <= 0:
             self._record_order(signal, strategy_name,
                                status="rejected", reason="T+1 restriction")
             return False
 
-        quantity = pos["quantity"]
         price = ref_price * (1 - self._slippage)
         revenue = price * quantity
         commission = self._commission.calculate(price, quantity, Direction.SELL)
@@ -862,7 +891,14 @@ class PaperBroker:
         if state is None:
             return False
         self._db.update_cash(state["cash"] + net)
-        self._db.delete_position(signal.stock_code)
+        remaining = pos["quantity"] - quantity
+        if remaining > 0:
+            self._db.upsert_position(
+                signal.stock_code, remaining, pos["avg_cost"],
+                pos["current_price"] or pos["avg_cost"], pos["buy_date"],
+                frozen_qty=remaining, frozen_date=bar_date)
+        else:
+            self._db.delete_position(signal.stock_code)
 
         order_id = self._record_order(
             signal, strategy_name,
