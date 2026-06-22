@@ -255,7 +255,7 @@ class QmtBroker:
             # Count the order against the daily-trade hard cap — the same floor
             # PaperBroker enforces (paper_broker records on fill). reset_daily()
             # at session start + seeding the count from /trader/trades is phase-③.
-            self._risk.record_trade()
+            self._risk.record_trade(signal.direction)
         self._mirror_order(
             signal, strategy_name, status=status,
             reason=res.get("msg", "") or signal.reason,

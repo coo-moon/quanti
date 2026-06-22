@@ -151,6 +151,20 @@ class TestEngineIntegration:
         assert buys, "expected a buy"
         assert buys[0].price == pytest.approx(10.01, rel=1e-4)
 
+    def test_default_slippage_is_flat_10bps_matching_paper(self, seeded):
+        """C4: the engine default (no slippage arg) is FlatSlippage(10bps),
+        matching the live/paper PaperBroker flat 0.1% — NOT VolumeImpact. At
+        close=10 a buy fills at 10.01 (flat), not ~10.007 (volume-impact)."""
+        provider = DataProvider(seeded)
+        engine = BacktestEngine(provider=provider, initial_cash=200_000)  # default
+        strat = _ForceBuy()
+        strat.init({})
+        result = engine.run(strategy=strat, codes=["000001"],
+                            start=date(2024, 1, 1), end=date.today())
+        buys = [t for t in result.trades if t.direction == Direction.BUY]
+        assert buys
+        assert buys[0].price == pytest.approx(10.01, rel=1e-4)
+
     def test_volume_impact_at_small_participation(self, seeded):
         """200K cash buying 10元 stock = ~20K notional in a 10M ADV name =
         0.2% participation. Expected total ~5 + 5*sqrt(0.2) ≈ 7.2 bps."""

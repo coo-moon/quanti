@@ -248,3 +248,21 @@ def test_daily_cap_auto_resets_on_new_calendar_day(monkeypatch):
         "today": staticmethod(lambda: _date(2026, 1, 6))}))
     ok2, _ = rm.check(buy, pf)
     assert ok2
+
+
+def test_daily_cap_counts_opens_not_exits():
+    """The daily-trade cap limits NEW positions (opens). A cluster of SELLs
+    (stop-loss/flatten) must NOT consume the budget and block rebalancing
+    BUYs (audit F2)."""
+    rm = RiskManager(RiskConfig(max_daily_trades=2))
+    pf = Portfolio(cash=1_000_000.0)
+    buy = Signal("000001", Direction.BUY, 0.5, "b")
+    # Many exits today — none count against the open budget.
+    for _ in range(5):
+        rm.record_trade(Direction.SELL)
+    assert rm.check(buy, pf)[0] is True
+    # Two opens consume the cap; the third open is blocked.
+    rm.record_trade(Direction.BUY)
+    rm.record_trade(Direction.BUY)
+    ok, reason = rm.check(buy, pf)
+    assert ok is False and "limit" in reason.lower()

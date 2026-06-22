@@ -19,7 +19,7 @@ import pandas as pd
 
 from quanti.backtest.commission import AShareCommission
 from quanti.backtest.metrics import compute_metrics
-from quanti.backtest.slippage import SlippageModel, VolumeImpactSlippage, coerce
+from quanti.backtest.slippage import FlatSlippage, SlippageModel, coerce
 from quanti.data.provider import DataProvider
 from quanti.models import BarData, Direction, Portfolio, Position, Signal
 from quanti.risk.manager import RiskManager, STOP_LOSS_REASON_PREFIX
@@ -75,10 +75,12 @@ class BacktestEngine:
         """Args:
             slippage: A `SlippageModel` (FlatSlippage / VolumeImpactSlippage),
                 or a float for backward-compat (interpreted as flat fraction
-                — e.g. 0.001 == 10 bps). Default: `VolumeImpactSlippage()`,
-                which calibrates to ~10 bps at 1% participation — equivalent
-                to the old 0.1% flat for small orders, but penalizes the
-                kind of large orders that lie about real fills in backtest.
+                — e.g. 0.001 == 10 bps). Default: `FlatSlippage(bps=10)` to
+                MATCH the live/paper PaperBroker's flat 0.1% — so the backtest
+                that ranks strategies fills at the same cost the paper/live
+                path uses (audit C4). Pass `VolumeImpactSlippage()` explicitly
+                for capacity stress-testing (penalizes large orders); the
+                per-bar volume cap (separate) is the place to bound capacity.
             sizer: Optional `Sizer`. Buys are sized by the SAME shared
                 `compute_buy_target_value` the live brokers use, so backtest
                 and live agree. With no sizer (the production default), a buy
@@ -89,7 +91,7 @@ class BacktestEngine:
         self._initial_cash = initial_cash
         self._commission = commission or AShareCommission()
         if slippage is None:
-            self._slippage: SlippageModel = VolumeImpactSlippage()
+            self._slippage: SlippageModel = FlatSlippage(bps=10.0)
         else:
             self._slippage = coerce(slippage)
         self._risk = risk_manager
@@ -340,7 +342,7 @@ class BacktestEngine:
         else:
             return False
         if filled and self._risk is not None:
-            self._risk.record_trade()
+            self._risk.record_trade(signal.direction)
         return filled
 
     def _recent_bars_asof(self, code: str, as_of: date) -> list[BarData]:
