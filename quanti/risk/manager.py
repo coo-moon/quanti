@@ -193,7 +193,14 @@ class RiskManager:
         self._daily_trade_count = 0
         self._count_day = date.today()
 
-    def record_trade(self) -> None:
-        """Record that a trade was executed."""
+    def record_trade(self, direction: Direction | None = None) -> None:
+        """Count a trade against the daily cap. The cap limits NEW positions
+        (opens) — exits (SELL), including forced stop-loss / flatten, do NOT
+        consume it; otherwise a day with a cluster of stop-losses would burn the
+        budget and block the rebalancing BUYs exactly when flexibility is most
+        needed (audit F2). Callers pass the fill direction; `None` counts as an
+        open for backward compatibility."""
         self._roll_day_if_needed()
+        if direction == Direction.SELL:
+            return
         self._daily_trade_count += 1

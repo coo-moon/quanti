@@ -644,7 +644,7 @@ class PaperBroker:
                 "commission": commission, "strategy_name": strategy_name,
                 "trade_date": bar_date.isoformat(),
             })
-            self._risk.record_trade()
+            self._risk.record_trade(signal.direction)
             self._db.log_decision(
                 "order_filled_pending",
                 f"挂单成交 买入 {signal.stock_code} {quantity}股 @ {price:.2f} "
@@ -700,7 +700,7 @@ class PaperBroker:
             "commission": commission, "strategy_name": strategy_name,
             "trade_date": bar_date.isoformat(),
         })
-        self._risk.record_trade()
+        self._risk.record_trade(signal.direction)
         self._db.log_decision(
             "order_filled_pending",
             f"挂单成交 卖出 {signal.stock_code} {quantity}股 @ {price:.2f} "
@@ -856,7 +856,7 @@ class PaperBroker:
             "commission": commission, "strategy_name": strategy_name,
             "trade_date": bar_date.isoformat(),
         })
-        self._risk.record_trade()
+        self._risk.record_trade(signal.direction)
         self._db.log_decision(
             "trade",
             f"买入 {signal.stock_code} {quantity}股 @ {price:.2f}",
@@ -913,7 +913,7 @@ class PaperBroker:
             "commission": commission, "strategy_name": strategy_name,
             "trade_date": bar_date.isoformat(),
         })
-        self._risk.record_trade()
+        self._risk.record_trade(signal.direction)
         self._db.log_decision(
             "trade",
             f"卖出 {signal.stock_code} {quantity}股 @ {price:.2f}",
