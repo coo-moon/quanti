@@ -182,6 +182,11 @@ class Database:
             # back-adjustment factor. Pre-existing rows backfill to 1.0 (read as
             # raw) until a `quanti sync --refetch` rewrites them as raw+factor.
             ("daily_quotes", "adj_factor", "REAL DEFAULT 1.0"),
+            # T+1: shares bought today are frozen (unsellable) until tomorrow.
+            # frozen_qty applies only on frozen_date (today's buys); SELLs are
+            # capped at quantity - frozen so a same-day add-on can't be sold.
+            ("positions", "frozen_qty", "REAL DEFAULT 0"),
+            ("positions", "frozen_date", "TEXT"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -295,7 +300,9 @@ class Database:
                 current_price REAL DEFAULT 0,
                 buy_date TEXT,
                 updated_at TEXT NOT NULL,
-                entry_strategy TEXT DEFAULT ''
+                entry_strategy TEXT DEFAULT '',
+                frozen_qty REAL NOT NULL DEFAULT 0,
+                frozen_date TEXT
             );
 
             CREATE TABLE IF NOT EXISTS orders (
@@ -886,16 +893,21 @@ class Database:
 
     def upsert_position(self, code: str, quantity: int, avg_cost: float,
                         current_price: float, buy_date: date | None,
-                        entry_strategy: str | None = None) -> None:
+                        entry_strategy: str | None = None,
+                        frozen_qty: float = 0,
+                        frozen_date: date | None = None) -> None:
         from datetime import datetime
         # entry_strategy is only set on the FIRST buy (position open). On a
         # follow-on buy (averaging in) we pass None to preserve the original
         # owning strategy via COALESCE rather than overwriting it.
+        # frozen_qty/frozen_date track today's T+1-frozen lot (callers compute
+        # them); they overwrite on every upsert (the caller owns the new value).
         self.conn.execute(
             """
             INSERT INTO positions (code, quantity, avg_cost, current_price,
-                                   buy_date, updated_at, entry_strategy)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                   buy_date, updated_at, entry_strategy,
+                                   frozen_qty, frozen_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 quantity=excluded.quantity,
                 avg_cost=excluded.avg_cost,
@@ -903,11 +915,15 @@ class Database:
                 buy_date=excluded.buy_date,
                 updated_at=excluded.updated_at,
                 entry_strategy=COALESCE(
-                    NULLIF(excluded.entry_strategy, ''), positions.entry_strategy)
+                    NULLIF(excluded.entry_strategy, ''), positions.entry_strategy),
+                frozen_qty=excluded.frozen_qty,
+                frozen_date=excluded.frozen_date
             """,
             (code, quantity, avg_cost, current_price,
              buy_date.isoformat() if buy_date else None,
-             datetime.now().isoformat(), entry_strategy or ""),
+             datetime.now().isoformat(), entry_strategy or "",
+             float(frozen_qty or 0),
+             frozen_date.isoformat() if frozen_date else None),
         )
         self.conn.commit()
 
@@ -918,7 +934,7 @@ class Database:
     def list_positions(self) -> list[dict]:
         rows = self.conn.execute(
             "SELECT code, quantity, avg_cost, current_price, buy_date, "
-            "updated_at, entry_strategy FROM positions"
+            "updated_at, entry_strategy, frozen_qty, frozen_date FROM positions"
         ).fetchall()
         return [
             {
@@ -927,6 +943,8 @@ class Database:
                 "buy_date": date.fromisoformat(r[4]) if r[4] else None,
                 "updated_at": r[5],
                 "entry_strategy": r[6] or "",
+                "frozen_qty": r[7] or 0,
+                "frozen_date": date.fromisoformat(r[8]) if r[8] else None,
             }
             for r in rows
         ]

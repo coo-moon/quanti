@@ -258,3 +258,54 @@ def test_protection_blocks_buy_after_stop_loss_cluster(tmp_path):
         Signal("600519", Direction.SELL, 1.0, "test sell"),
         broker._build_runtime_portfolio())
     assert ok2 is True
+
+
+# --- T+1 frozen-lot tracking (audit F1) ----------------------------------
+
+def _sell(broker, code="000001"):
+    return broker.execute_signal(Signal(code, Direction.SELL, 1.0, "exit"), "t")
+
+
+def test_t1_blocks_selling_todays_fresh_buy(setup):
+    """A position opened today is fully frozen → a same-day SELL is rejected
+    and the position is untouched (the basic T+1 guard)."""
+    db, _, broker = setup
+    assert broker.execute_signal(
+        Signal("000001", Direction.BUY, 0.5, "open"), "t") is True
+    pos = db.list_positions()[0]
+    assert pos["frozen_qty"] == pos["quantity"]        # whole lot frozen today
+    assert _sell(broker) is False                      # T+1 blocks it
+    assert db.list_positions()[0]["quantity"] == pos["quantity"]  # untouched
+
+
+def test_addon_today_freezes_only_new_lot_not_old(setup):
+    """THE F1 bug: a settled lot + a same-day add-on. The SELL must liquidate
+    ONLY the settled shares; today's add-on stays frozen (was: whole position
+    sellable because the add-on kept the old buy_date)."""
+    db, _, broker = setup
+    # Settled holding from long ago (frozen_qty defaults to 0 → fully sellable).
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    # Add to it TODAY via the broker.
+    assert broker.execute_signal(
+        Signal("000001", Direction.BUY, 0.5, "addon"), "t") is True
+    total = db.list_positions()[0]["quantity"]
+    addon = total - 1000
+    assert addon > 0 and db.list_positions()[0]["frozen_qty"] == addon
+
+    assert _sell(broker) is True
+    sells = [t for t in db.list_trades() if t["direction"] == "sell"]
+    assert sells[0]["quantity"] == 1000               # only the settled lot
+    remaining = db.list_positions()
+    assert remaining and remaining[0]["quantity"] == addon   # add-on still held
+    assert remaining[0]["frozen_qty"] == addon               # …and still frozen
+
+
+def test_frozen_lot_settles_next_session(setup):
+    """A frozen lot dated before today has settled → the whole holding sells."""
+    db, _, broker = setup
+    db.upsert_position("000001", 1500, 10.0, 10.0, date(2020, 1, 1),
+                       frozen_qty=500, frozen_date=date(2020, 1, 2))  # past → settled
+    assert _sell(broker) is True
+    sells = [t for t in db.list_trades() if t["direction"] == "sell"]
+    assert sells[0]["quantity"] == 1500
+    assert db.list_positions() == []
