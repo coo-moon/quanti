@@ -174,18 +174,34 @@ class VnpyBackend:
     def positions(self) -> dict:  # pragma: no cover - QMT box only
         out = []
         with self._lock:
-            poss = list(self._positions.values())
+            poss = [p for p in self._positions.values()
+                    if int(getattr(p, "volume", 0)) > 0]
+        # Batch the realtime last prices so market_value / current_price track
+        # the live quote, not cost. Reporting cost-based market_value made
+        # QmtBroker reverse-derive current_price ≡ avg_cost → pnl always 0 →
+        # the per-stock stop-loss never fired on real money (audit C5).
+        last_by_code: dict[str, float] = {}
+        if _XTDATA_OK and poss:
+            try:
+                xt_codes = [self._xt_symbol(p.symbol) for p in poss]
+                ticks = _xtdata.get_full_tick(xt_codes) or {}
+                for p in poss:
+                    t = ticks.get(self._xt_symbol(p.symbol), {}) or {}
+                    last_by_code[p.symbol] = float(t.get("lastPrice", 0) or 0)
+            except Exception:  # noqa: BLE001 - fall back to cost on quote failure
+                pass
         for p in poss:
             vol = int(getattr(p, "volume", 0))
-            if vol <= 0:
-                continue
             avg = float(getattr(p, "price", 0.0))
             # yd_volume = yesterday's holding = the T+1-sellable quantity.
             sellable = int(getattr(p, "yd_volume", 0))
+            last = last_by_code.get(p.symbol, 0.0)
+            cur = last if last > 0 else avg
             out.append({
                 "code": p.symbol, "volume": vol,
                 "can_use_volume": sellable, "avg_price": avg,
-                "market_value": round(vol * avg, 2)})
+                "last_price": round(cur, 3),
+                "market_value": round(vol * cur, 2)})
         return {"positions": out}
 
     def submit_order(self, body: dict) -> dict:  # pragma: no cover - QMT box only

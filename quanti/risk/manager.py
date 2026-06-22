@@ -34,7 +34,6 @@ class RiskConfig:
 
     max_position_pct: float = 0.10  # Max 10% per stock
     max_industry_pct: float = 0.30  # Max 30% per industry
-    max_total_position_pct: float = 0.80  # Max 80% invested
     stop_loss_pct: float = -0.08  # -8% stop loss per stock
     portfolio_stop_loss_pct: float = -0.15  # -15% portfolio drawdown stop
     max_daily_trades: int = 20
@@ -77,14 +76,11 @@ class RiskManager:
         if signal.direction == Direction.SELL:
             return True, ""
 
-        # Check total position ratio
+        # Per-stock concentration tripwire. The total-position (80%) cap was
+        # intentionally removed — full deployment is allowed, bounded only by
+        # the per-stock 10% / per-industry 30% caps, which are the real
+        # post-trade enforcement point in max_additional_buy_value.
         total_value = portfolio.total_value
-        if total_value > 0:
-            position_ratio = portfolio.market_value / total_value
-            if position_ratio >= self.config.max_total_position_pct:
-                return False, f"Total position ratio {position_ratio:.1%} exceeds limit {self.config.max_total_position_pct:.1%}"
-
-        # Check single stock position ratio
         if signal.stock_code in portfolio.positions:
             pos = portfolio.positions[signal.stock_code]
             if total_value > 0:
@@ -100,12 +96,13 @@ class RiskManager:
 
     def max_additional_buy_value(self, portfolio: Portfolio, code: str,
                                  industry: str = "") -> float:
-        """Largest 元 value addable to `code` without breaching the single-stock,
-        industry, or total-position caps — computed POST-trade (room up to the
-        ceiling, net of what's already held). 0.0 when any cap is already at its
-        limit. This is the real enforcement point for the hard caps; callers
-        size buys against it. Pass `industry=""` to skip the industry cap (e.g.
-        when industry data isn't available, as in the backtest)."""
+        """Largest 元 value addable to `code` without breaching the single-stock
+        or industry caps — computed POST-trade (room up to the ceiling, net of
+        what's already held). 0.0 when a cap is already at its limit. This is the
+        real enforcement point for the hard caps; callers size buys against it.
+        Pass `industry=""` to skip the industry cap (e.g. when industry data
+        isn't available, as in the backtest). The total-position (80%) cap was
+        removed — full deployment is bounded only by these per-name caps."""
         total = portfolio.total_value
         if total <= 0:
             return 0.0
@@ -113,14 +110,13 @@ class RiskManager:
         held = portfolio.positions.get(code)
         stock_mv = held.market_value if held else 0.0
         stock_room = total * cfg.max_position_pct - stock_mv
-        total_room = total * cfg.max_total_position_pct - portfolio.market_value
         if industry:
             ind_mv = sum(p.market_value for p in portfolio.positions.values()
                          if p.industry == industry)
             ind_room = total * cfg.max_industry_pct - ind_mv
         else:
             ind_room = float("inf")
-        return max(0.0, min(stock_room, ind_room, total_room))
+        return max(0.0, min(stock_room, ind_room))
 
     def check_portfolio_stop(self, total_value: float, peak_value: float) -> bool:
         """True when equity has drawn down from its high-water mark past

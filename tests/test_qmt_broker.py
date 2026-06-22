@@ -121,9 +121,10 @@ def test_execute_signals_reports_filled_count(env):
 def test_risk_gate_blocks_before_venue(env):
     db, provider = env
     broker = _make(db, provider)
-    # Total-position cap of 0 trips for a fresh BUY (ratio 0.0 >= 0.0), so the
-    # RISK GATE (not sizing) blocks it — exercising the real reject branch.
-    broker._risk = RiskManager(RiskConfig(max_total_position_pct=0.0))
+    # A daily-trade cap of 0 makes the RISK GATE (check(), not sizing) reject
+    # any fresh BUY before it can reach the venue — exercising the real reject
+    # branch. (The 80% total-position cap was removed.)
+    broker._risk = RiskManager(RiskConfig(max_daily_trades=0))
     assert broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"),
                                  "s") is False
     # Nothing reached the venue.
@@ -216,6 +217,40 @@ def test_cancel_all_pending_cancels_open_order(env):
 def test_check_exits_runs_clean(env):
     db, provider = env
     assert _make(db, provider).check_exits() == 0
+
+
+def test_reconciled_current_price_uses_live_quote_not_cost(env):
+    """C5: the reconciled current_price must reflect the live last price, not be
+    reverse-derived from a cost-based market_value (which pinned it to avg_cost
+    → pnl always 0)."""
+    db, provider = env
+    broker = _make(db, provider)
+    broker._client.gw._mock_positions["000001"] = {
+        "volume": 1000, "can_use": 1000, "avg_price": 30.0}
+    pf, _ = broker._reconciled_portfolio()
+    pos = pf.positions["000001"]
+    # Mock live quote for 000001 (~24.43) ≠ cost 30.0 → a real (negative) pnl.
+    assert pos.current_price != pytest.approx(pos.avg_cost)
+    assert pos.pnl_pct < -0.08
+
+
+def test_check_exits_fires_stop_loss_on_loss(env):
+    """C5 regression: a holding whose live price is past the -8% stop triggers a
+    SELL via check_exits and is sold down at the venue. Before the fix the
+    stop-loss never fired live because pnl was structurally 0. The masking test
+    (no positions → 0) is kept above; this exercises the loss path."""
+    db, provider = env
+    broker = _make(db, provider)
+    # Hold 1000 sh at cost 30.0, fully T+1-settled. Mock live quote ~24.43
+    # (~-18.6%) is well past the -8% per-stock stop.
+    broker._client.gw._mock_positions["000001"] = {
+        "volume": 1000, "can_use": 1000, "avg_price": 30.0}
+
+    landed = broker.check_exits()
+    assert landed == 1, "stop-loss exit should have fired and landed at venue"
+    remaining = {p["code"]: p for p in
+                 broker._client.get("/trader/positions")["positions"]}
+    assert remaining.get("000001", {}).get("volume", 0) == 0  # sold out
 
 
 def test_qmt_protection_blocks_buy(tmp_path):

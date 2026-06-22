@@ -34,11 +34,14 @@ from quanti.data.provider import DataProvider
 from quanti.execution.base import BrokerResult, PendingFillResult
 from quanti.models import BarData, Direction, PriceType, Signal
 from quanti.risk.manager import RiskConfig, RiskManager
-from quanti.risk.sizer import Sizer
+from quanti.risk.sizer import Sizer, compute_buy_target_value
 from quanti.utils.market import (
     count_trading_days_between,
     next_trading_bar,
     next_trading_day,
+    prev_bar_close,
+    tradable_at_close,
+    tradable_at_open,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,6 +130,14 @@ class PaperBroker:
             return None
         last = bars[-1]
         return last.close, last.date
+
+    def _latest_bar(self, code: str) -> BarData | None:
+        """Most recent full bar on disk (for the immediate-fill tradability
+        gate, which needs the open to detect a limit-locked session)."""
+        end = date.today()
+        start = end - timedelta(days=30)
+        bars = self._provider.get_daily_bars(code, start, end)
+        return bars[-1] if bars else None
 
     # ------------------------------------------------------------ portfolio
     def snapshot_portfolio(self) -> dict:
@@ -225,12 +236,27 @@ class PaperBroker:
             )
             return False
 
-        quote = self._latest_close(signal.stock_code)
-        if quote is None:
+        bar = self._latest_bar(signal.stock_code)
+        if bar is None:
             self._record_order(signal, strategy_name, status="rejected",
                                reason="no market data")
             return False
-        ref_price, bar_date = quote
+        ref_price, bar_date = float(bar.close), bar.date
+
+        # Tradability gate: can't buy a limit-up lock or sell a limit-down lock
+        # (incl. 一字板). Immediate mode fills at the close, so gate on the
+        # close; no queue, so reject rather than defer (audit C3).
+        pc = prev_bar_close(self._provider, signal.stock_code, bar.date)
+        if not tradable_at_close(signal.direction, bar, pc):
+            r = "涨跌停板 当日不可成交"
+            self._record_order(signal, strategy_name, status="rejected", reason=r)
+            self._db.log_decision(
+                "order_skipped_limit",
+                f"跳过 {signal.direction.value} {signal.stock_code}: {r}",
+                code=signal.stock_code,
+                details={"bar_date": bar.date.isoformat(), "open": bar.open,
+                         "prev_close": pc})
+            return False
 
         if signal.direction == Direction.BUY:
             return self._fill_buy(signal, ref_price, bar_date, strategy_name)
@@ -362,6 +388,32 @@ class PaperBroker:
                 out.reasons.append(reason)
                 continue
 
+            # Tradability gate: a BUY can't fill into a limit-up lock and a
+            # SELL can't fill into a limit-down lock (incl. 一字板). Keep the
+            # order pending across locked days within the TTL — exactly what
+            # the backtest engine does, so paper/live and backtest agree (C3).
+            pc = prev_bar_close(self._provider, o["code"], bar.date)
+            _gate = (tradable_at_open if self._fill_basis == "open"
+                     else tradable_at_close)
+            if not _gate(sig.direction, bar, pc):
+                td = count_trading_days_between(created_date, today)
+                if td > self._pending_ttl_days:
+                    self._db.update_order_status(
+                        o["order_id"], "cancelled",
+                        reason=f"limit-locked {td} trading days")
+                    self._db.log_decision(
+                        "order_expired_pending",
+                        f"挂单超时取消 {o['direction']} {o['code']} "
+                        f"(涨跌停板 {td} 个交易日未能成交)",
+                        code=o["code"],
+                        details={"order_id": o["order_id"],
+                                 "trading_days_pending": td,
+                                 "reason": "limit_locked"})
+                    out.expired += 1
+                else:
+                    out.still_pending += 1
+                continue
+
             # Pick the price.
             ref_price = float(bar.open if self._fill_basis == "open"
                               else bar.close)
@@ -483,10 +535,17 @@ class PaperBroker:
     def enforce_portfolio_stop(self) -> bool:
         """Portfolio drawdown circuit breaker: if equity is down past
         `portfolio_stop_loss_pct` from its high-water mark, cancel pending +
-        flatten everything. Returns True iff it fired (caller halts the agent)."""
-        snap = self.snapshot_portfolio()  # also persists today's snapshot
+        flatten everything. Returns True iff it fired (caller halts the agent).
+
+        The high-water mark is read BEFORE snapshot_portfolio() persists today's
+        row: snapshot writes today's (possibly drawn-down) value via
+        INSERT-OR-REPLACE keyed by date, which would otherwise overwrite an
+        earlier, higher same-day peak and deflate the peak — the breaker would
+        then never fire on a same-day top-then-drop (audit G3/L2)."""
+        prior_peak = self._db.get_peak_total_value()
+        snap = self.snapshot_portfolio()  # persists today's snapshot (overwrite)
         total = snap["total_value"]
-        peak = max(self._db.get_peak_total_value(), total)
+        peak = max(prior_peak, total)
         if not self._risk.check_portfolio_stop(total, peak):
             return False
         self.cancel_all_pending()
@@ -527,16 +586,12 @@ class PaperBroker:
             size_cap = self._risk.max_additional_buy_value(
                 self._build_runtime_portfolio(), signal.stock_code,
                 self._stock_industry(signal.stock_code))
-            if self._sizer is not None:
-                recent = self._recent_bars(signal.stock_code)
-                target_w = self._sizer.target_weight(
-                    code=signal.stock_code, signal_strength=signal.strength,
-                    recent_bars=recent, portfolio_total_value=total_value)
-                sizer_value = total_value * target_w
-                target_value = min(sizer_value, size_cap, cash * 0.95)
-            else:
-                cash_cap = cash * 0.95 * max(min(signal.strength, 1.0), 0.1)
-                target_value = min(cash_cap, size_cap)
+            recent = (self._recent_bars(signal.stock_code)
+                      if self._sizer is not None else None)
+            target_value = compute_buy_target_value(
+                cash=cash, total_value=total_value, strength=signal.strength,
+                size_cap=size_cap, code=signal.stock_code,
+                sizer=self._sizer, recent_bars=recent)
 
             commission_est = self._commission.calculate(price, 100, Direction.BUY)
             affordable_lots = int(target_value / (price * 100 + commission_est))
@@ -703,22 +758,15 @@ class PaperBroker:
         size_cap = self._risk.max_additional_buy_value(
             self._build_runtime_portfolio(), signal.stock_code,
             self._stock_industry(signal.stock_code))
-        if self._sizer is not None:
-            # Sizer-driven path: convert target portfolio weight to a notional
-            # cap. The single-stock RiskManager cap still applies on top so
-            # the sizer can't push past risk limits.
-            recent = self._recent_bars(signal.stock_code)
-            target_w = self._sizer.target_weight(
-                code=signal.stock_code,
-                signal_strength=signal.strength,
-                recent_bars=recent,
-                portfolio_total_value=total_value,
-            )
-            sizer_value = total_value * target_w
-            target_value = min(sizer_value, size_cap, cash * 0.95)
-        else:
-            cash_cap = cash * 0.95 * max(min(signal.strength, 1.0), 0.1)
-            target_value = min(cash_cap, size_cap)
+        # Shared sizing helper (same as pending fill + backtest + QMT) so the
+        # paths can't drift. The single-stock RiskManager cap still applies on
+        # top so a sizer can't push past risk limits.
+        recent = (self._recent_bars(signal.stock_code)
+                  if self._sizer is not None else None)
+        target_value = compute_buy_target_value(
+            cash=cash, total_value=total_value, strength=signal.strength,
+            size_cap=size_cap, code=signal.stock_code,
+            sizer=self._sizer, recent_bars=recent)
         commission_est = self._commission.calculate(price, 100, Direction.BUY)
         affordable_lots = int(target_value / (price * 100 + commission_est))
         if affordable_lots < 1:

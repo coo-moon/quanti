@@ -20,7 +20,47 @@ from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.paper_broker import PaperBroker
 from quanti.models import BarData, Direction, Signal
-from quanti.risk.sizer import FixedSizer, VolTargetSizer
+from quanti.risk.sizer import (
+    FixedSizer, VolTargetSizer, compute_buy_target_value,
+)
+
+
+class TestComputeBuyTargetValue:
+    """The shared buy-sizing helper used by backtest engine + paper + QMT, so
+    the three paths can't drift (audit C2). These pin the exact formula."""
+
+    def test_no_sizer_scales_with_strength(self):
+        # cash*0.95*clamp(strength) when the size_cap doesn't bind.
+        full = compute_buy_target_value(
+            cash=1_000_000, total_value=1_000_000, strength=1.0,
+            size_cap=float("inf"), code="x")
+        half = compute_buy_target_value(
+            cash=1_000_000, total_value=1_000_000, strength=0.5,
+            size_cap=float("inf"), code="x")
+        assert full == pytest.approx(950_000.0)
+        assert half == pytest.approx(475_000.0)
+
+    def test_no_sizer_strength_floor(self):
+        # Strength below 0.1 is floored at 0.1 (never sizes to ~zero).
+        v = compute_buy_target_value(
+            cash=1_000_000, total_value=1_000_000, strength=0.0,
+            size_cap=float("inf"), code="x")
+        assert v == pytest.approx(95_000.0)
+
+    def test_size_cap_binds(self):
+        # The post-trade hard cap (single-stock/industry room) wins when smaller.
+        v = compute_buy_target_value(
+            cash=1_000_000, total_value=1_000_000, strength=1.0,
+            size_cap=100_000.0, code="x")
+        assert v == pytest.approx(100_000.0)
+
+    def test_with_sizer_caps_by_room_and_cash(self):
+        sizer = FixedSizer(max_pct=0.10)  # target 10% of total
+        # total*0.10 = 100k, but room caps it to 40k.
+        v = compute_buy_target_value(
+            cash=1_000_000, total_value=1_000_000, strength=1.0,
+            size_cap=40_000.0, code="x", sizer=sizer, recent_bars=[])
+        assert v == pytest.approx(40_000.0)
 
 
 def _make_bars(code: str, n: int, sigma_per_day: float, start_price: float = 10.0,

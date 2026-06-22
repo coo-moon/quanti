@@ -150,3 +150,42 @@ class VolTargetSizer:
         raw_w = (self._tgt / ann_vol) / self._n
         scaled = raw_w * s
         return min(self._max_pct, max(self._floor * s, scaled))
+
+
+def compute_buy_target_value(
+    *,
+    cash: float,
+    total_value: float,
+    strength: float,
+    size_cap: float,
+    code: str,
+    sizer: "Sizer | None" = None,
+    recent_bars: list[BarData] | None = None,
+    cash_buffer: float = 0.95,
+) -> float:
+    """Single source of truth for how much 元 a BUY deploys.
+
+    Shared by the backtest engine and the live brokers (paper + QMT) so the
+    three execution paths can't drift apart on sizing — the divergence the
+    2026-06-22 audit flagged as C2 (the backtest ignored ``signal.strength``
+    and deployed ~2.5x what live does).
+
+    - **Without a sizer:** ``cash * cash_buffer * clamp(strength, 0.1, 1.0)``,
+      then capped by ``size_cap``.
+    - **With a sizer:** ``min(total_value * target_weight, size_cap,
+      cash * cash_buffer)``.
+
+    ``size_cap`` is the post-trade hard-cap room from
+    ``RiskManager.max_additional_buy_value`` (single-stock + industry caps).
+    Returns a 元 value *before* lot-rounding and the final affordability check.
+    """
+    if sizer is not None:
+        target_w = sizer.target_weight(
+            code=code,
+            signal_strength=strength,
+            recent_bars=recent_bars or [],
+            portfolio_total_value=total_value,
+        )
+        return max(0.0, min(total_value * target_w, size_cap, cash * cash_buffer))
+    cash_cap = cash * cash_buffer * max(min(strength, 1.0), 0.1)
+    return max(0.0, min(cash_cap, size_cap))

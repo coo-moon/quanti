@@ -1081,7 +1081,6 @@ curl -X POST http://127.0.0.1:8000/api/backtest/run \
 |------|------|------|
 | `max_position_pct` | 0.10 | 单股不超过组合的 10% |
 | `max_industry_pct` | 0.30 | 单行业不超过 30% |
-| `max_total_position_pct` | 0.80 | 总仓位不超过 80%（留 20% 现金缓冲） |
 | `stop_loss_pct` | -0.08 | 单股止损 -8% |
 | `portfolio_stop_loss_pct` | -0.15 | 组合止损 -15% |
 | `max_daily_trades` | 20 | 每日最多 20 笔 |
@@ -1107,7 +1106,7 @@ app.state.broker = PaperBroker(
 
 ### 12.2 波动率目标仓位(opt-in,2026-05 升级)
 
-风控提供仓位**上限**(单股 10%、行业 30%、总仓 80%)。`VolTargetSizer` 提供仓位**目标**:让低波股拿到更大权重、高波股更小,组合年化波动接近某个目标值。详见 §6.9.2。
+风控提供仓位**上限**(单股 10%、行业 30%;总仓位上限已移除,允许满仓,仅受单股/行业上限约束)。`VolTargetSizer` 提供仓位**目标**:让低波股拿到更大权重、高波股更小,组合年化波动接近某个目标值。详见 §6.9.2。
 
 二者不冲突:Sizer 给出的目标权重仍受 `RiskConfig.max_position_pct` 硬上限约束。Sizer 是 opt-in,默认 PaperBroker 行为不变。
 

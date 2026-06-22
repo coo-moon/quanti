@@ -298,6 +298,74 @@ class TestTTL:
         assert len(db.list_decisions(kind="order_expired_pending")) == 1
 
 
+# --- limit-up/down tradability gate (audit C3) ---------------------------
+
+class TestLimitTradabilityGate:
+    """Paper/live must not 'fill' into a 一字板 the way the old code did — a
+    BUY can't fill a limit-up lock, a SELL can't fill a limit-down lock. The
+    backtest already gated this; these pin the broker to the same rule."""
+
+    def _backdate(self, db):
+        db.conn.execute(
+            "UPDATE orders SET created_at=? WHERE status='pending'",
+            ((datetime.now() - timedelta(days=1)).isoformat(),))
+        db.conn.commit()
+
+    def test_pending_buy_blocked_by_limit_up(self, seeded_pending):
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending", slippage=0.001)
+        broker.execute_signal(Signal("AAA", Direction.BUY, 0.5, "q"), "test")
+        self._backdate(db)
+        # Today's bar opens limit-up (一字板) vs prev close ~10.20 (>+10%).
+        _append_new_bar(db, "AAA", 0, open_price=11.40, close_price=11.40)
+        result = broker.try_fill_pending_orders()
+        assert result.filled == 0
+        assert result.still_pending == 1          # stays queued, not filled
+        assert db.list_trades() == []
+        assert len(db.list_orders(status="pending")) == 1
+
+    def test_pending_sell_blocked_by_limit_down(self, seeded_pending):
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending")
+        # Hold AAA from long ago (T+1 satisfied), then queue an exit SELL.
+        db.upsert_position("AAA", 1000, 10.0, 10.2, date(2020, 1, 1))
+        broker.execute_signal(Signal("AAA", Direction.SELL, 1.0, "exit"), "test")
+        self._backdate(db)
+        # Today opens limit-down vs prev ~10.20 (<-10%) → SELL can't fill.
+        _append_new_bar(db, "AAA", 0, open_price=9.00, close_price=9.00)
+        result = broker.try_fill_pending_orders()
+        assert result.filled == 0
+        assert result.still_pending == 1
+        assert any(p["code"] == "AAA" for p in db.list_positions())  # untouched
+
+    def test_pending_buy_fills_when_open_within_band(self, seeded_pending):
+        """Control: a normal open (+7%) within the band fills as usual — the
+        gate doesn't block legitimate moves."""
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending", slippage=0.0)
+        broker.execute_signal(Signal("AAA", Direction.BUY, 0.5, "q"), "test")
+        self._backdate(db)
+        _append_new_bar(db, "AAA", 0, open_price=10.90, close_price=10.95)
+        result = broker.try_fill_pending_orders()
+        assert result.filled == 1
+        assert result.still_pending == 0
+
+    def test_immediate_buy_blocked_by_limit_up_close(self, seeded_pending):
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="immediate")
+        # Latest bar sealed limit-up at close vs prev ~10.20.
+        _append_new_bar(db, "AAA", 0, open_price=11.40, close_price=11.40)
+        assert broker.execute_signal(Signal("AAA", Direction.BUY, 0.5, "m"),
+                                     "test") is False
+        assert db.list_trades() == []
+        assert any(d["kind"] == "order_skipped_limit"
+                   for d in db.list_decisions(limit=10))
+
+
 # --- immediate-mode regression -------------------------------------------
 
 class TestImmediateMode:
