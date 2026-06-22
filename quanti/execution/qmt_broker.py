@@ -38,6 +38,7 @@ from quanti.execution.base import BrokerResult, PendingFillResult
 from quanti.models import Direction, Portfolio, Position, PriceType, Signal
 from quanti.risk.manager import RiskConfig, RiskManager
 from quanti.risk.sizer import compute_buy_target_value
+from quanti.utils.market import board_limit_pct, prev_bar_close
 
 if TYPE_CHECKING:
     from quanti.risk.protections import ProtectionConfig
@@ -60,11 +61,16 @@ class QmtBroker:
         protection_config: ProtectionConfig | None = None,
         slippage: float = 0.001,
         strategies_dir: str = "strategies",
+        require_live: bool = False,
     ) -> None:
         self._db = db
         self._provider = provider
         self._client: BridgeClient = client or HttpBridgeClient(bridge_url)
         self._initial_cash = initial_cash
+        # When True (real money), a silent mock fallback must read as NOT
+        # connected and orders must not submit (audit G1). Default False keeps
+        # dev/mock/tests working.
+        self._require_live = require_live
         self._risk = RiskManager(risk_config)
         from quanti.risk.protections import ProtectionConfig, ProtectionManager
         self._protections = ProtectionManager(
@@ -75,15 +81,30 @@ class QmtBroker:
 
     # ----------------------------------------------------------- health
     def is_connected(self) -> bool:
-        """True iff the bridge is reachable and reports ok. (A stricter live
-        gate also requires ``trader_connected``; left permissive while the
-        bridge runs in mock mode.)"""
+        """True iff the bridge is reachable and reports ok. With ``require_live``
+        (real money), ALSO require real ``vnpy`` mode + a connected trader: a
+        silent mock fallback (xtquant failed to import on the QMT box) must read
+        as NOT connected, else mock 'fills' get mirrored as real trades (G1)."""
         try:
             h = self._client.get("/health")
         except Exception as e:  # noqa: BLE001 - unreachable bridge == down
             logger.warning("qmt-bridge unreachable: %s", e)
             return False
-        return bool(h.get("ok"))
+        if not h.get("ok"):
+            return False
+        if self._require_live:
+            return h.get("mode") == "vnpy" and bool(h.get("trader_connected"))
+        return True
+
+    def _order_price(self, code: str, price: float) -> float:
+        """Round to the A-share tick (0.01) and clamp into today's price-limit
+        band, so the venue can't reject an illegal/over-limit price (audit G4)."""
+        p = round(float(price), 2)
+        pc = prev_bar_close(self._provider, code, date.today())
+        if pc and pc > 0:
+            lim = board_limit_pct(code)
+            p = min(max(p, round(pc * (1 - lim), 2)), round(pc * (1 + lim), 2))
+        return p
 
     # ------------------------------------------------------- reconciliation
     def _reconciled_portfolio(self) -> tuple[Portfolio, dict[str, int]]:
@@ -200,6 +221,19 @@ class QmtBroker:
         RiskManager runs BEFORE every submit (red line). SELL volume is capped
         at the T+1-sellable quantity (`can_use_volume`) so a lot bought today
         is never over-sold — a frozen position is skipped, not submitted."""
+        # Live red line: never submit (nor mirror as filled) against a bridge
+        # that isn't truly live — a mock fallback would book phantom real
+        # trades (audit G1). No-op when require_live is off (dev/mock/tests).
+        if self._require_live and not self.is_connected():
+            self._mirror_order(signal, strategy_name, status="rejected",
+                               reason="bridge not live (mock fallback?)")
+            self._db.log_decision(
+                "broker_not_live",
+                f"拒单(实盘):bridge 非真实连接(疑似 mock 回退) "
+                f"{signal.direction.value} {signal.stock_code}",
+                code=signal.stock_code, details={"venue": "qmt"})
+            return False, "rejected", "bridge not live"
+
         portfolio, sellable = self._reconciled_portfolio()
         ok, reason, kind = self._entry_allowed(signal, portfolio)
         if not ok:
@@ -246,7 +280,8 @@ class QmtBroker:
 
         res = self._client.post("/trader/order", {
             "code": signal.stock_code, "direction": signal.direction.value,
-            "volume": int(volume), "price": round(float(price), 3),
+            "volume": int(volume),
+            "price": self._order_price(signal.stock_code, price),
             "price_type": "limit" if price else "market"})
         accepted = bool(res.get("ok"))
         filled = accepted and res.get("status") == "filled"

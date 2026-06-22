@@ -94,6 +94,34 @@ def test_is_connected_false_when_bridge_down(env):
     assert QmtBroker(db, provider, client=DeadBridge()).is_connected() is False
 
 
+def test_require_live_treats_mock_bridge_as_not_connected(env):
+    """G1: with require_live, a bridge in mock mode (xtquant absent) must read
+    as NOT connected and refuse to submit — else mock 'fills' would be mirrored
+    as real trades."""
+    db, provider = env
+    broker = _make(db, provider, require_live=True)  # in-proc bridge = mock mode
+    assert broker.is_connected() is False            # mock ≠ vnpy
+    # A submit is rejected before any venue/local state changes.
+    assert broker.execute_signal(
+        Signal("000001", Direction.BUY, 0.5, "b"), "s") is False
+    assert db.list_trades() == []
+    assert any(d["kind"] == "broker_not_live"
+               for d in db.list_decisions(limit=10))
+
+
+def test_order_price_clamps_to_tick_and_limit(env):
+    """G4: order price is rounded to the A-share tick (0.01) and clamped into
+    today's daily price-limit band, so the venue can't reject it."""
+    from quanti.utils.market import prev_bar_close
+    db, provider = env
+    broker = _make(db, provider)
+    pc = prev_bar_close(provider, "000001", date.today())
+    assert pc and pc > 0
+    lim_hi = round(pc * 1.10, 2)              # main board ±10%
+    assert broker._order_price("000001", 999.0) == lim_hi   # clamped up
+    assert broker._order_price("000001", 10.123) == 10.12   # rounded to tick
+
+
 def test_buy_submits_and_reconciles_from_broker(env):
     db, provider = env
     broker = _make(db, provider)
