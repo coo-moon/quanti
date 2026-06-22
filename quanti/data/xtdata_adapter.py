@@ -79,6 +79,7 @@ class XtdataAdapter:
             "volume": float(b.get("volume", 0) or 0),
             "amount": float(b.get("amount", 0) or 0),
             "turnover": float(b.get("turnover", 0) or 0),
+            "adj_factor": float(b.get("adj_factor", 1.0) or 1.0),
         } for b in bars])
         saved = self._db.save_daily_quotes(df)
         logger.info("%s: %d bars [%s~%s] via xtdata", code, saved,

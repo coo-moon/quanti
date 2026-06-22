@@ -178,6 +178,10 @@ class Database:
             ("positions", "entry_strategy", "TEXT DEFAULT ''"),
             ("orders", "entry_strategy", "TEXT DEFAULT ''"),
             ("stocks", "delist_date", "TEXT"),
+            # Qlib-style price adjustment: store RAW prices + a per-(code,date)
+            # back-adjustment factor. Pre-existing rows backfill to 1.0 (read as
+            # raw) until a `quanti sync --refetch` rewrites them as raw+factor.
+            ("daily_quotes", "adj_factor", "REAL DEFAULT 1.0"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -225,6 +229,7 @@ class Database:
                 volume REAL NOT NULL,
                 amount REAL NOT NULL,
                 turnover REAL DEFAULT 0,
+                adj_factor REAL NOT NULL DEFAULT 1.0,
                 PRIMARY KEY (code, date)
             );
 
@@ -514,6 +519,12 @@ class Database:
         for _, row in df.iterrows():
             d = row["date"]
             date_str = d.isoformat() if isinstance(d, date) else str(d)
+            # Back-adjustment factor: raw_price × adj_factor = hfq price. Default
+            # 1.0 (raw) and clamp NaN/inf/≤0 to 1.0 — a bad factor would silently
+            # zero/negate prices for every reader.
+            f = float(row.get("adj_factor", 1.0) or 1.0)
+            if not math.isfinite(f) or f <= 0:
+                f = 1.0
             records.append(
                 (
                     row["code"],
@@ -525,13 +536,15 @@ class Database:
                     float(row["volume"]),
                     float(row["amount"]),
                     float(row.get("turnover", 0)),
+                    f,
                 )
             )
         self.conn.executemany(
             """
             INSERT OR REPLACE INTO daily_quotes
-                (code, date, open, high, low, close, volume, amount, turnover)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (code, date, open, high, low, close, volume, amount, turnover,
+                 adj_factor)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             records,
         )
@@ -553,7 +566,8 @@ class Database:
         with self._db_lock:
             df = pd.read_sql_query(
                 """
-                SELECT code, date, open, high, low, close, volume, amount, turnover
+                SELECT code, date, open, high, low, close, volume, amount,
+                       turnover, adj_factor
                 FROM daily_quotes
                 WHERE code=? AND date>=? AND date<=?
                 ORDER BY date

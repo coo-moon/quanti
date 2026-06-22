@@ -11,14 +11,41 @@ from quanti.models import BarData
 
 
 class DataProvider:
-    """Reads market data from database. Single source of truth for strategies."""
+    """Reads market data from database. Single source of truth for strategies.
+
+    `daily_quotes` stores RAW (不复权) prices + a per-(code,date) back-adjustment
+    factor `adj_factor`. This is the single boundary where adjustment is applied:
+    with ``adjust="hfq"`` (the default) prices are back-adjusted to a continuous
+    series (correct returns, no ex-dividend gaps); with ``adjust="none"`` the raw
+    market prices are returned (for live order pricing and UI display). The DB
+    layer never adjusts — so gap-repair / re-reads can't double-adjust.
+    """
 
     def __init__(self, db: Database):
         self._db = db
 
-    def get_daily_bars(self, code: str, start: date, end: date) -> list[BarData]:
-        """Get daily bar data as list of BarData objects."""
-        df = self._db.get_daily_quotes(code, start, end)
+    @staticmethod
+    def _apply_adjust(df: pd.DataFrame, adjust: str) -> pd.DataFrame:
+        """Back-adjust (hfq) a raw-price frame by adj_factor, or return raw.
+
+        adjusted price = raw × adj_factor; volume = raw / adj_factor (Qlib
+        convention, keeps price×volume ≈ amount); amount/turnover unchanged.
+        Returns a copy — never mutates the input — so no double-adjustment.
+        """
+        if adjust == "none" or df.empty or "adj_factor" not in df.columns:
+            return df
+        df = df.copy()
+        f = df["adj_factor"].astype(float)
+        for col in ("open", "high", "low", "close"):
+            df[col] = df[col] * f
+        df["volume"] = df["volume"] / f
+        return df
+
+    def get_daily_bars(self, code: str, start: date, end: date,
+                       adjust: str = "hfq") -> list[BarData]:
+        """Get daily bars. ``adjust="hfq"`` (default) returns back-adjusted
+        prices; ``adjust="none"`` returns raw market prices."""
+        df = self._apply_adjust(self._db.get_daily_quotes(code, start, end), adjust)
         return [
             BarData(
                 code=row["code"],
@@ -34,9 +61,11 @@ class DataProvider:
             for _, row in df.iterrows()
         ]
 
-    def get_daily_df(self, code: str, start: date, end: date) -> pd.DataFrame:
-        """Get daily data as DataFrame (for factor computation)."""
-        return self._db.get_daily_quotes(code, start, end)
+    def get_daily_df(self, code: str, start: date, end: date,
+                    adjust: str = "hfq") -> pd.DataFrame:
+        """Get daily data as DataFrame (for factor computation). Adjusted (hfq)
+        by default; pass ``adjust="none"`` for raw prices."""
+        return self._apply_adjust(self._db.get_daily_quotes(code, start, end), adjust)
 
     def get_trade_dates(self, start: date, end: date) -> list[date]:
         return self._db.get_trade_dates(start, end)

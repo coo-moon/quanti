@@ -72,6 +72,34 @@ def _estimate_expected_rows(start: date, end: date) -> int:
     return max(1, int(calendar_days * 242 / 365))
 
 
+def _attach_adj_factor(df: pd.DataFrame, hfq: pd.DataFrame | None,
+                       date_col: str, close_col: str) -> pd.DataFrame:
+    """Attach `adj_factor = hfq_close / raw_close` (aligned by date) to a RAW
+    price frame `df` (must have 'date' + 'close'). `hfq` is the source's
+    back-adjusted frame; date_col/close_col name its date+close columns.
+
+    The hfq series is anchored to the listing day (window-independent), so the
+    factor for a given date is stable across incremental syncs — the property
+    qfq lacked (audit A2). Missing dates or non-positive raw close → factor 1.0.
+    # VERIFY against the installed akshare build: hfq is listing-anchored (qfq
+    # is rebased to the latest day and MUST NOT be used to derive the factor)."""
+    df = df.copy()
+    if hfq is None or hfq.empty:
+        df["adj_factor"] = 1.0
+        return df
+    h = pd.DataFrame({
+        "date": pd.to_datetime(hfq[date_col]).dt.date,
+        "_hfq": hfq[close_col].astype(float),
+    }).drop_duplicates(subset=["date"])
+    df = df.merge(h, on="date", how="left")
+    raw_close = df["close"].astype(float)
+    factor = pd.Series(1.0, index=df.index)
+    ok = df["_hfq"].notna() & (raw_close > 0)
+    factor[ok] = df["_hfq"][ok] / raw_close[ok]
+    df["adj_factor"] = factor.where(factor > 0, 1.0)
+    return df.drop(columns=["_hfq"])
+
+
 class AkShareAdapter:
     """Fetches A-share data from AkShare and saves to database."""
 
@@ -151,51 +179,56 @@ class AkShareAdapter:
 
     # --- Data sources ---
 
-    def _fetch_eastmoney(self, code: str, start: date, end: date) -> pd.DataFrame | None:
-        """Fetch from East Money (东方财富) - primary source."""
+    def _em_hist(self, code: str, start: date, end: date,
+                 adjust: str) -> pd.DataFrame | None:
+        """East Money raw akshare frame for the given adjust mode, with retries."""
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 raw = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period="daily",
+                    symbol=code, period="daily",
                     start_date=start.strftime("%Y%m%d"),
-                    end_date=end.strftime("%Y%m%d"),
-                    adjust="qfq",
-                )
+                    end_date=end.strftime("%Y%m%d"), adjust=adjust)
                 if raw is not None and not raw.empty:
-                    return pd.DataFrame(
-                        {
-                            "code": code,
-                            "date": pd.to_datetime(raw["日期"]).dt.date,
-                            "open": raw["开盘"].astype(float),
-                            "high": raw["最高"].astype(float),
-                            "low": raw["最低"].astype(float),
-                            "close": raw["收盘"].astype(float),
-                            "volume": raw["成交量"].astype(float),
-                            "amount": raw["成交额"].astype(float),
-                            "turnover": raw["换手率"].astype(float) if "换手率" in raw.columns else 0,
-                        }
-                    )
+                    return raw
                 return None
             except Exception as e:
-                logger.warning(f"East Money attempt {attempt}/{MAX_RETRIES} for {code}: {e}")
+                logger.warning(f"East Money({adjust or 'raw'}) attempt "
+                               f"{attempt}/{MAX_RETRIES} for {code}: {e}")
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY * attempt)
         return None
 
-    def _fetch_sina(self, code: str, start: date, end: date) -> pd.DataFrame | None:
-        """Fetch from Sina (新浪) - fallback source. Chunks by quarter to avoid truncation."""
-        symbol = _code_to_sina_symbol(code)
-        all_chunks: list[pd.DataFrame] = []
+    def _fetch_eastmoney(self, code: str, start: date, end: date) -> pd.DataFrame | None:
+        """Fetch RAW (不复权) OHLCV + adj_factor (=hfq/raw) from East Money."""
+        raw = self._em_hist(code, start, end, adjust="")  # RAW prices
+        if raw is None or raw.empty:
+            return None
+        df = pd.DataFrame(
+            {
+                "code": code,
+                "date": pd.to_datetime(raw["日期"]).dt.date,
+                "open": raw["开盘"].astype(float),
+                "high": raw["最高"].astype(float),
+                "low": raw["最低"].astype(float),
+                "close": raw["收盘"].astype(float),
+                "volume": raw["成交量"].astype(float),
+                "amount": raw["成交额"].astype(float),
+                "turnover": raw["换手率"].astype(float) if "换手率" in raw.columns else 0,
+            }
+        )
+        hfq = self._em_hist(code, start, end, adjust="hfq")  # for the factor
+        return _attach_adj_factor(df, hfq, "日期", "收盘")
 
+    def _sina_daily_chunked(self, symbol: str, start: date, end: date,
+                            adjust: str) -> pd.DataFrame | None:
+        """Sina raw akshare frame for the given adjust mode, chunked by quarter
+        to avoid truncation; concatenated + de-duped by date."""
+        chunks: list[pd.DataFrame] = []
         chunk_start = start
         while chunk_start < end:
             chunk_end = min(
-                date(
-                    chunk_start.year + (chunk_start.month + 2) // 12,
-                    (chunk_start.month + 2) % 12 + 1,
-                    1,
-                ),
+                date(chunk_start.year + (chunk_start.month + 2) // 12,
+                     (chunk_start.month + 2) % 12 + 1, 1),
                 end,
             )
             try:
@@ -203,19 +236,24 @@ class AkShareAdapter:
                     symbol=symbol,
                     start_date=chunk_start.strftime("%Y%m%d"),
                     end_date=chunk_end.strftime("%Y%m%d"),
-                    adjust="qfq",
-                )
+                    adjust=adjust)
                 if raw is not None and not raw.empty:
-                    all_chunks.append(raw)
+                    chunks.append(raw)
             except Exception as e:
-                logger.warning(f"Sina chunk {chunk_start}~{chunk_end} for {code}: {e}")
+                logger.warning(f"Sina({adjust or 'raw'}) chunk "
+                               f"{chunk_start}~{chunk_end} for {symbol}: {e}")
             chunk_start = chunk_end
-
-        if not all_chunks:
+        if not chunks:
             return None
+        return pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["date"])
 
-        raw = pd.concat(all_chunks, ignore_index=True).drop_duplicates(subset=["date"])
-        return pd.DataFrame(
+    def _fetch_sina(self, code: str, start: date, end: date) -> pd.DataFrame | None:
+        """Fetch RAW (不复权) OHLCV + adj_factor (=hfq/raw) from Sina (fallback)."""
+        symbol = _code_to_sina_symbol(code)
+        raw = self._sina_daily_chunked(symbol, start, end, adjust="")  # RAW
+        if raw is None or raw.empty:
+            return None
+        df = pd.DataFrame(
             {
                 "code": code,
                 "date": pd.to_datetime(raw["date"]).dt.date,
@@ -228,6 +266,8 @@ class AkShareAdapter:
                 "turnover": raw["turnover"].astype(float) if "turnover" in raw.columns else 0,
             },
         )
+        hfq = self._sina_daily_chunked(symbol, start, end, adjust="hfq")  # for factor
+        return _attach_adj_factor(df, hfq, "date", "close")
 
     def _fetch_with_fallback(self, code: str, start: date, end: date) -> tuple[pd.DataFrame | None, str]:
         """Try East Money, fallback to Sina. Returns (df, source_name)."""

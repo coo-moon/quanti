@@ -237,9 +237,12 @@ expr = parse_expr("-Mean(turnover, 20)")                  # 低换手异象
 | `quanti sync --stocks` | 同步全A股列表（名称/行业/交易所） |
 | `quanti sync --calendar` | 同步交易日历 |
 | `quanti sync --quotes --codes 000001,600519` | 同步指定股票K线 |
+| `quanti sync --quotes --refetch` | 全量重拉历史(覆盖旧数据)——从 qfq 切到「原始价+复权因子」后须跑一次 |
 | `quanti sync --tushare-stocks` | 同步含退市股的全量名册（需 `TUSHARE_TOKEN`，可选依赖 `.[data]`） |
 | `quanti sync --tushare-quotes --delisted-only` | 补拉退市股历史行情（用于无幸存者偏差回测） |
 | `quanti serve` | 启动 API 服务（端口 8000） |
+
+> **复权口径(Qlib 式)**:`daily_quotes` 存**原始价(不复权)+ 每日复权因子 `adj_factor`**(=后复权/原始);akshare/tushare/xtdata 三源同一口径。研究/回测/因子/策略由 `DataProvider` 读时**后复权(hfq,连续、跨除权无假跳变、可复现)**,实盘下单与图表展示用**原始价**。因子锚定上市首日 → 增量同步安全。旧库是 qfq,升级后跑一次 `quanti sync --quotes --refetch` 重置口径。
 
 ### 无幸存者偏差回测 (survivorship-free)
 

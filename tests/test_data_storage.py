@@ -56,6 +56,28 @@ class TestDailyQuoteStorage:
         result = db.get_daily_quotes("000001", date(2024, 1, 1), date(2024, 1, 5))
         assert len(result) == 2
         assert result.iloc[0]["close"] == 10.2
+        # No adj_factor supplied → defaults to 1.0 (backward compatible).
+        assert "adj_factor" in result.columns
+        assert list(result["adj_factor"]) == [1.0, 1.0]
+
+    def test_adj_factor_round_trip_and_clamp(self, db):
+        import math
+
+        import pandas as pd
+        df = pd.DataFrame({
+            "code": ["000001"] * 4,
+            "date": [date(2024, 1, i) for i in (2, 3, 4, 5)],
+            "open": [10.0] * 4, "high": [10.5] * 4, "low": [9.8] * 4,
+            "close": [10.0] * 4, "volume": [1e6] * 4, "amount": [1e7] * 4,
+            "turnover": [1.0] * 4,
+            # valid, then three poisoned values that must clamp to 1.0.
+            "adj_factor": [1.25, 0.0, -3.0, math.nan],
+        })
+        db.save_daily_quotes(df)
+        result = db.get_daily_quotes("000001", date(2024, 1, 1), date(2024, 1, 9))
+        assert list(result["adj_factor"]) == [1.25, 1.0, 1.0, 1.0]
+        # raw prices are stored untouched regardless of factor.
+        assert list(result["close"]) == [10.0, 10.0, 10.0, 10.0]
 
     def test_get_latest_date(self, db):
         import pandas as pd
@@ -80,6 +102,35 @@ class TestDailyQuoteStorage:
     def test_get_latest_date_no_data(self, db):
         latest = db.get_latest_quote_date("000001")
         assert latest is None
+
+    def test_adj_factor_migration_on_legacy_db(self, tmp_path):
+        """A pre-existing daily_quotes WITHOUT adj_factor gains the column (=1.0)
+        via _migrate, without losing data — and is idempotent on re-init."""
+        import sqlite3
+
+        path = str(tmp_path / "legacy.db")
+        con = sqlite3.connect(path)
+        con.execute("""
+            CREATE TABLE daily_quotes (
+                code TEXT NOT NULL, date TEXT NOT NULL,
+                open REAL, high REAL, low REAL, close REAL,
+                volume REAL, amount REAL, turnover REAL DEFAULT 0,
+                PRIMARY KEY (code, date))""")
+        con.execute("INSERT INTO daily_quotes VALUES "
+                    "('000001','2024-01-02',10,10.5,9.8,10.2,1e6,1e7,1.5)")
+        con.commit()
+        con.close()
+
+        d = Database(path)
+        d.initialize()  # runs _migrate → ADD COLUMN adj_factor DEFAULT 1.0
+        cols = [r[1] for r in d.conn.execute(
+            "PRAGMA table_info(daily_quotes)").fetchall()]
+        assert "adj_factor" in cols
+        res = d.get_daily_quotes("000001", date(2024, 1, 1), date(2024, 1, 9))
+        assert len(res) == 1 and res.iloc[0]["close"] == 10.2  # data intact
+        assert res.iloc[0]["adj_factor"] == 1.0                # backfilled
+        d._migrate()  # idempotent — no error, no duplicate column
+        d.close()
 
 
 class TestTradeCalendar:

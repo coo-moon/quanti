@@ -78,6 +78,34 @@ def test_sync_daily_quotes_lands_with_zero_turnover(db):
     assert (out["turnover"] == 0).all()  # free tier has no turnover
 
 
+def test_adj_factor_from_raw_and_hfq(db):
+    """RAW close is stored; adj_factor = hfq_close / raw_close, from a second
+    adj='hfq' pull aligned by trade_date."""
+    db.upsert_stock("600001", "x", "SH", date(1998, 1, 22), "")
+
+    def bar(ts_code, asset, adj, start_date, end_date):
+        # raw vs hfq diverge — hfq is anchored higher (post-split inflation).
+        c = ([6.2, 6.0] if adj == "hfq" else [3.1, 3.0])
+        return pd.DataFrame([
+            {"ts_code": ts_code, "trade_date": "20100120", "open": c[0],
+             "high": c[0] + 0.1, "low": c[0] - 0.1, "close": c[0],
+             "vol": 1000.0, "amount": 3.1e6},
+            {"ts_code": ts_code, "trade_date": "20100119", "open": c[1],
+             "high": c[1] + 0.1, "low": c[1] - 0.1, "close": c[1],
+             "vol": 1200.0, "amount": 3.6e6},
+        ])
+
+    adapter = TushareAdapter(db, pro=FakePro(), pro_bar=bar)
+    adapter.sync_daily_quotes("600001", start=date(2010, 1, 1),
+                              end=date(2010, 1, 31))
+    out = db.get_daily_quotes("600001", date(2010, 1, 1), date(2010, 1, 31))
+    by_date = {str(d): (c, f) for d, c, f in
+               zip(out["date"], out["close"], out["adj_factor"])}
+    assert by_date["2010-01-19"][0] == pytest.approx(3.0)           # RAW stored
+    assert by_date["2010-01-19"][1] == pytest.approx(6.0 / 3.0)     # hfq/raw
+    assert by_date["2010-01-20"][1] == pytest.approx(6.2 / 3.1)
+
+
 def test_methods_raise_clearly_without_token(db, monkeypatch):
     # No pro injected, no TUSHARE_TOKEN → clear error, no token leak.
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
