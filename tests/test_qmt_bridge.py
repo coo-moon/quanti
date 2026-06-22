@@ -36,8 +36,25 @@ def test_kline_returns_ohlc_bars(gw):
     assert body["code"] == "000001"
     assert len(body["bars"]) > 0
     bar = body["bars"][0]
-    assert set(bar) >= {"date", "open", "high", "low", "close", "volume", "amount"}
+    assert set(bar) >= {"date", "open", "high", "low", "close", "volume",
+                        "amount", "adj_factor"}
     assert bar["high"] >= bar["low"]
+
+
+def test_kline_adj_factor_is_anchored_window_independent(gw):
+    """Each bar carries adj_factor; the mock factor steps at a FIXED absolute
+    date, so a sub-window re-pull yields the SAME factor per date (anti-A2)."""
+    def facs(start, end):
+        _, b = route(gw, "GET", "/data/kline",
+                     {"code": ["000001"], "start": [start], "end": [end]}, None)
+        return {bar["date"]: bar["adj_factor"] for bar in b["bars"]}
+    wide = facs("20240501", "20240701")    # spans the 2024-06-01 step
+    narrow = facs("20240520", "20240610")  # sub-window across the same step
+    # factor present on both sides of the step…
+    assert set(wide.values()) == {1.0, 1.1}
+    # …and identical per-date regardless of the query window (the A2 fix).
+    for d, f in narrow.items():
+        assert wide[d] == f
 
 
 def test_stock_list(gw):

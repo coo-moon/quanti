@@ -24,10 +24,15 @@ def _open_db():
 
 def cmd_sync(args):
     """Sync market data."""
+    from datetime import date
+
     from quanti.data.akshare_adapter import AkShareAdapter
 
     db = _open_db()
     adapter = AkShareAdapter(db)
+    # --refetch: ignore the incremental start and re-pull full history so old
+    # qfq rows are overwritten (INSERT OR REPLACE) with raw price + adj_factor.
+    refetch_start = date(2010, 1, 1) if getattr(args, "refetch", False) else None
 
     if args.calendar:
         logger.info("Syncing trade calendar...")
@@ -42,9 +47,10 @@ def cmd_sync(args):
     if args.quotes:
         codes = args.codes.split(",") if args.codes else db.list_stocks()
         codes = [c.code if hasattr(c, "code") else c for c in codes]
-        logger.info(f"Syncing daily quotes for {len(codes)} stocks...")
+        logger.info(f"Syncing daily quotes for {len(codes)} stocks"
+                    f"{' (full refetch)' if refetch_start else ''}...")
         for i, code in enumerate(codes):
-            count = adapter.sync_daily_quotes(code)
+            count = adapter.sync_daily_quotes(code, start=refetch_start)
             if (i + 1) % 50 == 0:
                 logger.info(f"  Progress: {i + 1}/{len(codes)}")
         logger.info("Quote sync complete")
@@ -65,7 +71,7 @@ def cmd_sync(args):
         logger.info(f"Syncing Tushare quotes for {len(codes)} stocks...")
         for i, code in enumerate(codes):
             try:
-                ta.sync_daily_quotes(code)
+                ta.sync_daily_quotes(code, start=refetch_start)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"  {code}: {e}")
             if (i + 1) % 50 == 0:
@@ -349,6 +355,10 @@ def main():
     sync_parser.add_argument("--tushare-quotes", action="store_true",
                              dest="tushare_quotes",
                              help="Sync daily history via Tushare")
+    sync_parser.add_argument("--refetch", action="store_true",
+                             help="全量重拉历史(覆盖旧数据)。从 qfq 切到"
+                                  "「原始价+adj_factor」后须跑一次,否则旧 qfq "
+                                  "行与新原始行混用,口径不一致")
     sync_parser.add_argument("--delisted-only", action="store_true",
                              dest="delisted_only",
                              help="With --tushare-quotes: only delisted stocks")

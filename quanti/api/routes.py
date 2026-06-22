@@ -484,7 +484,7 @@ async def get_quotes(code: str, start: str, end: str, request: Request):
     except ValueError as e:
         raise HTTPException(status_code=422,
                             detail=f"invalid date (use YYYY-MM-DD): {e}")
-    df = provider.get_daily_df(code, start_d, end_d)
+    df = provider.get_daily_df(code, start_d, end_d, adjust="none")  # 真实市场价
     records = []
     for _, row in df.iterrows():
         d = row["date"]

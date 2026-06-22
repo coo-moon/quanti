@@ -300,8 +300,10 @@ class QmtBroker:
                 return last
         except Exception:  # noqa: BLE001 - fall back to stored close
             pass
+        # RAW (不复权) close — this prices a live order, so it must be the real
+        # tradable price, not the back-adjusted (hfq) series.
         bars = self._provider.get_daily_bars(
-            code, date(2000, 1, 1), date.today())
+            code, date(2000, 1, 1), date.today(), adjust="none")
         return float(bars[-1].close) if bars else 0.0
 
     # ------------------------------------------------ pending / reconcile

@@ -286,11 +286,15 @@ def _mock_bars(code: str, start: str, end: str) -> list[dict]:
     while d <= e:
         if d.weekday() < 5:  # business days only
             px = round(base + (i % 7) * 0.1 - (i % 3) * 0.05, 2)
+            # Synthetic adj_factor keyed off the ABSOLUTE date (a step at a
+            # fixed cutover), so any sub-window re-sync reproduces the SAME
+            # factor per date — exercising the anti-A2 window-independence.
+            factor = 1.0 if d < date(2024, 6, 1) else 1.1
             bars.append({
                 "date": d.isoformat(), "open": round(px - 0.05, 2),
                 "high": round(px + 0.1, 2), "low": round(px - 0.1, 2),
                 "close": px, "volume": 1_000_000.0 + (i % 5) * 1000,
-                "amount": round(px * 1_000_000, 2)})
+                "amount": round(px * 1_000_000, 2), "adj_factor": factor})
             i += 1
         d += timedelta(days=1)
     return bars

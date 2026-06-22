@@ -59,7 +59,7 @@ Windows 机器(常开、交易时段保持登录):
 | 用途 | 源 | 说明 |
 |------|------|------|
 | 选股 / 因子 / 回测 / regime / 研究 | **日线** | 这些全是**日线粒度**,不需要分钟数据 |
-| 历史日线主源(交易宇宙) | **xtdata → 缓存进 SQLite** | 券商级、与成交一致、复权由 SDK 处理;写进现有 `daily_quotes` 表,和 akshare adapter 同一个 `save_daily_quotes` 出口 |
+| 历史日线主源(交易宇宙) | **xtdata → 缓存进 SQLite** | 券商级、与成交一致;写**原始价(不复权)+ adj_factor**(=后复权/原始),与 akshare/tushare 同一口径、同一个 `save_daily_quotes` 出口;研究/回测读取时由 `DataProvider` 复权(hfq),实盘下单用原始价 |
 | 兜底 + 新闻(情绪层) | **akshare**(保留) | 免费、覆盖广;xtdata 没有新闻 |
 | 实盘下单 + 盘中止损/止盈 | **xtdata 实时报价**(tick/快照) | 注意:要的是**实时报价,不是分钟 K 线**;分钟 bar 仅在将来写日内策略时才需要 |
 | 退市股 / point-in-time(可信回测) | **Tushare Pro / 米筐 / 聚宽**(按需) | xtdata 与 akshare **都给不了**——这是数据**内容**问题(幸存者偏差/前视偏差),不是存储/搬运问题 |

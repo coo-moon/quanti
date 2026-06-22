@@ -29,6 +29,7 @@ try:
 except ImportError:  # pragma: no cover - exercised via monkeypatch
     ts = None
 
+from quanti.data.akshare_adapter import _attach_adj_factor
 from quanti.data.database import Database
 
 logger = logging.getLogger(__name__)
@@ -159,9 +160,10 @@ class TushareAdapter:
 
         bar = self._bar_fn()
         ts_code = self._code_to_ts_code(code)
+        sd, ed = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
         raw = self._retry(
-            bar, ts_code=ts_code, asset="E", adj="qfq",
-            start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"))
+            bar, ts_code=ts_code, asset="E", adj=None,  # RAW (不复权) prices
+            start_date=sd, end_date=ed)
         if raw is None or raw.empty:
             return 0
 
@@ -176,6 +178,14 @@ class TushareAdapter:
             "amount": raw["amount"].astype(float),
             "turnover": 0.0,
         })
+        # adj_factor = hfq_close / raw_close, from a second back-adjusted pull
+        # (hfq is anchored to listing → window-independent → incremental-safe).
+        # Computing the ratio sidesteps tushare's adj_factor normalization
+        # convention. # VERIFY adj="hfq" availability for delisted ts_codes.
+        hfq = self._retry(
+            bar, ts_code=ts_code, asset="E", adj="hfq",
+            start_date=sd, end_date=ed)
+        df = _attach_adj_factor(df, hfq, "trade_date", "close")
         saved = self._db.save_daily_quotes(df)
         logger.info("%s: %d bars [%s~%s] via tushare", code, saved,
                     df["date"].min(), df["date"].max())

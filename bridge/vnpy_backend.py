@@ -274,19 +274,37 @@ class VnpyBackend:
         # VERIFY field/period names against the installed xtdata build.
         _xtdata.download_history_data(xt_code, period="1d", start_time=start,
                                       end_time=end)
+        # RAW (不复权) OHLCV.
         data = _xtdata.get_market_data_ex(
             ["open", "high", "low", "close", "volume", "amount"],
-            [xt_code], period="1d", start_time=start, end_time=end)
+            [xt_code], period="1d", start_time=start, end_time=end,
+            dividend_type="none")
+        # Back-adjusted (hfq) close, for adj_factor = back_close / raw_close.
+        # # VERIFY 'back' is listing-anchored (window-independent) on the
+        # installed build, else use xtdata.get_divid_factors.
+        try:
+            back = _xtdata.get_market_data_ex(
+                ["close"], [xt_code], period="1d", start_time=start,
+                end_time=end, dividend_type="back").get(xt_code)
+        except Exception:  # noqa: BLE001 - factor optional; default 1.0
+            back = None
         df = data.get(xt_code)
         bars = []
         if df is not None:
             for ts, row in df.iterrows():
                 d = str(ts)[:8]  # 'YYYYMMDD'
+                raw_close = float(row["close"])
+                factor = 1.0
+                if back is not None and ts in back.index and raw_close > 0:
+                    bc = float(back.loc[ts, "close"])
+                    if bc > 0:
+                        factor = bc / raw_close
                 bars.append({
                     "date": f"{d[:4]}-{d[4:6]}-{d[6:8]}",
                     "open": float(row["open"]), "high": float(row["high"]),
-                    "low": float(row["low"]), "close": float(row["close"]),
-                    "volume": float(row["volume"]), "amount": float(row["amount"])})
+                    "low": float(row["low"]), "close": raw_close,
+                    "volume": float(row["volume"]), "amount": float(row["amount"]),
+                    "adj_factor": factor})
         return {"code": code, "period": period, "bars": bars}
 
     def stock_list(self) -> dict:  # pragma: no cover

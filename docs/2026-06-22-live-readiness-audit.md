@@ -17,6 +17,7 @@
 ### A. 数据正确性 (data-correctness)
 
 #### A1【HIGH】回测源(akshare qfq) 与实盘源(xtdata none) 复权口径不一致，写入同一 daily_quotes 表
+- **✅ 状态(2026-06-22)：已修复(Qlib 式)** — `daily_quotes` 改存**原始价 + `adj_factor`**(=hfq/raw),akshare/tushare/xtdata 三源统一原始价口径;`DataProvider` 读时复权(默认 hfq),实盘下单/图表用 `adjust="none"`。升级后须跑一次 `quanti sync --quotes --refetch`。
 - **位置**：`quanti/data/akshare_adapter.py:163,206`（adjust="qfq"）；`bridge/vnpy_backend.py:259-274`（get_market_data_ex / download_history_data 均未传 dividend_type → xtdata 默认 'none' 原始价）；`quanti/data/xtdata_adapter.py:67-83`（同一 save_daily_quotes 出口）；`quanti/data/database.py:228,530-538`（主键 (code,date)，INSERT OR REPLACE，无 source 列）
 - **问题**：AkShare 两条取数路径均前复权写入；xtdata 经 bridge 取原始未复权价，写入同一张表同一列。增量同步按 (code,date) 用不复权 bar 覆盖此前前复权 bar，在每个除权除息点产生成倍/跳变价格断点。
 - **实盘影响**：实盘期切换/混入 xtdata 后，历史价序列在除权点不连续，污染所有价格型指标与回测；同一票切换数据源前后口径不一致 → 回测≢实盘，基于 pnl_pct/价格的止损与选股阈值被系统性扭曲。计划文档（`docs/plans/2026-06-16-live-trading-qmt.md:62,68`）明确宣称"复权由 SDK 处理、避免口径不一致"，而代码不传 dividend_type 使该声明为假——属误导性设计声明。
@@ -24,6 +25,7 @@
 - **业界对照**：Qlib 存"原始价 + 复权因子"读取时按需复权；zipline 用独立 adjustments 表。复权因子单调可增量，不回改历史。
 
 #### A2【HIGH，与 A1 同根因互补】qfq 前复权增量同步存在拼接断层 — 回测历史价随每次同步漂移
+- **✅ 状态(2026-06-22)：已修复** — `adj_factor` 锚定上市首日(后复权/原始),同一日期因子永不随同步窗口变化 → 增量追加新行即正确、老行无需重写、可复现。
 - **位置**：`quanti/data/akshare_adapter.py:163,206,326`；`quanti/data/background_sync.py:481`；`quanti/data/database.py:532`
 - **问题**：前复权特性是整段历史相对"最新一天"重算，分红/送转后过去所有 bar 复权价都会变；而增量同步只拉"最新存储日期往后"的新 bar 并 INSERT OR REPLACE。结果老 bar 保留旧基准 qfq、新 bar 用新基准 qfq，每个除权日拼接点价格跳变。
 - **实盘影响**：回测收益率在除权点被人为放大/缩小，且不可复现（取决于上次同步时间）——直接污染回测正确性。
