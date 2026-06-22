@@ -37,7 +37,10 @@ class RiskConfig:
     stop_loss_pct: float = -0.08  # -8% stop loss per stock
     portfolio_stop_loss_pct: float = -0.15  # -15% portfolio drawdown stop
     max_daily_trades: int = 20
-    blocked_prefixes: tuple[str, ...] = ("ST", "*ST")  # Block ST stocks
+    # (ST/*ST filtering is NOT here — it lives in agent/universe.py by stock
+    # NAME. A code-prefix blocklist here was dead config: never read, and ST is
+    # a name prefix not a code prefix, so it couldn't match anyway. Removed to
+    # avoid advertising an inert safety limit — audit G7.)
 
     # --- Exit overlays (see check_exits) ---
     take_profit_activate_pct: float = 0.15
