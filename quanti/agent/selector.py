@@ -41,6 +41,12 @@ from quanti.strategy.loader import StrategyLoader
 
 logger = logging.getLogger(__name__)
 
+# Minimum OOS trades for a walk-forward result to be trusted. Below this, the
+# OOS Sharpe is sampling noise — it neither earns the Sharpe/consistency score
+# components nor gets softmax capital weight (overrideable via goal.params
+# "wf_min_oos_trades"). Real money shouldn't ride a 2-trade Sharpe.
+_MIN_OOS_TRADES = 10
+
 
 @dataclass
 class StrategyEvaluation:
@@ -57,6 +63,7 @@ class StrategyEvaluation:
     oos_sharpe: float = 0.0
     oos_consistency: float = 0.0
     n_folds: int = 0
+    oos_trades: int = 0   # total OOS trades across folds (confidence guard)
 
     def as_dict(self) -> dict:
         return {
@@ -71,6 +78,7 @@ class StrategyEvaluation:
             "oos_sharpe": self.oos_sharpe,
             "oos_consistency": self.oos_consistency,
             "n_folds": self.n_folds,
+            "oos_trades": self.oos_trades,
         }
 
 
@@ -166,6 +174,7 @@ class StrategySelector:
                     ev.oos_sharpe = wf.oos_sharpe
                     ev.oos_consistency = wf.oos_consistency
                     ev.n_folds = len(wf.folds)
+                    ev.oos_trades = wf.total_trades_oos
 
                 ev.score = self._score(ev, goal)
                 results.append(ev)
@@ -212,11 +221,18 @@ class StrategySelector:
         params = goal.params or {}
         wf_enabled = bool(params.get("wf_enabled", True))
 
+        min_trades = int(params.get("wf_min_oos_trades", _MIN_OOS_TRADES))
         top = ranking[:k]
-        sharpes = [
-            max(0.0, ev.oos_sharpe if wf_enabled and ev.n_folds > 0 else ev.sharpe)
-            for ev in top
-        ]
+        # Capital weight rides on Sharpe — but a low-OOS-trade Sharpe is noise,
+        # so zero its weight (it can still be the rank winner on return/dd, just
+        # not get concentrated capital). All-zero → equal-weight fallback below.
+        sharpes = []
+        for ev in top:
+            if wf_enabled and ev.n_folds > 0:
+                s = ev.oos_sharpe if ev.oos_trades >= min_trades else 0.0
+            else:
+                s = ev.sharpe
+            sharpes.append(max(0.0, s))
         total = sum(sharpes)
         if total <= 0:
             # All non-positive: fall back to score rank.
@@ -253,11 +269,18 @@ class StrategySelector:
         if isinstance(tol, str):
             tol = RiskTolerance(tol)
 
+        # Trust the OOS Sharpe/consistency only with enough OOS trades —
+        # otherwise it's sampling noise that mustn't drive selection.
+        min_trades = int((goal.params or {}).get(
+            "wf_min_oos_trades", _MIN_OOS_TRADES))
+        confident = ev.n_folds > 0 and ev.oos_trades >= min_trades
+
         # Pick which numbers feed the score. WF available → use OOS.
         if ev.n_folds > 0:
             ann_return = ev.oos_annual_return
             max_dd = ev.oos_max_drawdown
-            sharpe = ev.oos_sharpe
+            # Don't reward a Sharpe estimated from too few OOS trades.
+            sharpe = ev.oos_sharpe if confident else 0.0
         else:
             ann_return = ev.annual_return
             max_dd = ev.max_drawdown
@@ -286,10 +309,10 @@ class StrategySelector:
         else:
             w_ret, w_dd, w_sharpe = 0.8, 1.0, 0.5
 
-        # Consistency bonus only when WF ran. A strategy that does 10% every
-        # fold is preferred over one that does 30% / -10% / 30% / -10% even
-        # if their mean matches — drawdown timing risk is real money.
-        w_consistency = 0.4 if ev.n_folds > 0 else 0.0
+        # Consistency bonus only with a trustworthy (enough-trades) WF result.
+        # A strategy that does 10% every fold is preferred over one that does
+        # 30% / -10% / 30% / -10% even if their mean matches.
+        w_consistency = 0.4 if confident else 0.0
 
         # `total_trades` is the IS count; a strategy that didn't trade at all
         # in IS but had OOS trades is rare-but-possible (e.g. WF found a

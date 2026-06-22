@@ -12,6 +12,24 @@ import pandas as pd
 _MIN_DAYS_TO_ANNUALIZE = 60
 
 
+def annualized_sharpe(returns, risk_free_rate: float = 0.03,
+                      trading_days: int = 252, min_obs: int = 2) -> float:
+    """Annualized Sharpe from a daily-return series/list.
+
+    Single source of truth so the per-fold backtest and the pooled
+    walk-forward estimate compute Sharpe identically. Uses sample std
+    (ddof=1). Returns 0.0 when there are too few observations or zero
+    variance — callers treat 0 as 'no signal' rather than a real edge."""
+    r = pd.Series(list(returns), dtype=float).dropna()
+    if len(r) < max(2, min_obs):
+        return 0.0
+    sd = r.std(ddof=1)
+    if not sd or sd <= 0:
+        return 0.0
+    excess_daily = r.mean() - risk_free_rate / trading_days
+    return float(excess_daily / sd * np.sqrt(trading_days))
+
+
 def compute_metrics(
     equity_curve: pd.Series,
     risk_free_rate: float = 0.03,
