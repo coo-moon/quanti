@@ -27,9 +27,16 @@ import numpy as np
 import pandas as pd
 
 from quanti.backtest.engine import BacktestEngine
-from quanti.backtest.metrics import compute_metrics
+from quanti.backtest.metrics import annualized_sharpe, compute_metrics
 
 logger = logging.getLogger(__name__)
+
+# Pool OOS daily returns across all folds before estimating Sharpe. A Sharpe
+# from a single ~15-bar fold has a huge standard error; averaging such per-fold
+# Sharpes (the old behavior) just averages noise. Pooling uses every OOS
+# observation for one estimate. Below this many pooled obs, Sharpe is unreliable
+# → reported as 0 ('no signal') and the selector's min-trades guard takes over.
+_MIN_POOLED_OBS = 20
 
 
 @dataclass
@@ -44,6 +51,7 @@ class FoldResult:
     fold: Fold
     metrics: dict  # OOS metrics computed on the test slice only
     n_trades_oos: int
+    oos_returns: list[float] = field(default_factory=list)  # daily OOS returns
 
 
 @dataclass
@@ -151,8 +159,10 @@ def run_walk_forward(
         m = compute_metrics(oos_curve)
         n_trades = sum(1 for t in bt.trades
                        if fold.test_start <= t.date <= fold.test_end)
+        oos_rets = oos_curve.pct_change().dropna().tolist()
         fold_results.append(FoldResult(fold=fold, metrics=m,
-                                       n_trades_oos=n_trades))
+                                       n_trades_oos=n_trades,
+                                       oos_returns=oos_rets))
 
     return _aggregate(fold_results)
 
@@ -162,8 +172,6 @@ def _aggregate(fold_results: list[FoldResult]) -> WalkForwardResult:
         return WalkForwardResult()
     rets = [r.metrics.get("annual_return", 0.0) or 0.0
             for r in fold_results if r.metrics]
-    sharpes = [r.metrics.get("sharpe_ratio", 0.0) or 0.0
-               for r in fold_results if r.metrics]
     dds = [r.metrics.get("max_drawdown", 0.0) or 0.0
            for r in fold_results if r.metrics]
 
@@ -171,20 +179,32 @@ def _aggregate(fold_results: list[FoldResult]) -> WalkForwardResult:
         return WalkForwardResult(folds=fold_results)
 
     mean_ret = float(np.mean(rets))
-    std_ret = float(np.std(rets))
-    # Consistency: 1 - CoV. If mean is near zero (within 1% absolute), CoV
-    # explodes, so fall back to a pure-noise penalty. Clamp final to [-1, 1].
-    if abs(mean_ret) < 0.01:
-        consistency = max(-1.0, -std_ret)
+    # Consistency: 1 - CoV of per-fold returns. Sample std (ddof=1) and require
+    # ≥2 folds — std of a single fold is 0/undefined and would feign perfect
+    # consistency. If mean is near zero (within 1% absolute), CoV explodes, so
+    # fall back to a pure-noise penalty. Clamp final to [-1, 1].
+    if len(rets) >= 2:
+        std_ret = float(np.std(rets, ddof=1))
+        if abs(mean_ret) < 0.01:
+            consistency = max(-1.0, -std_ret)
+        else:
+            consistency = max(-1.0, min(1.0, 1.0 - std_ret / abs(mean_ret)))
     else:
-        cov = std_ret / abs(mean_ret)
-        consistency = max(-1.0, min(1.0, 1.0 - cov))
+        consistency = 0.0  # one fold → no cross-fold stability signal
+
+    # Sharpe from POOLED OOS daily returns (one estimate over every fold's
+    # observations), NOT a mean of noisy per-fold Sharpes.
+    pooled: list[float] = []
+    for r in fold_results:
+        pooled.extend(r.oos_returns)
+    pooled_sharpe = (annualized_sharpe(pooled, min_obs=_MIN_POOLED_OBS)
+                     if len(pooled) >= _MIN_POOLED_OBS else 0.0)
 
     return WalkForwardResult(
         folds=fold_results,
         oos_annual_return=mean_ret,
         oos_max_drawdown=float(min(dds)) if dds else 0.0,
-        oos_sharpe=float(np.mean(sharpes)) if sharpes else 0.0,
+        oos_sharpe=pooled_sharpe,
         oos_consistency=consistency,
         total_trades_oos=sum(r.n_trades_oos for r in fold_results),
     )

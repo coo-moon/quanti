@@ -19,7 +19,10 @@ import pytest
 from quanti.agent.goal import Goal, RiskTolerance
 from quanti.agent.selector import StrategyEvaluation, StrategySelector
 from quanti.agent.walk_forward import (
+    Fold,
+    FoldResult,
     WalkForwardResult,
+    _aggregate,
     make_folds,
     run_walk_forward,
 )
@@ -190,7 +193,7 @@ class TestSelectorWFScoring:
             annual_return=0.20, max_drawdown=-0.10, sharpe=1.5, total_trades=30,
             score=0.0,
             oos_annual_return=0.20, oos_max_drawdown=-0.10, oos_sharpe=1.5,
-            oos_consistency=0.5, n_folds=3,
+            oos_consistency=0.5, n_folds=3, oos_trades=30,  # enough to trust OOS
         )
         s_no_wf = StrategySelector._score(ev_no_wf, goal)
         s_with_wf = StrategySelector._score(ev_with_wf, goal)
@@ -198,6 +201,46 @@ class TestSelectorWFScoring:
         assert s_with_wf > s_no_wf
         # But not by a huge amount — same return/dd/sharpe inputs.
         assert s_with_wf - s_no_wf == pytest.approx(0.4 * 0.5, abs=1e-6)
+
+    def test_pooled_sharpe_and_consistency(self):
+        """oos_sharpe is computed from POOLED OOS returns across folds, and
+        consistency uses sample std with a ≥2-fold guard (audit E1/E5)."""
+        f = Fold(date(2024, 1, 1), date(2024, 2, 1), date(2024, 3, 1))
+        steady = [0.01] * 15  # steady positive daily returns
+        r1 = FoldResult(fold=f, metrics={"annual_return": 0.1, "max_drawdown": -0.02},
+                        n_trades_oos=6, oos_returns=steady)
+        r2 = FoldResult(fold=f, metrics={"annual_return": 0.1, "max_drawdown": -0.03},
+                        n_trades_oos=6, oos_returns=steady)
+        agg = _aggregate([r1, r2])
+        assert agg.oos_sharpe > 0          # 30 pooled obs, steady → real Sharpe
+        assert agg.oos_consistency == pytest.approx(1.0)  # equal fold returns
+        assert agg.total_trades_oos == 12
+
+    def test_thin_pool_sharpe_is_zero_and_single_fold_no_consistency(self):
+        """Too few pooled obs → Sharpe unreliable → 0; a lone fold gives no
+        cross-fold consistency signal → 0 (not a fake 1.0)."""
+        f = Fold(date(2024, 1, 1), date(2024, 2, 1), date(2024, 3, 1))
+        r = FoldResult(fold=f, metrics={"annual_return": 0.5, "max_drawdown": -0.01},
+                       n_trades_oos=2, oos_returns=[0.05, 0.05, 0.05])
+        agg = _aggregate([r])
+        assert agg.oos_sharpe == 0.0
+        assert agg.oos_consistency == 0.0
+
+    def test_score_ignores_oos_sharpe_below_min_trades(self):
+        """A WF result with too few OOS trades must not earn the Sharpe or
+        consistency score components — its Sharpe is sampling noise (E1)."""
+        goal = Goal(target_annual_return=0.20, max_drawdown=-0.20,
+                    risk_tolerance=RiskTolerance.MEDIUM)
+        base = dict(strategy_name="x", annual_return=0.2, max_drawdown=-0.1,
+                    sharpe=0.0, total_trades=30, score=0.0,
+                    oos_annual_return=0.2, oos_max_drawdown=-0.1,
+                    oos_sharpe=2.0, oos_consistency=0.8, n_folds=3)
+        thin = StrategyEvaluation(**base, oos_trades=3)    # below min → ignored
+        rich = StrategyEvaluation(**base, oos_trades=50)   # trusted
+        s_thin = StrategySelector._score(thin, goal)
+        s_rich = StrategySelector._score(rich, goal)
+        # MEDIUM: w_sharpe=0.5, w_consistency=0.4 → gap = 0.5*2.0 + 0.4*0.8.
+        assert s_rich - s_thin == pytest.approx(0.5 * 2.0 + 0.4 * 0.8, abs=1e-6)
 
     def test_evaluate_respects_wf_disabled(self, seeded_long):
         """When goal.params['wf_enabled']=False, no WF columns are populated."""
