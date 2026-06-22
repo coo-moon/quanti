@@ -16,10 +16,30 @@ from quanti.data.provider import DataProvider
 from quanti.models import BarData, Direction
 from quanti.utils.market import (
     board_limit_pct,
+    max_fill_shares,
     prev_bar_close,
     tradable_at_close,
     tradable_at_open,
 )
+
+
+class TestMaxFillShares:
+    """Single-bar capacity cap by turnover (成交额 元), A3-unit-safe (audit B1)."""
+
+    def test_caps_at_participation_of_turnover(self):
+        # 25% of 100k 元 = 25k; at price 10 → 25 lots = 2500 shares.
+        assert max_fill_shares(100_000.0, 10.0) == 2500
+
+    def test_custom_participation(self):
+        assert max_fill_shares(100_000.0, 10.0, participation=0.10) == 1000
+
+    def test_lot_rounded_down(self):
+        # 25% of 130k = 32.5k / (10*100) = 32.5 lots → floor 32 → 3200.
+        assert max_fill_shares(130_000.0, 10.0) == 3200
+
+    def test_none_when_no_turnover(self):
+        assert max_fill_shares(0.0, 10.0) is None
+        assert max_fill_shares(100_000.0, 0.0) is None
 
 
 def _bar(code: str, open_: float, close: float = 0.0) -> BarData:
