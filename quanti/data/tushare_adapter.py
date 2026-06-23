@@ -218,3 +218,50 @@ class TushareAdapter:
         logger.info("%s: %d bars [%s~%s] via tushare", code, saved,
                     df["date"].min(), df["date"].max())
         return saved
+
+    def sync_daily_quotes_by_date(self, trade_date: date) -> int:
+        """Pull the WHOLE market for ONE trading day in a few calls — the
+        efficient path for bulk backfill (~3 calls/day vs ~2/stock). Returns
+        rows saved. Delisted names appear in pro.daily for dates they traded.
+
+        Uses tushare's NATIVE adj_factor (listing-anchored), which equals the
+        per-stock path's hfq/raw ratio, so the two paths agree. turnover is
+        filled from daily_basic.turnover_rate when that endpoint is available."""
+        pro = self._ensure_pro()
+        td = trade_date.strftime("%Y%m%d")
+        raw = self._retry(pro.daily, trade_date=td)
+        if raw is None or raw.empty:
+            return 0
+        fac = self._retry(pro.adj_factor, trade_date=td)
+        fac_by_code = ({str(r["ts_code"]): float(r["adj_factor"])
+                        for _, r in fac.iterrows()} if fac is not None
+                       and not fac.empty else {})
+        # turnover_rate is on daily_basic (point-tier gated) — degrade to 0 if
+        # unavailable rather than failing the whole backfill.
+        turn_by_code: dict[str, float] = {}
+        try:
+            basic = self._retry(pro.daily_basic, trade_date=td,
+                                fields="ts_code,turnover_rate")
+            if basic is not None and not basic.empty:
+                turn_by_code = {str(r["ts_code"]): float(r["turnover_rate"] or 0)
+                                for _, r in basic.iterrows()}
+        except Exception as e:  # noqa: BLE001
+            logger.debug("daily_basic unavailable for %s: %s", td, e)
+
+        rows = []
+        for _, r in raw.iterrows():
+            ts_code = str(r["ts_code"])
+            code, _ex = self._ts_code_to_code(ts_code)
+            # # VERIFY: tushare native adj_factor satisfies raw×factor = hfq
+            # (provider._apply_adjust does raw×factor). Default 1.0 if missing.
+            rows.append({
+                "code": code, "date": trade_date,
+                "open": float(r["open"]), "high": float(r["high"]),
+                "low": float(r["low"]), "close": float(r["close"]),
+                "volume": float(r["vol"]) * TS_VOL_TO_SHARES,
+                "amount": float(r["amount"]) * TS_AMOUNT_TO_YUAN,
+                "turnover": turn_by_code.get(ts_code, 0.0),
+                "adj_factor": fac_by_code.get(ts_code, 1.0),
+                "source": "tushare",
+            })
+        return self._db.save_daily_quotes(pd.DataFrame(rows))

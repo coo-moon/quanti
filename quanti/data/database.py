@@ -357,6 +357,12 @@ class Database:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS backfill_progress (
+                trade_date TEXT PRIMARY KEY,
+                rows INTEGER NOT NULL DEFAULT 0,
+                done_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS agent_goal (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 target_annual_return REAL NOT NULL,
@@ -1159,6 +1165,22 @@ class Database:
              "market_value": r[2], "total_value": r[3]}
             for r in rows
         ]
+
+    # --- Backfill progress (resumable bulk history pull) ---
+
+    def mark_backfill_done(self, trade_date: date, rows: int) -> None:
+        from datetime import datetime
+        self.conn.execute(
+            "INSERT OR REPLACE INTO backfill_progress (trade_date, rows, done_at) "
+            "VALUES (?, ?, ?)",
+            (trade_date.isoformat(), int(rows), datetime.now().isoformat()),
+        )
+        self.conn.commit()
+
+    def get_backfilled_dates(self) -> set[str]:
+        """ISO date strings already backfilled — `run_backfill --resume` skips them."""
+        return {r[0] for r in self.conn.execute(
+            "SELECT trade_date FROM backfill_progress").fetchall()}
 
     # --- App config (data source + credential) ---
 
