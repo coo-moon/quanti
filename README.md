@@ -270,7 +270,7 @@ quanti sync --backfill --years 5
 quanti backtest --strategy my_strat --start 2021-01-01 --end 2022-12-31 --survivorship-free
 ```
 
-> **批量回填与财务同步**:`quanti sync --backfill [--years N]`(默认 5 年)按交易日逐日全市场回填(`quanti/data/backfill.py` `run_backfill`),每个交易日约 3 次调用(`pro.daily + pro.adj_factor + pro.daily_basic`),断点续传(`backfill_progress` 表记录已完成交易日,重跑时自动跳过已完成日)、按 `calls_per_min` 限速、含退市股、需 Tushare token 且**不静默回退 akshare**——比 per-stock 串行的 `--tushare-quotes --delisted-only` 明显更快。另有 `quanti sync --financials` 按 `ann_date` 拉取 PIT 安全的财务指标(ROE/同比)入 `financials` 表。
+> **批量回填与财务同步**:`quanti sync --backfill [--years N]`(默认 5 年)按交易日逐日全市场回填(`quanti/data/backfill.py` `run_backfill`),每个交易日约 2 次调用(`pro.daily + pro.daily_basic`)。**复权因子不再调 `adj_factor` 接口**(低积分档限 1 次/分钟,是回填瓶颈),改由 `pro.daily` 自带的 `pre_close` 重建(`tushare_adapter.reconstruct_adj_factor`:`f[t]=f[t-1]·close[t-1]/pre_close[t]`,增量同步用上一根已存 bar 续接、接缝无跳变),只用限额宽松的 `daily`(500 次/分钟)。断点续传(`backfill_progress` 表记录已完成交易日,重跑自动跳过)、按 `calls_per_min` 限速、含退市股、需 Tushare token 且**不静默回退 akshare**——比 per-stock 串行的 `--tushare-quotes --delisted-only` 明显更快。后台同步守护对 tushare 改走**逐日 top-up**(整市场一天 ≈2 次调用,而非逐股两次×数千只),避免触发频率限制。另有 `quanti sync --financials` 按 `ann_date` 拉取 PIT 安全的财务指标(ROE/同比)入 `financials` 表。
 
 手动同步通常不需要：服务启动后**后台同步守护**（`BackgroundQuoteSyncer`）会持续维护数据新鲜度——
 

@@ -1,10 +1,16 @@
 """Bulk multi-year history backfill, by trading date — efficient + resumable.
 
-Per-stock pulls cost ~2 calls/stock; the WHOLE market for one day is ~3 calls
-(pro.daily + pro.adj_factor + pro.daily_basic). So a 5-year full-market backfill
-is ~3,750 calls (≈1,250 trading days × 3) instead of ~11,000 per-stock — and it
-is naturally batched, resumable (backfill_progress checkpoint), and throttled to
-the free-tier per-minute cap.
+Per-stock pulls cost ~2 calls/stock; the WHOLE market for one day is ~2 calls
+(pro.daily + pro.daily_basic). adj_factor is reconstructed from `daily`'s
+pre_close (see tushare_adapter.reconstruct_adj_factor), so the rate-limited
+adj_factor endpoint (as low as 1/min) is NEVER called — `daily` is 500/min. A
+5-year full-market backfill is thus ~2,500 calls (≈1,250 trading days × 2)
+against the generous `daily` cap, naturally batched, resumable
+(backfill_progress checkpoint), and throttled to the per-minute cap.
+
+A caller-owned `seed_state` dict carries each stock's (raw_close, factor) from
+day to day so the cumulative adj_factor splices forward without re-reading the
+DB per stock per day.
 """
 
 from __future__ import annotations
@@ -60,21 +66,24 @@ def run_backfill(db, *, years: int = 5, end: date | None = None,
     dates = _trade_dates(db, start, end)
     done = db.get_backfilled_dates() if resume else set()
     res = BackfillResult()
-    # ~3 calls per date → seconds/date to honor the per-minute cap.
-    min_interval = (3.0 / calls_per_min) * 60.0 if calls_per_min > 0 else 0.0
+    # ~2 calls per date (daily + daily_basic) → seconds/date for the per-min cap.
+    min_interval = (2.0 / calls_per_min) * 60.0 if calls_per_min > 0 else 0.0
+    # Carried across days so adj_factor reconstruction never re-reads the DB.
+    seed_state: dict = {}
 
     for i, d in enumerate(dates):
         if d.isoformat() in done:
             res.dates_skipped += 1
             continue
         try:
-            n = adapter.sync_daily_quotes_by_date(d)
+            n = adapter.sync_daily_quotes_by_date(d, seed_state=seed_state)
             db.mark_backfill_done(d, n)
             res.dates_done += 1
             res.rows += n
         except Exception as e:  # noqa: BLE001 - log + continue (resumable)
             logger.warning("backfill %s failed: %s", d, e)
             res.errors.append(f"{d}: {e}")
+            seed_state.clear()  # re-seed from persisted DB after a gap
         if on_progress:
             on_progress(i + 1, len(dates), d, res)
         if min_interval:

@@ -28,7 +28,7 @@ class _FakeAdapter:
     def sync_stock_list(self) -> int:
         return 0
 
-    def sync_daily_quotes_by_date(self, d: date) -> int:
+    def sync_daily_quotes_by_date(self, d: date, seed_state=None) -> int:
         self.seen.append(d)
         if d == date(2024, 1, 3):
             raise RuntimeError("boom")   # one transient failure
@@ -67,5 +67,5 @@ def test_backfill_throttles(db, fake_adapter):
     slept: list[float] = []
     run_backfill(db, years=1, end=date(2024, 1, 4), source="tushare",
                  calls_per_min=600, sleep_fn=slept.append)
-    # ~3 calls/date at 600/min → 0.3s/date; called once per processed date.
-    assert slept and all(s == pytest.approx(0.3) for s in slept)
+    # ~2 calls/date (daily + daily_basic; no adj_factor) at 600/min → 0.2s/date.
+    assert slept and all(s == pytest.approx(0.2) for s in slept)

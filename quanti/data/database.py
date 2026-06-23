@@ -778,6 +778,23 @@ class Database:
         row = self.conn.execute("SELECT MAX(date) FROM daily_quotes").fetchone()
         return self._safe_quote_date(row[0]) if row else None
 
+    def get_latest_quote_before(self, code: str, d: date
+                                ) -> tuple[float, float] | None:
+        """(raw close, adj_factor) of `code`'s newest bar strictly before `d`,
+        or None if there is none. Seeds incremental adj-factor reconstruction so
+        an appended batch splices onto the stored series without a jump."""
+        row = self.conn.execute(
+            "SELECT close, adj_factor FROM daily_quotes "
+            "WHERE code=? AND date<? ORDER BY date DESC LIMIT 1",
+            (code, d.isoformat()),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        try:
+            return float(row[0]), float(row[1] if row[1] is not None else 1.0)
+        except (ValueError, TypeError):
+            return None
+
     def get_high_water(self, code: str, since: date) -> float | None:
         """Highest intraday high for `code` on/after `since` (the post-entry
         peak, for trailing take-profit). None if no bars in range."""
