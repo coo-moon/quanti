@@ -36,6 +36,12 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds; free tier rate-limits per-minute call counts
+# Canonical DB units: volume = 股 (shares), amount = 元 (yuan). Tushare returns
+# vol in 手 (lots) and amount in 千元 (thousand-yuan), so convert at the edge.
+# # VERIFY against a real token: confirm vol=手 / amount=千元 on a known stock
+# (e.g. close*vol*100 ≈ amount*1000) before trusting ADV/volume factors.
+TS_VOL_TO_SHARES = 100
+TS_AMOUNT_TO_YUAN = 1000
 
 
 class TushareAdapter:
@@ -147,6 +153,22 @@ class TushareAdapter:
                     logger.warning("save %s failed: %s", code, e)
         return count
 
+    def sync_trade_calendar(self, year: int | None = None) -> int:
+        """Fetch SSE open trading days from tushare and save. Mirrors
+        AkShareAdapter.sync_trade_calendar so the default source can own the
+        calendar too."""
+        pro = self._ensure_pro()
+        df = self._retry(pro.trade_cal, exchange="SSE", is_open="1")
+        if df is None or df.empty:
+            return 0
+        dates = []
+        for v in df["cal_date"]:
+            d = self._parse_ts_date(v)
+            if d is not None and (year is None or d.year == year):
+                dates.append(d)
+        self._db.save_trade_calendar(dates)
+        return len(dates)
+
     def sync_daily_quotes(self, code: str, start: date | None = None,
                           end: date | None = None,
                           repair_gaps: bool = True) -> int:
@@ -178,9 +200,11 @@ class TushareAdapter:
             "high": raw["high"].astype(float),
             "low": raw["low"].astype(float),
             "close": raw["close"].astype(float),
-            "volume": raw["vol"].astype(float),
-            "amount": raw["amount"].astype(float),
-            "turnover": 0.0,
+            # Normalize to canonical units (股 / 元) — see TS_* constants.
+            "volume": raw["vol"].astype(float) * TS_VOL_TO_SHARES,
+            "amount": raw["amount"].astype(float) * TS_AMOUNT_TO_YUAN,
+            "turnover": 0.0,  # filled from daily_basic.turnover_rate in P3/P4
+            "source": "tushare",
         })
         # adj_factor = hfq_close / raw_close, from a second back-adjusted pull
         # (hfq is anchored to listing → window-independent → incremental-safe).

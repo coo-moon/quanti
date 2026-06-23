@@ -34,6 +34,9 @@ class FakePro:
             ])
         return pd.DataFrame(columns=["ts_code", "name", "list_date", "delist_date"])
 
+    def trade_cal(self, exchange, is_open):
+        return pd.DataFrame([{"cal_date": "20240102"}, {"cal_date": "20240103"}])
+
 
 def _fake_pro_bar(ts_code, asset, adj, start_date, end_date):
     # tushare returns newest-first; columns trade_date/open/high/low/close/vol/amount
@@ -52,6 +55,25 @@ def test_code_ts_code_mapping():
     assert TushareAdapter._ts_code_to_code("600519.SH") == ("600519", "SH")
     assert TushareAdapter._ts_code_to_code("000001.SZ") == ("000001", "SZ")
     assert TushareAdapter._ts_code_to_code("830799.BJ") == ("830799", "BJ")
+
+
+def test_units_normalized_and_source_tagged(db):
+    """vol(手)→股 ×100, amount(千元)→元 ×1000, and source='tushare' (P2)."""
+    db.upsert_stock("600001", "x", "SH", date(1998, 1, 22), "")
+    adapter = TushareAdapter(db, pro=FakePro(), pro_bar=_fake_pro_bar)
+    adapter.sync_daily_quotes("600001", start=date(2010, 1, 1), end=date(2010, 1, 31))
+    out = db.get_daily_quotes("600001", date(2010, 1, 1), date(2010, 1, 31))
+    row = out[out["date"] == date(2010, 1, 19)].iloc[0]
+    assert row["volume"] == 1200.0 * 100        # 手 → 股
+    assert row["amount"] == 3_600_000.0 * 1000   # 千元 → 元
+    assert db.get_quote_source("600001") == "tushare"
+
+
+def test_sync_trade_calendar(db):
+    adapter = TushareAdapter(db, pro=FakePro())
+    n = adapter.sync_trade_calendar()
+    assert n == 2
+    assert db.is_trade_date(date(2024, 1, 2)) is True
 
 
 def test_sync_stock_list_includes_delisted(db):

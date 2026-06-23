@@ -81,10 +81,13 @@ class XtdataAdapter:
             "date": date.fromisoformat(b["date"]),
             "open": float(b["open"]), "high": float(b["high"]),
             "low": float(b["low"]), "close": float(b["close"]),
+            # Units assumed canonical (股 / 元) per the bridge contract;
+            # # VERIFY xtdata volume unit (股 vs 手) on the QMT box.
             "volume": float(b.get("volume", 0) or 0),
             "amount": float(b.get("amount", 0) or 0),
             "turnover": float(b.get("turnover", 0) or 0),
             "adj_factor": float(b.get("adj_factor", 1.0) or 1.0),
+            "source": "xtdata",
         } for b in bars])
         saved = self._db.save_daily_quotes(df)
         logger.info("%s: %d bars [%s~%s] via xtdata", code, saved,
