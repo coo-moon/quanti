@@ -207,6 +207,9 @@ class TestAkShareAdapter:
         assert by_date["2024-01-02"][0] == 10.0                     # RAW stored
         assert by_date["2024-01-02"][1] == pytest.approx(11.0 / 10.0)
         assert by_date["2024-01-03"][1] == pytest.approx(11.0 / 9.0)
+        # P2: East Money 成交量(手)→股 ×100, and source tagged.
+        assert res.iloc[0]["volume"] == 1e4 * 100
+        assert db.get_quote_source("000001") == "akshare"
 
     @patch("quanti.data.akshare_adapter.ak")
     def test_fetch_daily_quotes(self, mock_ak, db):

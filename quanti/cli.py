@@ -35,10 +35,13 @@ def cmd_sync(args):
     refetch_start = date(2010, 1, 1) if getattr(args, "refetch", False) else None
 
     if args.calendar:
-        # Calendar currently only from akshare; tushare trade_cal lands in P2.4.
-        from quanti.data.akshare_adapter import AkShareAdapter
         logger.info("Syncing trade calendar...")
-        count = AkShareAdapter(db).sync_trade_calendar()
+        cal_adapter = make_quote_adapter(db, source)
+        if not hasattr(cal_adapter, "sync_trade_calendar"):
+            # xtdata has no calendar API — fall back to akshare for the calendar.
+            from quanti.data.akshare_adapter import AkShareAdapter
+            cal_adapter = AkShareAdapter(db)
+        count = cal_adapter.sync_trade_calendar()
         logger.info(f"Synced {count} trade dates")
 
     if args.stocks:

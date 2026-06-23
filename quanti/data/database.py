@@ -187,6 +187,10 @@ class Database:
             # capped at quantity - frozen so a same-day add-on can't be sold.
             ("positions", "frozen_qty", "REAL DEFAULT 0"),
             ("positions", "frozen_date", "TEXT"),
+            # Which vendor wrote a bar (akshare|tushare|xtdata). Prevents
+            # cross-vendor splices within one code (different units/adjustment
+            # conventions). Legacy rows are '' (unknown).
+            ("daily_quotes", "source", "TEXT DEFAULT ''"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -235,6 +239,7 @@ class Database:
                 amount REAL NOT NULL,
                 turnover REAL DEFAULT 0,
                 adj_factor REAL NOT NULL DEFAULT 1.0,
+                source TEXT DEFAULT '',
                 PRIMARY KEY (code, date)
             );
 
@@ -551,19 +556,31 @@ class Database:
                     float(row["amount"]),
                     float(row.get("turnover", 0)),
                     f,
+                    str(row.get("source", "") or ""),
                 )
             )
         self.conn.executemany(
             """
             INSERT OR REPLACE INTO daily_quotes
                 (code, date, open, high, low, close, volume, amount, turnover,
-                 adj_factor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 adj_factor, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             records,
         )
         self.conn.commit()
         return len(records)
+
+    def get_quote_source(self, code: str) -> str | None:
+        """The vendor that wrote `code`'s bars (akshare|tushare|xtdata), or None
+        if the code has no tagged bars (legacy '' rows count as untagged). Lets
+        the sync driver keep one source per code and avoid cross-vendor splices."""
+        row = self.conn.execute(
+            "SELECT source FROM daily_quotes "
+            "WHERE code=? AND source IS NOT NULL AND source!='' LIMIT 1",
+            (code,),
+        ).fetchone()
+        return row[0] if row else None
 
     def get_daily_quotes(
         self, code: str, start: date, end: date

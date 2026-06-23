@@ -18,6 +18,10 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
 # A-share max consecutive non-trading days (Spring Festival ~11, National Day ~9)
 MAX_HOLIDAY_GAP = 15
+# Canonical DB units: volume = 股, amount = 元. East Money 成交量 is 手 (lots);
+# Sina volume is already 股 — normalizing EM fixes a latent EM-vs-Sina mismatch
+# (same code, 100× different volume depending on which source filled the bar).
+EM_VOL_TO_SHARES = 100
 
 
 def _code_to_sina_symbol(code: str) -> str:
@@ -211,9 +215,10 @@ class AkShareAdapter:
                 "high": raw["最高"].astype(float),
                 "low": raw["最低"].astype(float),
                 "close": raw["收盘"].astype(float),
-                "volume": raw["成交量"].astype(float),
-                "amount": raw["成交额"].astype(float),
+                "volume": raw["成交量"].astype(float) * EM_VOL_TO_SHARES,  # 手→股
+                "amount": raw["成交额"].astype(float),  # already 元
                 "turnover": raw["换手率"].astype(float) if "换手率" in raw.columns else 0,
+                "source": "akshare",
             }
         )
         hfq = self._em_hist(code, start, end, adjust="hfq")  # for the factor
@@ -261,9 +266,10 @@ class AkShareAdapter:
                 "high": raw["high"].astype(float),
                 "low": raw["low"].astype(float),
                 "close": raw["close"].astype(float),
-                "volume": raw["volume"].astype(float),
+                "volume": raw["volume"].astype(float),  # Sina already 股
                 "amount": raw["amount"].astype(float) if "amount" in raw.columns else 0,
                 "turnover": raw["turnover"].astype(float) if "turnover" in raw.columns else 0,
+                "source": "akshare",
             },
         )
         hfq = self._sina_daily_chunked(symbol, start, end, adjust="hfq")  # for factor
