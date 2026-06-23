@@ -236,17 +236,22 @@ class TushareAdapter:
         fac_by_code = ({str(r["ts_code"]): float(r["adj_factor"])
                         for _, r in fac.iterrows()} if fac is not None
                        and not fac.empty else {})
-        # turnover_rate is on daily_basic (point-tier gated) — degrade to 0 if
-        # unavailable rather than failing the whole backfill.
+        # daily_basic (point-tier gated) feeds BOTH the daily_basic table (P4
+        # valuation factors) and the quotes' turnover — one call, not two.
+        # Degrade gracefully (turnover 0, no valuation) if it's unavailable.
         turn_by_code: dict[str, float] = {}
+        basic = None
         try:
-            basic = self._retry(pro.daily_basic, trade_date=td,
-                                fields="ts_code,turnover_rate")
-            if basic is not None and not basic.empty:
-                turn_by_code = {str(r["ts_code"]): float(r["turnover_rate"] or 0)
-                                for _, r in basic.iterrows()}
+            basic = self._retry(
+                pro.daily_basic, trade_date=td,
+                fields=("ts_code,turnover_rate,pe,pe_ttm,pb,ps,ps_ttm,"
+                        "dv_ratio,total_mv,circ_mv"))
         except Exception as e:  # noqa: BLE001
             logger.debug("daily_basic unavailable for %s: %s", td, e)
+        if basic is not None and not basic.empty:
+            turn_by_code = {str(r["ts_code"]): float(r["turnover_rate"] or 0)
+                            for _, r in basic.iterrows()}
+            self._save_daily_basic_frame(basic, trade_date)
 
         rows = []
         for _, r in raw.iterrows():
@@ -265,3 +270,50 @@ class TushareAdapter:
                 "source": "tushare",
             })
         return self._db.save_daily_quotes(pd.DataFrame(rows))
+
+    def _save_daily_basic_frame(self, basic, trade_date: date) -> int:
+        """Map a tushare daily_basic frame → daily_basic table (P4 valuation)."""
+        rows = []
+        for _, r in basic.iterrows():
+            code, _ex = self._ts_code_to_code(str(r["ts_code"]))
+            rows.append({
+                "code": code, "date": trade_date,
+                "pe": r.get("pe"), "pe_ttm": r.get("pe_ttm"),
+                "pb": r.get("pb"), "ps": r.get("ps"), "ps_ttm": r.get("ps_ttm"),
+                "total_mv": r.get("total_mv"), "circ_mv": r.get("circ_mv"),
+                "dv_ratio": r.get("dv_ratio"),
+                "turnover_rate": r.get("turnover_rate"),
+            })
+        return self._db.save_daily_basic(pd.DataFrame(rows))
+
+    def sync_financials(self, code: str) -> int:
+        """Per-code financial indicators (ROE + YoY growth) keyed by report
+        period, carrying ann_date for point-in-time alignment. Higher tushare
+        point-tier; degrades to 0 rows (logged) if the endpoint is unavailable."""
+        pro = self._ensure_pro()
+        ts_code = self._code_to_ts_code(code)
+        try:
+            df = self._retry(
+                pro.fina_indicator, ts_code=ts_code,
+                fields="ts_code,ann_date,end_date,roe,netprofit_yoy,or_yoy")
+        except Exception as e:  # noqa: BLE001 - point-tier / availability
+            logger.info("fina_indicator unavailable for %s: %s", code, e)
+            return 0
+        if df is None or df.empty:
+            return 0
+        rows = []
+        for _, r in df.iterrows():
+            ann = self._parse_ts_date(r.get("ann_date"))
+            end = self._parse_ts_date(r.get("end_date"))
+            if ann is None or end is None:
+                continue  # ann_date is the PIT key — skip rows without it
+            rows.append({
+                "code": code, "end_date": end.isoformat(),
+                "ann_date": ann.isoformat(), "report_type": "",
+                "roe": r.get("roe"), "net_profit": None, "revenue": None,
+                "netprofit_yoy": r.get("netprofit_yoy"),
+                "revenue_yoy": r.get("or_yoy"),
+            })
+        if not rows:
+            return 0
+        return self._db.save_financials(pd.DataFrame(rows))

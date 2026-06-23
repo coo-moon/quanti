@@ -281,10 +281,35 @@ class Database:
                 PRIMARY KEY (code, as_of)
             );
 
+            -- Daily valuation snapshot (tushare daily_basic). Point-in-time by
+            -- construction: the row for `date` is known after that close.
+            CREATE TABLE IF NOT EXISTS {m}daily_basic (
+                code TEXT NOT NULL,
+                date TEXT NOT NULL,
+                pe REAL, pe_ttm REAL, pb REAL, ps REAL, ps_ttm REAL,
+                total_mv REAL, circ_mv REAL, dv_ratio REAL, turnover_rate REAL,
+                PRIMARY KEY (code, date)
+            );
+
+            -- Financial statements keyed by report period (end_date) WITH the
+            -- announcement date (ann_date) — the ONLY date safe to key
+            -- point-in-time on (a report is invisible until announced).
+            CREATE TABLE IF NOT EXISTS {m}financials (
+                code TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                ann_date TEXT NOT NULL,
+                report_type TEXT DEFAULT '',
+                roe REAL, net_profit REAL, revenue REAL,
+                netprofit_yoy REAL, revenue_yoy REAL,
+                PRIMARY KEY (code, end_date, report_type)
+            );
+
             CREATE INDEX IF NOT EXISTS {m}idx_daily_quotes_code
                 ON daily_quotes(code);
             CREATE INDEX IF NOT EXISTS {m}idx_daily_quotes_date
                 ON daily_quotes(date);
+            CREATE INDEX IF NOT EXISTS {m}idx_financials_ann
+                ON financials(code, ann_date);
             """
         )
         # Trading state → always the main (account) DB.
@@ -587,6 +612,88 @@ class Database:
             (code,),
         ).fetchone()
         return row[0] if row else None
+
+    # --- Fundamentals (daily_basic + financials, point-in-time) ---
+    _DAILY_BASIC_COLS = ("pe", "pe_ttm", "pb", "ps", "ps_ttm",
+                         "total_mv", "circ_mv", "dv_ratio", "turnover_rate")
+    _FIN_COLS = ("roe", "net_profit", "revenue", "netprofit_yoy", "revenue_yoy")
+
+    def save_daily_basic(self, df: pd.DataFrame) -> int:
+        """Save per-(code,date) valuation rows. Missing columns → NULL."""
+        cols = ("code", "date", *self._DAILY_BASIC_COLS)
+        recs = []
+        for _, r in df.iterrows():
+            d = r["date"]
+            ds = d.isoformat() if isinstance(d, date) else str(d)
+            recs.append((r["code"], ds,
+                         *[(None if r.get(c) is None else float(r.get(c)))
+                           for c in self._DAILY_BASIC_COLS]))
+        ph = ", ".join("?" * len(cols))
+        self.conn.executemany(
+            f"INSERT OR REPLACE INTO daily_basic ({', '.join(cols)}) VALUES ({ph})",
+            recs)
+        self.conn.commit()
+        return len(recs)
+
+    def get_daily_basic(self, code: str, start: date, end: date) -> pd.DataFrame:
+        with self._db_lock:
+            df = pd.read_sql_query(
+                f"SELECT code, date, {', '.join(self._DAILY_BASIC_COLS)} "
+                "FROM daily_basic WHERE code=? AND date>=? AND date<=? ORDER BY date",
+                self._raw_conn,
+                params=(code, start.isoformat(), end.isoformat()))
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df
+
+    @staticmethod
+    def _iso_date(v) -> str:
+        """Normalize a date-ish value to ISO 'YYYY-MM-DD'. Accepts ISO strings,
+        tushare 'YYYYMMDD', or date objects — so ann_date/end_date compare
+        correctly against `as_of.isoformat()` in get_financials_asof."""
+        if isinstance(v, date):
+            return v.isoformat()
+        s = str(v)
+        if len(s) == 8 and s.isdigit():
+            return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+        return s
+
+    def save_financials(self, df: pd.DataFrame) -> int:
+        cols = ("code", "end_date", "ann_date", "report_type", *self._FIN_COLS)
+        recs = []
+        for _, r in df.iterrows():
+            recs.append((
+                r["code"], self._iso_date(r["end_date"]),
+                self._iso_date(r["ann_date"]),
+                str(r.get("report_type", "") or ""),
+                *[(None if r.get(c) is None else float(r.get(c)))
+                  for c in self._FIN_COLS]))
+        ph = ", ".join("?" * len(cols))
+        self.conn.executemany(
+            f"INSERT OR REPLACE INTO financials ({', '.join(cols)}) VALUES ({ph})",
+            recs)
+        self.conn.commit()
+        return len(recs)
+
+    def has_fundamentals(self) -> bool:
+        """True if any daily_basic or financials rows exist — lets the factor
+        panel skip the per-code fundamental merge entirely when there's none."""
+        for tbl in ("daily_basic", "financials"):
+            if self.conn.execute(f"SELECT 1 FROM {tbl} LIMIT 1").fetchone():
+                return True
+        return False
+
+    def get_financials_asof(self, code: str, as_of: date) -> pd.DataFrame:
+        """Reports ANNOUNCED on/before `as_of`, ordered by ann_date — the only
+        point-in-time-safe view (a report is invisible until its ann_date)."""
+        with self._db_lock:
+            df = pd.read_sql_query(
+                f"SELECT code, end_date, ann_date, {', '.join(self._FIN_COLS)} "
+                "FROM financials WHERE code=? AND ann_date<=? ORDER BY ann_date",
+                self._raw_conn, params=(code, as_of.isoformat()))
+        if not df.empty:
+            df["ann_date"] = pd.to_datetime(df["ann_date"]).dt.date
+        return df
 
     def get_daily_quotes(
         self, code: str, start: date, end: date

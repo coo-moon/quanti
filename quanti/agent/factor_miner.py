@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 _SYSTEM = (
     "You are a quant researcher proposing cross-sectional alpha factors for "
     "A-share daily bars, expressed in a tiny DSL.\n"
-    "Allowed data: close, open, high, low, volume, turnover.\n"
+    "Allowed data: close, open, high, low, volume, turnover; and fundamentals "
+    "(point-in-time): pe, pe_ttm, pb, ps, ps_ttm, total_mv, circ_mv, dv_ratio, "
+    "roe, netprofit_yoy, revenue_yoy.\n"
     "Allowed functions: Ref(x, n) lag n bars; Mean(x, n); Std(x, n); Sum(x, n); "
     "Max(x, n); Min(x, n); Log(x). Operators: + - * / and unary minus. "
     "Integer windows only. No ** and no other names/functions.\n"

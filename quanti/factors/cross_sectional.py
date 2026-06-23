@@ -45,6 +45,36 @@ from quanti.factors.library import FACTOR_EXPRS, as_factor_fn
 logger = logging.getLogger(__name__)
 
 
+def _merge_fundamentals(bars_df: pd.DataFrame, provider: "DataProvider",
+                        code: str, start: date, as_of: date) -> pd.DataFrame:
+    """Merge point-in-time fundamentals onto a code's bars so factors can read
+    pe/pb/roe/... as columns. daily_basic joins on (date) — same-day is PIT by
+    construction. financials join via merge_asof on ann_date ≤ bar.date — a
+    factor at date t only ever sees reports ANNOUNCED on/before t (no
+    look-ahead). Best-effort: any failure leaves bars unchanged."""
+    try:
+        basic = provider.get_daily_basic_df(code, start, as_of)
+        if not basic.empty:
+            cols = [c for c in basic.columns if c != "code"]
+            bars_df = bars_df.merge(basic[cols], on="date", how="left")
+        fin = provider.get_financials_asof(code, as_of)
+        if not fin.empty:
+            fin_cols = [c for c in fin.columns
+                        if c not in ("code", "end_date", "ann_date")]
+            left = bars_df.copy()
+            left["_d"] = pd.to_datetime(left["date"])
+            right = fin.copy()
+            right["_a"] = pd.to_datetime(right["ann_date"])
+            right = right.sort_values("_a")
+            merged = pd.merge_asof(
+                left.sort_values("_d"), right[["_a", *fin_cols]],
+                left_on="_d", right_on="_a", direction="backward")
+            bars_df = merged.drop(columns=["_d", "_a"], errors="ignore")
+    except Exception as e:  # noqa: BLE001 - fundamentals are additive/optional
+        logger.debug("fundamental merge failed for %s: %s", code, e)
+    return bars_df
+
+
 # A FactorFn takes a code's bars (sorted asc by date) and returns a single
 # scalar — the factor value for that code on the most recent date in `bars`.
 # Returning np.nan signals "not computable" (insufficient history, etc).
@@ -154,12 +184,17 @@ def compute_factor_panel(
         factor_fns.update(db.load_active_factor_fns())
     start = as_of - timedelta(days=cfg.lookback_days)
 
+    # Only pay the per-code fundamental merge when fundamentals exist at all.
+    fund_on = db.has_fundamentals()
+
     rows: dict[str, dict[str, float]] = {}
     for code in codes:
         bars_df = provider.get_daily_df(code, start, as_of)
         if bars_df.empty or len(bars_df) < 21:
             continue
         bars_df = bars_df.sort_values("date").reset_index(drop=True)
+        if fund_on:
+            bars_df = _merge_fundamentals(bars_df, provider, code, start, as_of)
         row: dict[str, float] = {}
         for name, fn in factor_fns.items():
             try:
