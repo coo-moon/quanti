@@ -104,6 +104,11 @@ def run_backfill(db, *, years: int = 5, end: date | None = None,
     min_interval = (2.0 / calls_per_min) * 60.0 if calls_per_min > 0 else 0.0
     # Carried across days so adj_factor reconstruction never re-reads the DB.
     seed_state: dict = {}
+    # daily_basic (valuation/turnover) is optional and can be ~1/min even at high
+    # tiers; if it fails on the first few days, DISABLE it so the OHLCV backfill
+    # runs at full `daily` speed instead of stalling. Backfill estimation later.
+    with_basic = True
+    basic_fail_streak = 0
 
     for i, d in enumerate(dates):
         if d.isoformat() in done:
@@ -111,7 +116,17 @@ def run_backfill(db, *, years: int = 5, end: date | None = None,
             continue
         try:
             n = adapter.sync_daily_quotes_by_date(d, seed_state=seed_state,
-                                                  patient=True)
+                                                  patient=True, with_basic=with_basic)
+            if with_basic:
+                if getattr(adapter, "last_basic_ok", False):
+                    basic_fail_streak = 0
+                else:
+                    basic_fail_streak += 1
+                    if basic_fail_streak >= 3:
+                        with_basic = False
+                        logger.warning(
+                            "daily_basic 连续限频 → 本次回填跳过估值,仅拉 OHLCV"
+                            "(行情全速);估值可单独补(升积分或减少并发)")
             db.mark_backfill_done(d, n)
             res.dates_done += 1
             res.rows += n
