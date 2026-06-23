@@ -25,3 +25,4 @@ web/dist/
 .ruff_cache/
 htmlcov/
 .coverage
+nohup.out

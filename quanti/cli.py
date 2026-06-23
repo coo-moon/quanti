@@ -26,25 +26,28 @@ def cmd_sync(args):
     """Sync market data."""
     from datetime import date
 
-    from quanti.data.akshare_adapter import AkShareAdapter
+    from quanti.data.source import make_quote_adapter, make_stock_list_adapter
 
     db = _open_db()
-    adapter = AkShareAdapter(db)
+    source = getattr(args, "source", None)  # None → resolve (DB > env > tushare)
     # --refetch: ignore the incremental start and re-pull full history so old
     # qfq rows are overwritten (INSERT OR REPLACE) with raw price + adj_factor.
     refetch_start = date(2010, 1, 1) if getattr(args, "refetch", False) else None
 
     if args.calendar:
+        # Calendar currently only from akshare; tushare trade_cal lands in P2.4.
+        from quanti.data.akshare_adapter import AkShareAdapter
         logger.info("Syncing trade calendar...")
-        count = adapter.sync_trade_calendar()
+        count = AkShareAdapter(db).sync_trade_calendar()
         logger.info(f"Synced {count} trade dates")
 
     if args.stocks:
         logger.info("Syncing stock list...")
-        count = adapter.sync_stock_list()
+        count = make_stock_list_adapter(db, source).sync_stock_list()
         logger.info(f"Synced {count} stocks")
 
     if args.quotes:
+        adapter = make_quote_adapter(db, source)
         codes = args.codes.split(",") if args.codes else db.list_stocks()
         codes = [c.code if hasattr(c, "code") else c for c in codes]
         logger.info(f"Syncing daily quotes for {len(codes)} stocks"
@@ -199,7 +202,7 @@ def cmd_up(args):
 
     from quanti.agent.goal import RiskTolerance, load_goal, save_goal
     from quanti.api.app import create_app
-    from quanti.data.akshare_adapter import AkShareAdapter
+    from quanti.data.source import make_stock_list_adapter
 
     db = _open_db()
 
@@ -212,7 +215,7 @@ def cmd_up(args):
         def _bootstrap_stocks() -> None:
             try:
                 local_db = _open_db()  # own connection for the thread
-                adapter = AkShareAdapter(local_db)
+                adapter = make_stock_list_adapter(local_db)
                 count = adapter.sync_stock_list()
                 logger.info(f"后台股票列表同步完成：{count} 只")
                 local_db.close()
@@ -349,6 +352,10 @@ def main():
     sync_parser.add_argument("--quotes", action="store_true")
     sync_parser.add_argument("--calendar", action="store_true")
     sync_parser.add_argument("--codes", type=str)
+    sync_parser.add_argument("--source", choices=["tushare", "akshare", "xtdata"],
+                             default=None,
+                             help="历史源(默认按配置: DB app_config > env "
+                                  "QUANTI_DATA_SOURCE > tushare;无 token 自动回退 akshare)")
     sync_parser.add_argument("--tushare-stocks", action="store_true",
                              dest="tushare_stocks",
                              help="Sync full roster incl. delisted via Tushare")

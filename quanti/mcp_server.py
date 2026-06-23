@@ -412,12 +412,12 @@ def _handle_tool_call(ctx: QuantiContext, name: str, args: dict[str, Any]) -> An
         results.sort(key=lambda r: r["score"], reverse=True)
         return results[: int(args.get("top_n", 20))]
     if name == "sync_stocks":
-        from quanti.data.akshare_adapter import AkShareAdapter
-        adapter = AkShareAdapter(ctx.db)
+        from quanti.data.source import make_stock_list_adapter
+        adapter = make_stock_list_adapter(ctx.db)
         return {"synced": adapter.sync_stock_list()}
     if name == "sync_quotes":
-        from quanti.data.akshare_adapter import AkShareAdapter
-        adapter = AkShareAdapter(ctx.db)
+        from quanti.data.source import make_quote_adapter
+        adapter = make_quote_adapter(ctx.db)
         out: dict[str, int] = {}
         for c in args["codes"]:
             try:

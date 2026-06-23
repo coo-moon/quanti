@@ -55,9 +55,14 @@ class XtdataAdapter:
         return count
 
     def sync_daily_quotes(self, code: str, start: date | None = None,
-                          end: date | None = None) -> int:
+                          end: date | None = None,
+                          repair_gaps: bool = True) -> int:
         """Fetch daily bars for ``code`` from xtdata (incremental from the last
-        stored bar by default) and save them. Returns rows saved."""
+        stored bar by default) and save them. Returns rows saved.
+
+        `repair_gaps` is accepted for adapter-signature parity (the syncer/sites
+        pass it) but ignored — xtdata is a single source with no cross-source
+        gap-fill."""
         if end is None:
             end = date.today()
         if start is None:

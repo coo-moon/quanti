@@ -170,10 +170,11 @@ class BackgroundQuoteSyncer:
     # ----------------- adapter factory -----------------
 
     def _default_adapter_factory(self):
-        # Lazy import: keeps this module loadable without akshare installed
-        # (useful for tests).
-        from quanti.data.akshare_adapter import AkShareAdapter
-        return AkShareAdapter(self._db)
+        # Resolve the configured source (DB app_config > env > default tushare),
+        # falling back to akshare when tushare is unavailable. Built per batch so
+        # a UI source/token change takes effect without a restart.
+        from quanti.data.source import make_quote_adapter
+        return make_quote_adapter(self._db)
 
     # ----------------- public API -----------------
 
