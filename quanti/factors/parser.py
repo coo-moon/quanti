@@ -11,9 +11,10 @@ from __future__ import annotations
 import ast
 
 from quanti.factors.expr import (
-    Close, Constant, Expr, High, Log, Low, Max, Mean, Min, Open, Ref, Std,
-    Sum, Turnover, Volume,
+    Close, Constant, Expr, Field, High, Log, Low, Max, Mean, Min, Open, Ref,
+    Std, Sum, Turnover, Volume,
 )
+from quanti.factors.expr import FUNDAMENTAL_FIELDS
 
 MAX_LEN = 400
 MAX_DEPTH = 25
@@ -26,6 +27,10 @@ class FactorParseError(ValueError):
 
 _FIELDS = {"close": Close, "open": Open, "high": High, "low": Low,
            "volume": Volume, "turnover": Turnover}
+# Fundamental fields (point-in-time merged into the panel) — generic Field
+# nodes; missing columns evaluate to NaN, so a factor referencing them on a
+# universe without fundamentals just drops out (no crash).
+_FIELDS.update({name: (lambda n=name: Field(n)) for name in FUNDAMENTAL_FIELDS})
 _WINDOW_FUNCS = {"Ref": Ref, "Mean": Mean, "Std": Std, "Sum": Sum,
                  "Max": Max, "Min": Min}
 _UNARY_FUNCS = {"Log": Log}

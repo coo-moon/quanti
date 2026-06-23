@@ -67,6 +67,16 @@ class DataProvider:
         by default; pass ``adjust="none"`` for raw prices."""
         return self._apply_adjust(self._db.get_daily_quotes(code, start, end), adjust)
 
+    def get_daily_basic_df(self, code: str, start: date, end: date) -> pd.DataFrame:
+        """Per-(code,date) valuation (PE/PB/PS/mv/dv/turnover). Point-in-time by
+        construction — used by the factor panel."""
+        return self._db.get_daily_basic(code, start, end)
+
+    def get_financials_asof(self, code: str, as_of: date) -> pd.DataFrame:
+        """Financial reports ANNOUNCED on/before `as_of` (ann_date ≤ as_of) —
+        the point-in-time-safe view for fundamental factors."""
+        return self._db.get_financials_asof(code, as_of)
+
     def get_trade_dates(self, start: date, end: date) -> list[date]:
         return self._db.get_trade_dates(start, end)
 

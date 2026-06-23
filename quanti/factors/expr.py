@@ -16,7 +16,15 @@ from abc import ABC, abstractmethod
 import numpy as np
 import pandas as pd
 
-_FIELDS = ("open", "high", "low", "close", "volume", "turnover")
+# Point-in-time fundamentals merged into the factor panel (cross_sectional):
+# daily_basic valuation + financial-statement indicators (by ann_date). Missing
+# columns evaluate to NaN, so these are safe to reference on any universe.
+FUNDAMENTAL_FIELDS = (
+    "pe", "pe_ttm", "pb", "ps", "ps_ttm", "total_mv", "circ_mv", "dv_ratio",
+    "roe", "netprofit_yoy", "revenue_yoy",
+)
+_FIELDS = ("open", "high", "low", "close", "volume", "turnover",
+           *FUNDAMENTAL_FIELDS)
 
 
 class EvalContext:
