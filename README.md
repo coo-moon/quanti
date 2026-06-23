@@ -410,6 +410,8 @@ OpenClaw 配置示例（MCP client config）：
 
 ### CLI 命令速查
 
+> 完整命令与全部参数见 **[命令行使用大全 docs/CLI.md](docs/CLI.md)**。
+
 | 命令 | 说明 |
 |------|------|
 | `quanti up [--target 0.20 --no-agent ...]` | 一键启动数据 + 目标 + Web + Agent |
