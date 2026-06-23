@@ -166,22 +166,35 @@ class TestPriceAdjustment:
 
 class TestAkShareAdapter:
     @patch("quanti.data.akshare_adapter.ak")
-    def test_fetch_stock_list(self, mock_ak, db):
-        mock_ak.stock_info_a_code_name.return_value = pd.DataFrame(
-            {"code": ["000001", "600519"], "name": ["平安银行", "贵州茅台"]}
-        )
-        mock_ak.stock_individual_info_em.side_effect = [
-            pd.DataFrame(
-                {"item": ["上市时间", "行业"], "value": ["19910403", "银行"]}
-            ),
-            pd.DataFrame(
-                {"item": ["上市时间", "行业"], "value": ["20010827", "白酒"]}
-            ),
-        ]
-        adapter = AkShareAdapter(db)
-        adapter.sync_stock_list()
-        stocks = db.list_stocks()
-        assert len(stocks) == 2
+    def test_fetch_stock_list_survivorship_free(self, mock_ak, db):
+        """akshare roster: SH/SZ/BJ listed + SH/SZ delisted, with real list_date
+        and delist_date — survivorship-free, no tushare."""
+        from datetime import date as _d
+        mock_ak.stock_info_sh_name_code.return_value = pd.DataFrame([
+            {"证券代码": "600519", "证券简称": "贵州茅台", "上市日期": _d(2001, 8, 27)}])
+        mock_ak.stock_info_sz_name_code.return_value = pd.DataFrame([
+            {"A股代码": "000001", "A股简称": "平安银行",
+             "A股上市日期": "1991-04-03", "所属行业": "J 金融业"}])
+        mock_ak.stock_info_bj_name_code.return_value = pd.DataFrame([
+            {"证券代码": "920000", "证券简称": "安徽凤凰",
+             "上市日期": _d(2020, 12, 23), "所属行业": "汽车制造业"}])
+        mock_ak.stock_info_sh_delist.return_value = pd.DataFrame([
+            {"公司代码": "600001", "公司简称": "邯郸钢铁",
+             "上市日期": _d(1998, 1, 22), "暂停上市日期": _d(2009, 12, 29)}])
+        mock_ak.stock_info_sz_delist.return_value = pd.DataFrame([
+            {"证券代码": "000003", "证券简称": "PT金田A",
+             "上市日期": _d(1991, 1, 14), "终止上市日期": _d(2002, 6, 14)}])
+
+        n = AkShareAdapter(db).sync_stock_list()
+        assert n == 5
+        assert len(db.list_stocks()) == 5
+        # real list_date parsed (string + date forms)
+        assert db.get_stock("000001").list_date == _d(1991, 4, 3)
+        assert db.get_stock("920000").exchange == "BJ"          # 北交所
+        # delisted carry delist_date (survivorship-free)
+        sh_del = db.get_stock("600001")
+        assert sh_del.delist_date == _d(2009, 12, 29)
+        assert db.get_stock("000003").delist_date == _d(2002, 6, 14)
 
     @patch("quanti.data.akshare_adapter.ak")
     def test_adj_factor_from_raw_and_hfq(self, mock_ak, db):

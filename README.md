@@ -260,14 +260,13 @@ expr = parse_expr("-Mean(turnover, 20)")                  # 低换手异象
 ### 无幸存者偏差回测 (survivorship-free)
 
 ```bash
-# 1) 拉含退市股的全量名册 + 退市股历史（需 TUSHARE_TOKEN，可选依赖 .[data]）
-# PowerShell: $env:TUSHARE_TOKEN="..."
-export TUSHARE_TOKEN=...
-quanti sync --tushare-stocks
-quanti sync --tushare-quotes --delisted-only
+# 1a) 含退市股的全量名册 —— akshare 免费、无需 token(SH/SZ/BJ 在市 + SH/SZ 退市,
+#     带真实上市日/退市日)。tushare stock_basic 在低积分档限频严重,首选 akshare:
+quanti sync --stocks --source akshare
 
-# 更高效的替代:逐交易日全市场批量回填(含退市股,可断点续)
-quanti sync --backfill --years 5
+# 1b) 退市股历史行情(需 TUSHARE_TOKEN;PowerShell: $env:TUSHARE_TOKEN="...")
+export TUSHARE_TOKEN=...
+quanti sync --backfill --years 5      # 逐交易日全市场回填(含退市股,可断点续)
 
 # 2) 在"按日期时点正确、含退市股"的宇宙上回测
 quanti backtest --strategy my_strat --start 2021-01-01 --end 2022-12-31 --survivorship-free
