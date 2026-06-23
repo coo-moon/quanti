@@ -666,6 +666,47 @@ class Database:
         self.conn.commit()
         return cur.rowcount
 
+    # --- Bulk delete of synced market data (quanti sync --clear) ---
+
+    def _clear(self, table: str, codes=None, source: str | None = None,
+               *, dry_run: bool = False) -> int:
+        """Count (and, unless dry_run, delete) rows of a market data `table`,
+        optionally scoped to `codes` and (quotes only) `source`. Returns the
+        matched/deleted row count. `table` is whitelisted — never user input."""
+        assert table in ("daily_quotes", "daily_basic", "financials")
+        where, params = [], []
+        if codes:
+            where.append(f"code IN ({','.join('?' * len(codes))})")
+            params += [str(c) for c in codes]
+        if source and table == "daily_quotes":
+            where.append("source=?")
+            params.append(source)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        n = self.conn.execute(
+            f"SELECT COUNT(*) FROM {table}{clause}", params).fetchone()[0]
+        if not dry_run and n:
+            self.conn.execute(f"DELETE FROM {table}{clause}", params)
+            self.conn.commit()
+        return int(n)
+
+    def delete_quotes(self, codes=None, source: str | None = None,
+                      *, dry_run: bool = False) -> int:
+        return self._clear("daily_quotes", codes, source, dry_run=dry_run)
+
+    def delete_daily_basic(self, codes=None, *, dry_run: bool = False) -> int:
+        return self._clear("daily_basic", codes, dry_run=dry_run)
+
+    def delete_financials(self, codes=None, *, dry_run: bool = False) -> int:
+        return self._clear("financials", codes, dry_run=dry_run)
+
+    def clear_backfill_progress(self) -> int:
+        """Wipe the by-date backfill checkpoint so a later `--backfill` re-pulls
+        from scratch (otherwise done dates are skipped). Called when quotes are
+        cleared wholesale (no code/source scope)."""
+        cur = self.conn.execute("DELETE FROM backfill_progress")
+        self.conn.commit()
+        return cur.rowcount
+
     # --- Fundamentals (daily_basic + financials, point-in-time) ---
     _DAILY_BASIC_COLS = ("pe", "pe_ttm", "pb", "ps", "ps_ttm",
                          "total_mv", "circ_mv", "dv_ratio", "turnover_rate")

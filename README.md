@@ -248,6 +248,7 @@ expr = parse_expr("-Mean(turnover, 20)")                  # 低换手异象
 | `quanti sync --backfill --years 5` | 逐交易日全市场批量回填（含退市股，高效/可断点续）；需 `TUSHARE_TOKEN` |
 | `quanti sync --financials` | 拉财务指标（ROE/净利/营收及同比，按公告日 PIT）——**akshare 业绩报表,免费、无需 token**,按 `--years` 覆盖报告期 |
 | `quanti sync --source {tushare,akshare,xtdata}` | 指定历史源；默认按 DB app_config > env `QUANTI_DATA_SOURCE` > tushare，无 token 时报错（不静默回退，须显式 `--source akshare`） |
+| `quanti sync --clear {quotes,daily_basic,financials,all}` | 删除已同步数据，**默认预演(dry-run 只报行数)，加 `--yes` 才真删**；可配 `--codes` 限定股票、`--source` 限定行情源；全量清 quotes 时同步重置回填断点 |
 | `quanti serve` | 启动 API 服务（端口 8000） |
 
 > **复权口径(Qlib 式)**:`daily_quotes` 存**原始价(不复权)+ 每日复权因子 `adj_factor`**(=后复权/原始);akshare/tushare/xtdata 三源同一口径。研究/回测/因子/策略由 `DataProvider` 读时**后复权(hfq,连续、跨除权无假跳变、可复现)**,实盘下单与图表展示用**原始价**。因子锚定上市首日 → 增量同步安全。旧库是 qfq,升级后跑一次 `quanti sync --quotes --refetch` 重置口径。

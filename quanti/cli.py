@@ -22,6 +22,53 @@ def _open_db():
     return db
 
 
+def _cmd_clear(db, args) -> None:
+    """Delete already-synced market data. DRY-RUN by default (prints matched row
+    counts); pass --yes to actually delete. Scope with --clear {quotes|
+    daily_basic|financials|all}, optional --codes (limit to stocks) and --source
+    (limit quotes to one vendor)."""
+    target = args.clear
+    codes = ([c.strip() for c in args.codes.split(",") if c.strip()]
+             if getattr(args, "codes", None) else None)
+    src = getattr(args, "source", None)
+    yes = getattr(args, "yes", False)
+
+    plan = []  # (table label, delete callable taking dry_run)
+    if target in ("quotes", "all"):
+        plan.append(("daily_quotes",
+                     lambda d: db.delete_quotes(codes, src, dry_run=d)))
+    if target in ("daily_basic", "all"):
+        plan.append(("daily_basic", lambda d: db.delete_daily_basic(codes, dry_run=d)))
+    if target in ("financials", "all"):
+        plan.append(("financials", lambda d: db.delete_financials(codes, dry_run=d)))
+
+    scope = []
+    if codes:
+        scope.append(f"codes={len(codes)}")
+    if src:
+        scope.append(f"source={src}(仅 quotes)")
+    scope_s = ", ".join(scope) if scope else "全部"
+    mode = "执行删除" if yes else "预演(dry-run)"
+    logger.info(f"--clear {target} [{scope_s}] — {mode}")
+
+    for label, fn in plan:
+        n = fn(True)  # always count first
+        if yes:
+            fn(False)
+            logger.info(f"  ✓ {label}: 已删除 {n} 行")
+        else:
+            logger.info(f"  [dry-run] {label}: 将删除 {n} 行")
+
+    # A wholesale quotes wipe must also reset the by-date backfill checkpoint,
+    # else a later --backfill skips those dates and won't re-pull.
+    if yes and target in ("quotes", "all") and not codes and not src:
+        cleared = db.clear_backfill_progress()
+        logger.info(f"  ✓ backfill_progress: 清除 {cleared} 条断点(可重新全量回填)")
+
+    if not yes:
+        logger.info("以上为预演;确认无误后加 --yes 实际执行")
+
+
 def _report_periods(years: int) -> list:
     """Quarterly report-period ends (MM-DD ∈ 03-31/06-30/09-30/12-31) within the
     last `years`, up to today — the keys akshare 业绩报表 is fetched by."""
@@ -47,6 +94,10 @@ def cmd_sync(args):
     # --refetch: ignore the incremental start and re-pull full history so old
     # qfq rows are overwritten (INSERT OR REPLACE) with raw price + adj_factor.
     refetch_start = date(2010, 1, 1) if getattr(args, "refetch", False) else None
+
+    if getattr(args, "clear", None):
+        _cmd_clear(db, args)
+        return
 
     if args.calendar:
         logger.info("Syncing trade calendar...")
@@ -429,6 +480,13 @@ def main():
     sync_parser.add_argument("--delisted-only", action="store_true",
                              dest="delisted_only",
                              help="With --tushare-quotes: only delisted stocks")
+    sync_parser.add_argument("--clear",
+                             choices=["quotes", "daily_basic", "financials", "all"],
+                             default=None,
+                             help="删除已同步数据(默认预演,加 --yes 实际执行);"
+                                  "可配 --codes 限定股票、--source 限定行情源")
+    sync_parser.add_argument("--yes", action="store_true",
+                             help="确认执行删除(配合 --clear;不加则只预演)")
 
     # backtest
     bt_parser = subparsers.add_parser("backtest", help="Run backtest")
