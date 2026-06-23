@@ -53,6 +53,10 @@ class BacktestResponse(BaseModel):
 
 class SyncRequest(BaseModel):
     codes: list[str]
+    # Opt-in fail-loud: codes whose post-sync coverage (present/expected trading
+    # days) is below this are recorded as ERRORS, not just warnings. None/0 →
+    # completeness is reported as warnings only (job still 'done').
+    min_coverage: float | None = None
 
 
 class SyncResult(BaseModel):
@@ -132,14 +136,18 @@ async def sync_quotes_async(body: SyncRequest, request: Request):
 
     job_id = f"q_{str(uuid.uuid4())[:8]}"
     db.create_sync_job(job_id, "_quotes_sync", len(codes))
-    asyncio.create_task(_run_quotes_sync(job_id, codes, db))
+    asyncio.create_task(_run_quotes_sync(job_id, codes, db,
+                                         min_coverage=body.min_coverage))
 
     return {"job_id": job_id}
 
 
-async def _run_quotes_sync(job_id: str, codes: list[str], db) -> None:
+async def _run_quotes_sync(job_id: str, codes: list[str], db,
+                           min_coverage: float | None = None) -> None:
     from datetime import date, timedelta
     from quanti.data.source import try_make_quote_adapter
+    from quanti.data.integrity import (check_quote_completeness,
+                                       expected_trading_days)
     import asyncio
     from functools import partial
 
@@ -149,7 +157,10 @@ async def _run_quotes_sync(job_id: str, codes: list[str], db) -> None:
     if src_err:
         db.update_sync_job(job_id, 0, "error", {"_source": src_err})
         return
+    # Window-level calendar lookup once, reused for every code's completeness.
+    exp_days, used_cal = expected_trading_days(db, start_d, end_d)
     errors: dict[str, str] = {}
+    warnings: dict[str, str] = {}
     loop = asyncio.get_event_loop()
 
     for i, code in enumerate(codes):
@@ -158,12 +169,22 @@ async def _run_quotes_sync(job_id: str, codes: list[str], db) -> None:
             count = await loop.run_in_executor(None, fn)
             if count == 0:
                 errors[code] = "未获取到数据"
+            else:
+                # Validate what actually landed (source-agnostic): real missing
+                # trading days vs the calendar, plus OHLC/dup defects.
+                rep = check_quote_completeness(
+                    db, code, start_d, end_d,
+                    expected_days=exp_days, used_calendar=used_cal)
+                if min_coverage and rep.coverage < min_coverage:
+                    errors[code] = f"完整性不足: {rep.summary()}"
+                elif not rep.clean:
+                    warnings[code] = rep.summary()
         except Exception as e:
             errors[code] = str(e)
-        db.update_sync_job(job_id, i + 1, "running", errors)
+        db.update_sync_job(job_id, i + 1, "running", errors, warnings)
 
     final_status = "error" if errors else "done"
-    db.update_sync_job(job_id, len(codes), final_status, errors)
+    db.update_sync_job(job_id, len(codes), final_status, errors, warnings)
 
 
 def _calc_eta_seconds(job: dict) -> int | None:
@@ -193,6 +214,8 @@ async def get_quotes_sync_status(job_id: str, request: Request):
     total = job["total"]
     status = job["status"]
     err_count = len(job["errors"])
+    warns = job.get("warnings", {})
+    warn_count = len(warns)
     eta = _calc_eta_seconds(job)
     if status == "running":
         message = f"已同步 {current}/{total}"
@@ -200,12 +223,16 @@ async def get_quotes_sync_status(job_id: str, request: Request):
             message += f"，约 {eta // 60} 分钟"
     elif status == "done":
         message = f"同步完成，共 {total} 只"
+        if warn_count:
+            message += f"（{warn_count} 只有完整性告警）"
     else:
         message = f"同步结束，{err_count} 只失败"
+        if warn_count:
+            message += f"，{warn_count} 只告警"
     return SyncStatusResponse(
         job_id=job_id, current=current, total=total,
         status=status, errors=job["errors"], message=message,
-        eta_seconds=eta,
+        eta_seconds=eta, warnings=warns,
     )
 
 
@@ -319,6 +346,7 @@ class SyncStatusResponse(BaseModel):
     errors: dict
     message: str
     eta_seconds: int | None = None
+    warnings: dict = {}  # code -> completeness/quality summary (non-fatal)
 
 
 @router.get("/pools")
@@ -413,6 +441,8 @@ async def _run_pool_sync(job_id: str, pool_name: str, codes: list[str], db) -> N
     """Background task to sync pool stocks and update progress."""
     from datetime import date, timedelta
     from quanti.data.source import try_make_quote_adapter
+    from quanti.data.integrity import (check_quote_completeness,
+                                       expected_trading_days)
     import asyncio
     from functools import partial
 
@@ -422,7 +452,9 @@ async def _run_pool_sync(job_id: str, pool_name: str, codes: list[str], db) -> N
     if src_err:
         db.update_sync_job(job_id, 0, "error", {"_source": src_err})
         return
+    exp_days, used_cal = expected_trading_days(db, start_d, end_d)
     errors: dict[str, str] = {}
+    warnings: dict[str, str] = {}
     loop = asyncio.get_event_loop()
 
     for i, code in enumerate(codes):
@@ -431,12 +463,18 @@ async def _run_pool_sync(job_id: str, pool_name: str, codes: list[str], db) -> N
             count = await loop.run_in_executor(None, fn)
             if count == 0:
                 errors[code] = "未获取到数据"
+            else:
+                rep = check_quote_completeness(
+                    db, code, start_d, end_d,
+                    expected_days=exp_days, used_calendar=used_cal)
+                if not rep.clean:
+                    warnings[code] = rep.summary()
         except Exception as e:
             errors[code] = str(e)
-        db.update_sync_job(job_id, i + 1, "running", errors)
+        db.update_sync_job(job_id, i + 1, "running", errors, warnings)
 
     final_status = "error" if errors else "done"
-    db.update_sync_job(job_id, len(codes), final_status, errors)
+    db.update_sync_job(job_id, len(codes), final_status, errors, warnings)
 
 
 @router.get("/pools/{name}/sync/status")
@@ -452,6 +490,8 @@ async def get_sync_status(name: str, job_id: str, request: Request):
     total = job["total"]
     status = job["status"]
     err_count = len(job["errors"])
+    warns = job.get("warnings", {})
+    warn_count = len(warns)
     eta = _calc_eta_seconds(job)
     if status == "running":
         message = f"已同步 {current}/{total}"
@@ -459,12 +499,16 @@ async def get_sync_status(name: str, job_id: str, request: Request):
             message += f"，约 {eta // 60} 分钟"
     elif status == "done":
         message = f"同步完成，共 {total} 只"
+        if warn_count:
+            message += f"（{warn_count} 只有完整性告警）"
     else:
         message = f"同步结束，{err_count} 只失败"
+        if warn_count:
+            message += f"，{warn_count} 只告警"
     return SyncStatusResponse(
         job_id=job_id, current=current, total=total,
         status=status, errors=job["errors"], message=message,
-        eta_seconds=eta,
+        eta_seconds=eta, warnings=warns,
     )
 
 

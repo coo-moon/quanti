@@ -191,6 +191,10 @@ class Database:
             # cross-vendor splices within one code (different units/adjustment
             # conventions). Legacy rows are '' (unknown).
             ("daily_quotes", "source", "TEXT DEFAULT ''"),
+            # Sync-job completeness/quality warnings (missing trading days, bad
+            # OHLC, …) — kept separate from errors_json so coverage gaps don't
+            # masquerade as hard failures yet stay visible to the UI.
+            ("sync_jobs", "warnings_json", "TEXT DEFAULT '{}'"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -973,17 +977,26 @@ class Database:
         )
         self.conn.commit()
 
-    def update_sync_job(self, job_id: str, current: int, status: str, errors: dict) -> None:
+    def update_sync_job(self, job_id: str, current: int, status: str,
+                        errors: dict, warnings: dict | None = None) -> None:
         import json
-        self.conn.execute(
-            "UPDATE sync_jobs SET current=?, status=?, errors_json=? WHERE job_id=?",
-            (current, status, json.dumps(errors), job_id),
-        )
+        if warnings is None:
+            self.conn.execute(
+                "UPDATE sync_jobs SET current=?, status=?, errors_json=? "
+                "WHERE job_id=?",
+                (current, status, json.dumps(errors), job_id))
+        else:
+            self.conn.execute(
+                "UPDATE sync_jobs SET current=?, status=?, errors_json=?, "
+                "warnings_json=? WHERE job_id=?",
+                (current, status, json.dumps(errors),
+                 json.dumps(warnings), job_id))
         self.conn.commit()
 
     def get_sync_job(self, job_id: str) -> dict | None:
         row = self.conn.execute(
-            "SELECT job_id, pool_name, total, current, status, errors_json, created_at FROM sync_jobs WHERE job_id=?",
+            "SELECT job_id, pool_name, total, current, status, errors_json, "
+            "created_at, warnings_json FROM sync_jobs WHERE job_id=?",
             (job_id,),
         ).fetchone()
         if row is None:
@@ -993,6 +1006,7 @@ class Database:
             "job_id": row[0], "pool_name": row[1], "total": row[2],
             "current": row[3], "status": row[4],
             "errors": json.loads(row[5]), "created_at": row[6],
+            "warnings": json.loads(row[7] or "{}"),
         }
 
     # --- Strategy hyperopt params ---
