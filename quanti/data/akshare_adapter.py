@@ -415,3 +415,71 @@ class AkShareAdapter:
         except Exception as e:
             logger.warning(f"Failed to fetch trade calendar: {e}")
             return 0
+
+    # akshare 业绩报表 (东财) column → financials field. FREE alternative to
+    # tushare's permission-gated fina_indicator, and richer: it also carries the
+    # net_profit / revenue ABSOLUTES, and — crucially — the announcement date,
+    # so financials stay point-in-time (merge_asof on ann_date, no look-ahead).
+    _YJBB_MAP = {
+        "净资产收益率": "roe",
+        "净利润-净利润": "net_profit",
+        "营业总收入-营业总收入": "revenue",
+        "净利润-同比增长": "netprofit_yoy",
+        "营业总收入-同比增长": "revenue_yoy",
+    }
+
+    @staticmethod
+    def _statutory_ann_date(period: date) -> date:
+        """PIT announcement date = the A-share regulatory disclosure DEADLINE for
+        the report period. akshare 业绩报表's 最新公告日期 is a last-updated
+        timestamp (often today / a later annual-report date), NOT this period's
+        announce date — using it would mis-align PIT. The statutory deadline is
+        look-ahead-safe: the report is guaranteed public by then (most firms
+        report earlier, so this is conservative, never leaky).
+          Q1 03-31 → 04-30 同年; 中报 06-30 → 08-31 同年;
+          Q3 09-30 → 10-31 同年; 年报 12-31 → 次年 04-30。"""
+        md = (period.month, period.day)
+        if md == (3, 31):
+            return date(period.year, 4, 30)
+        if md == (6, 30):
+            return date(period.year, 8, 31)
+        if md == (9, 30):
+            return date(period.year, 10, 31)
+        if md == (12, 31):
+            return date(period.year + 1, 4, 30)
+        return period
+
+    def sync_financials_by_period(self, period: date) -> int:
+        """Pull the WHOLE market's report for ONE report period (e.g. 2024-03-31)
+        via akshare 业绩报表 — free, no token, whole-market in one call. ann_date
+        is the period's STATUTORY disclosure deadline (see _statutory_ann_date),
+        NOT akshare's unreliable 最新公告日期, so financials stay point-in-time
+        (merge_asof on ann_date, no look-ahead). Returns rows saved; degrades to
+        0 (logged) on endpoint/columns drift. `financials` is its own table, so
+        this is orthogonal to the daily_quotes source (one-source guard N/A)."""
+        ds = period.strftime("%Y%m%d")
+        try:
+            df = ak.stock_yjbb_em(date=ds)
+        except Exception as e:  # noqa: BLE001 - upstream/columns drift → skip
+            logger.info("stock_yjbb_em unavailable for %s: %s", ds, e)
+            return 0
+        if df is None or df.empty or "股票代码" not in df.columns:
+            return 0
+        ann = self._statutory_ann_date(period)
+        rows = []
+        for _, r in df.iterrows():
+            code = str(r.get("股票代码", "") or "").strip()
+            if not code:
+                continue
+            rec = {"code": code, "end_date": period.isoformat(),
+                   "ann_date": ann, "report_type": ""}
+            for src, dst in self._YJBB_MAP.items():
+                v = r.get(src)
+                rec[dst] = None if pd.isna(v) else float(v)
+            rows.append(rec)
+        if not rows:
+            return 0
+        n = self._db.save_financials(pd.DataFrame(rows))
+        logger.info("financials %s (ann≤%s): %d rows via akshare 业绩报表",
+                    period.isoformat(), ann.isoformat(), n)
+        return n

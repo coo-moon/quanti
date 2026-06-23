@@ -45,6 +45,47 @@ def test_financials_asof_excludes_future_announcements(db):
     assert seen.iloc[0]["roe"] == 15.0
 
 
+def test_akshare_financials_by_period_is_pit(db, monkeypatch):
+    """Free akshare 业绩报表 → financials with net_profit/revenue absolutes, keyed
+    by the STATUTORY disclosure deadline (Q1 → 04-30) so it's point-in-time —
+    akshare's own 最新公告日期 (a last-updated stamp) is deliberately ignored."""
+    import quanti.data.akshare_adapter as aks
+    from quanti.data.akshare_adapter import AkShareAdapter
+
+    def fake_yjbb(**kw):
+        return pd.DataFrame([
+            {"股票代码": "000001", "净资产收益率": 15.0,
+             "净利润-净利润": 1.2e9, "营业总收入-营业总收入": 5.0e9,
+             "净利润-同比增长": 20.0, "营业总收入-同比增长": 8.0,
+             # unreliable: a 2025 last-updated stamp — must NOT be used as ann.
+             "最新公告日期": date(2025, 4, 30)},
+            {"股票代码": "", "净资产收益率": 5.0, "净利润-净利润": 1.0e8,
+             "营业总收入-营业总收入": 2.0e8, "净利润-同比增长": float("nan"),
+             "营业总收入-同比增长": 1.0, "最新公告日期": None},  # no code → skipped
+        ])
+
+    monkeypatch.setattr(aks.ak, "stock_yjbb_em", fake_yjbb)
+    n = AkShareAdapter(db).sync_financials_by_period(date(2024, 3, 31))
+    assert n == 1                                        # blank-code row dropped
+    # Q1 2024 → statutory deadline 2024-04-30 (NOT akshare's 2025 stamp).
+    asof = db.get_financials_asof("000001", date(2024, 5, 1))
+    row = asof.iloc[0]
+    assert list(asof["ann_date"]) == [date(2024, 4, 30)]
+    assert row["roe"] == 15.0 and row["netprofit_yoy"] == 20.0
+    assert row["revenue_yoy"] == 8.0
+    assert row["net_profit"] == 1.2e9 and row["revenue"] == 5.0e9
+    # Before the 04-30 deadline → not visible (point-in-time).
+    assert db.get_financials_asof("000001", date(2024, 4, 15)).empty
+
+
+def test_statutory_ann_date_deadlines():
+    from quanti.data.akshare_adapter import AkShareAdapter as A
+    assert A._statutory_ann_date(date(2024, 3, 31)) == date(2024, 4, 30)
+    assert A._statutory_ann_date(date(2024, 6, 30)) == date(2024, 8, 31)
+    assert A._statutory_ann_date(date(2024, 9, 30)) == date(2024, 10, 31)
+    assert A._statutory_ann_date(date(2024, 12, 31)) == date(2025, 4, 30)
+
+
 def test_merge_fundamentals_is_point_in_time(db):
     """roe is NaN before its ann_date and equals the report value on/after —
     no look-ahead. pe (daily_basic) is available same-day."""

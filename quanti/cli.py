@@ -22,6 +22,20 @@ def _open_db():
     return db
 
 
+def _report_periods(years: int) -> list:
+    """Quarterly report-period ends (MM-DD ∈ 03-31/06-30/09-30/12-31) within the
+    last `years`, up to today — the keys akshare 业绩报表 is fetched by."""
+    from datetime import date as _date
+    today = _date.today()
+    out = []
+    for y in range(today.year - years, today.year + 1):
+        for mo, day in ((3, 31), (6, 30), (9, 30), (12, 31)):
+            d = _date(y, mo, day)
+            if d <= today:
+                out.append(d)
+    return out
+
+
 def cmd_sync(args):
     """Sync market data."""
     from datetime import date
@@ -66,23 +80,21 @@ def cmd_sync(args):
                     f"{res.dates_skipped} skipped, {len(res.errors)} errors")
 
     if getattr(args, "financials", False):
-        import time as _time
-        adapter = make_quote_adapter(db, source or "tushare")
-        if not hasattr(adapter, "sync_financials"):
-            logger.error("source has no financials support (need tushare)")
-        else:
-            codes = [s.code for s in db.list_stocks()]
-            logger.info(f"Syncing financials for {len(codes)} stocks (PIT by ann_date)...")
-            total = 0
-            for i, code in enumerate(codes):
-                try:
-                    total += adapter.sync_financials(code)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"  {code}: {e}")
-                if (i + 1) % 50 == 0:
-                    logger.info(f"  {i + 1}/{len(codes)} (rows={total})")
-                _time.sleep(0.15)  # throttle per-minute cap
-            logger.info(f"Financials sync complete: {total} rows")
+        # Financials come from akshare 业绩报表 (free, no token, whole-market per
+        # report period, PIT by 公告日) — independent of the quote source, and
+        # works even when tushare's fina_indicator is permission-gated.
+        from quanti.data.akshare_adapter import AkShareAdapter
+        years = getattr(args, "years", 5)
+        periods = _report_periods(years)
+        ak_adapter = AkShareAdapter(db)
+        logger.info(f"Syncing financials over {len(periods)} report periods "
+                    f"(akshare 业绩报表, PIT by 公告日)...")
+        total = 0
+        for p in periods:
+            total += ak_adapter.sync_financials_by_period(p)
+            logger.info(f"  {p}: cumulative {total} rows")
+        logger.info(f"Financials sync complete: {total} rows "
+                    f"over {len(periods)} periods")
 
     if args.quotes:
         adapter = make_quote_adapter(db, source)
@@ -407,8 +419,9 @@ def main():
     sync_parser.add_argument("--years", type=int, default=5,
                              help="--backfill 回填年数(默认 5)")
     sync_parser.add_argument("--financials", action="store_true",
-                             help="逐股拉财务指标(ROE/同比增速,按公告日 PIT);"
-                                  "需 Tushare token(高点数档)")
+                             help="拉财务指标(ROE/净利营收及同比,按公告日 PIT)"
+                                  "—— akshare 业绩报表,免费、无需 token,按 --years "
+                                  "覆盖报告期")
     sync_parser.add_argument("--refetch", action="store_true",
                              help="全量重拉历史(覆盖旧数据)。从 qfq 切到"
                                   "「原始价+adj_factor」后须跑一次,否则旧 qfq "
