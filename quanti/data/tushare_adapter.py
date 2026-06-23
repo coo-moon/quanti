@@ -271,7 +271,8 @@ class TushareAdapter:
         return saved
 
     def sync_daily_quotes_by_date(self, trade_date: date,
-                                  seed_state: dict | None = None) -> int:
+                                  seed_state: dict | None = None,
+                                  patient: bool = False) -> int:
         """Pull the WHOLE market for ONE trading day — the efficient bulk path.
         Returns rows saved. Delisted names appear in pro.daily for dates they
         traded.
@@ -283,10 +284,11 @@ class TushareAdapter:
         WITHOUT re-querying the DB or re-fetching history; on a miss it seeds
         from the DB's last stored bar (fresh anchor 1.0 if none). turnover +
         valuation come from daily_basic when that endpoint is available
-        (gracefully skipped otherwise)."""
+        (gracefully skipped otherwise). `patient` waits out per-minute rate
+        limits (set by the bulk backfill so a slow `daily` cap doesn't drop days)."""
         pro = self._ensure_pro()
         td = trade_date.strftime("%Y%m%d")
-        raw = self._retry(pro.daily, trade_date=td)
+        raw = self._retry(pro.daily, trade_date=td, _patient=patient)
         if raw is None or raw.empty:
             return 0
         # daily_basic (point-tier gated) feeds BOTH the daily_basic table (P4
@@ -296,7 +298,7 @@ class TushareAdapter:
         basic = None
         try:
             basic = self._retry(
-                pro.daily_basic, trade_date=td,
+                pro.daily_basic, trade_date=td, _patient=patient,
                 fields=("ts_code,turnover_rate,pe,pe_ttm,pb,ps,ps_ttm,"
                         "dv_ratio,total_mv,circ_mv"))
         except Exception as e:  # noqa: BLE001

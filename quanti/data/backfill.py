@@ -52,13 +52,27 @@ def run_backfill(db, *, years: int = 5, end: date | None = None,
     """Backfill `years` of daily history for the whole market (incl. delisted),
     oldest→newest so an interrupted run leaves a contiguous prefix. Requires a
     by-date-capable source (tushare); no silent akshare fallback (per-stock
-    akshare backfill would be unworkable)."""
-    from quanti.data.source import make_quote_adapter, make_stock_list_adapter
+    akshare backfill would be unworkable).
+
+    `calls_per_min` paces the per-minute cap of the binding endpoint (`daily` is
+    50/min on low-points tokens, 500/min on higher tiers) — set it at/under your
+    token's `daily` limit. Even if over-paced, the by-date sweep retries
+    patiently (waits out the minute) so days aren't dropped."""
+    from quanti.data.source import make_quote_adapter
 
     end = end or date.today()
     start = end - timedelta(days=365 * years)
-    # Roster first so the universe / point-in-time see delisted names too.
-    make_stock_list_adapter(db, source, allow_fallback=False).sync_stock_list()
+    # Roster (universe / point-in-time membership incl. delisted) from akshare —
+    # FREE, survivorship-free, and independent of the quote source's stock_basic
+    # (which is rate-limited to ~1/hour on low tokens). Best-effort: the by-date
+    # `daily` sweep returns every stock that traded regardless, so a roster blip
+    # doesn't block the quote backfill.
+    try:
+        from quanti.data.akshare_adapter import AkShareAdapter
+        n_roster = AkShareAdapter(db).sync_stock_list()
+        logger.info("roster: %d 只(akshare,含退市股)", n_roster)
+    except Exception as e:  # noqa: BLE001 - roster is metadata; quotes don't need it
+        logger.warning("roster 同步跳过(%s)——逐日 daily 仍覆盖全市场", e)
     adapter = make_quote_adapter(db, source, allow_fallback=False)
     if not hasattr(adapter, "sync_daily_quotes_by_date"):
         raise RuntimeError(f"source {source!r} has no by-date backfill path")
@@ -84,7 +98,8 @@ def run_backfill(db, *, years: int = 5, end: date | None = None,
             res.dates_skipped += 1
             continue
         try:
-            n = adapter.sync_daily_quotes_by_date(d, seed_state=seed_state)
+            n = adapter.sync_daily_quotes_by_date(d, seed_state=seed_state,
+                                                  patient=True)
             db.mark_backfill_done(d, n)
             res.dates_done += 1
             res.rows += n

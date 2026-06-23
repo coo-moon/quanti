@@ -126,8 +126,9 @@ def cmd_sync(args):
     if getattr(args, "backfill", False):
         from quanti.data.backfill import run_backfill
         years = getattr(args, "years", 5)
+        cpm = getattr(args, "calls_per_min", 400) or 400
         logger.info(f"Backfilling {years}y of history by trading date "
-                    f"(source={source or 'default'})...")
+                    f"(source={source or 'default'}, calls/min={cpm})...")
 
         def _prog(i, total, d, res):
             if i % 50 == 0 or i == total:
@@ -135,7 +136,7 @@ def cmd_sync(args):
                             f"skipped={res.dates_skipped} errors={len(res.errors)}")
 
         res = run_backfill(db, years=years, source=source or "tushare",
-                           on_progress=_prog)
+                           calls_per_min=cpm, on_progress=_prog)
         logger.info(f"Backfill complete: {res.dates_done} dates, {res.rows} rows, "
                     f"{res.dates_skipped} skipped, {len(res.errors)} errors")
 
@@ -478,6 +479,10 @@ def main():
                                   "配合 --years;需 Tushare token")
     sync_parser.add_argument("--years", type=int, default=5,
                              help="--backfill 回填年数(默认 5)")
+    sync_parser.add_argument("--calls-per-min", dest="calls_per_min", type=int,
+                             default=400,
+                             help="--backfill 每分钟调用上限(按 token 的 daily 限额设;"
+                                  "低档约 50,设 ~80;高档可 400+)")
     sync_parser.add_argument("--financials", action="store_true",
                              help="拉财务指标(ROE/净利营收及同比,按公告日 PIT)"
                                   "—— akshare 业绩报表,免费、无需 token,按 --years "
