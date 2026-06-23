@@ -143,44 +143,76 @@ class AkShareAdapter:
 
         self._db.upsert_stock(code, name, exchange, list_date, industry)
 
+    # Survivorship-free roster from akshare (FREE, no token) — listed (SH/SZ/BJ)
+    # + delisted (SH/SZ), each carrying a REAL list_date. Replaces the tushare
+    # stock_basic path, which on a low-points token is rate-limited to ~1/hour.
+    # (endpoint, code col, name col, list_date col, delist_date col, exchange,
+    #  industry col); None = column absent. Delist sources LAST so delist_date wins.
+    _ROSTER_SOURCES = (
+        ("stock_info_sh_name_code", "证券代码", "证券简称", "上市日期", None, "SH", None),
+        ("stock_info_sz_name_code", "A股代码", "A股简称", "A股上市日期", None, "SZ", "所属行业"),
+        ("stock_info_bj_name_code", "证券代码", "证券简称", "上市日期", None, "BJ", "所属行业"),
+        ("stock_info_sh_delist", "公司代码", "公司简称", "上市日期", "暂停上市日期", "SH", None),
+        ("stock_info_sz_delist", "证券代码", "证券简称", "上市日期", "终止上市日期", "SZ", None),
+    )
+
+    @staticmethod
+    def _parse_ak_date(v) -> date | None:
+        """akshare dates come as datetime.date or 'YYYY-MM-DD'/'YYYYMMDD' strings."""
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "none", "nat"):
+            return None
+        for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(s[:10], fmt).date()
+            except ValueError:
+                continue
+        return None
+
     def sync_stock_list(self, patient: bool = False) -> int:
-        """Fetch and save A-share stock list (code + name only). Returns count.
-        `patient` accepted for adapter-signature parity (tushare uses it for
-        per-minute rate limits); akshare ignores it.
-
-        Retries on network failure — AkShare upstream occasionally resets
-        connections and a one-shot failure shouldn't bring down the bootstrap.
-        """
-        df = None
-        last_err: Exception | None = None
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                df = ak.stock_info_a_code_name()
-                if df is not None and not df.empty:
-                    break
-            except Exception as e:
-                last_err = e
-                logger.warning(f"sync_stock_list attempt {attempt}/{MAX_RETRIES}: {e}")
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY * attempt)
-        if df is None or df.empty:
-            if last_err is not None:
-                raise last_err
-            return 0
-
+        """Survivorship-free A-share roster from akshare (free, no token): SH/SZ/BJ
+        listed + SH/SZ delisted, each with a real list_date (delisted also carry
+        delist_date). Each source is best-effort (one flaky endpoint won't abort
+        the rest), retried on network blips. `patient` accepted for adapter-
+        signature parity (akshare isn't point-tiered). Returns stocks saved."""
         count = 0
-        for _, row in df.iterrows():
-            code = str(row["code"])
-            name = str(row["name"])
-            exchange = "SH" if code.startswith("6") else "SZ"
-            # Use a default list_date; real date can be fetched later per-stock if needed
-            list_date = date(2000, 1, 1)
-            industry = ""
-            try:
-                self._db.upsert_stock(code, name, exchange, list_date, industry)
-                count += 1
-            except Exception as e:
-                logger.warning(f"Failed to save {code}: {e}")
+        for fn_name, c_code, c_name, c_list, c_delist, exch, c_ind in self._ROSTER_SOURCES:
+            fn = getattr(ak, fn_name, None)
+            if fn is None:
+                continue
+            df = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    df = fn()
+                    break
+                except Exception as e:  # noqa: BLE001 - upstream blip → retry/skip
+                    logger.warning("%s attempt %d/%d: %s",
+                                   fn_name, attempt, MAX_RETRIES, e)
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY * attempt)
+            if df is None or df.empty or c_code not in df.columns:
+                logger.warning("roster source %s unavailable/changed — skipped", fn_name)
+                continue
+            for _, r in df.iterrows():
+                code = str(r.get(c_code, "")).strip()
+                if not code.isdigit():
+                    continue  # skip headers/junk; A-share codes are all digits
+                list_date = self._parse_ak_date(r.get(c_list)) or date(2000, 1, 1)
+                delist_date = self._parse_ak_date(r.get(c_delist)) if c_delist else None
+                industry = str(r.get(c_ind) or "") if c_ind else ""
+                try:
+                    self._db.upsert_stock(code, str(r.get(c_name) or code), exch,
+                                          list_date, industry, delist_date=delist_date)
+                    count += 1
+                except Exception as e:  # noqa: BLE001 - one bad row shouldn't abort
+                    logger.warning("Failed to save %s: %s", code, e)
+        logger.info("akshare roster: %d 只(SH/SZ/BJ 在市 + SH/SZ 退市)", count)
         return count
 
     # --- Data sources ---

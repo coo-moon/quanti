@@ -111,10 +111,17 @@ def cmd_sync(args):
 
     if args.stocks:
         logger.info("Syncing stock list...")
-        # patient=True: CLI can wait out per-minute rate limits (tushare
-        # stock_basic is 1/min on low tiers → L/D/P takes ~2 min).
-        count = make_stock_list_adapter(db, source).sync_stock_list(patient=True)
-        logger.info(f"Synced {count} stocks")
+        # patient=True: CLI can wait out per-minute rate limits. tushare
+        # stock_basic can be 1/HOUR on low-points tokens (L/D/P → ~3h, impractical)
+        # → on rate-limit, point the user at the free akshare roster instead.
+        try:
+            count = make_stock_list_adapter(db, source).sync_stock_list(patient=True)
+            logger.info(f"Synced {count} stocks")
+        except Exception as e:  # noqa: BLE001
+            logger.error("名册同步失败: %s", e)
+            if "频率超限" in str(e):
+                logger.error("tushare 该接口积分受限;改用免费 akshare 含退市股名册:"
+                             "  quanti sync --stocks --source akshare")
 
     if getattr(args, "backfill", False):
         from quanti.data.backfill import run_backfill
