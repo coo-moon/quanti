@@ -271,6 +271,26 @@ class TestBatchProcessing:
         assert s.synced_session == 2
         assert s.failed_session == 0
 
+    def test_adapter_factory_failure_skips_batch_cleanly(self, db_with_stocks):
+        """Source unbuildable (e.g. tushare, no token — no silent akshare
+        fallback): the batch aborts once, records last_error, requeues the
+        code, and does NOT count a per-code failure for every queued stock."""
+        from quanti.data.source import DataSourceUnavailable
+
+        def _boom():
+            raise DataSourceUnavailable("未配置 token")
+
+        syncer = BackgroundQuoteSyncer(
+            db=db_with_stocks, adapter_factory=_boom,
+            config=BackgroundSyncConfig(per_code_sleep_sec=0.0, batch_size=3))
+        syncer._queue.extend(["BBB", "CCC"])
+        syncer._process_batch()
+        s = syncer.status()
+        assert s.failed_session == 0                  # not a per-code failure
+        assert s.last_error and "数据源" in s.last_error
+        assert "BBB" in list(syncer._queue)           # requeued, nothing dropped
+        assert "CCC" in list(syncer._queue)
+
     def test_zero_rows_counts_as_failure(self, db_with_stocks):
         """A code that returns 0 (delisted, no data on feed) should be
         backed off, not retried every cycle."""

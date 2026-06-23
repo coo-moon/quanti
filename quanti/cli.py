@@ -393,7 +393,8 @@ def main():
     sync_parser.add_argument("--source", choices=["tushare", "akshare", "xtdata"],
                              default=None,
                              help="历史源(默认按配置: DB app_config > env "
-                                  "QUANTI_DATA_SOURCE > tushare;无 token 自动回退 akshare)")
+                                  "QUANTI_DATA_SOURCE > tushare)。tushare 无 token "
+                                  "时直接报错,不再静默回退;要用 akshare 请显式指定")
     sync_parser.add_argument("--tushare-stocks", action="store_true",
                              dest="tushare_stocks",
                              help="Sync full roster incl. delisted via Tushare")
@@ -489,24 +490,31 @@ def main():
 
     args = parser.parse_args()
     cmd = args.command
-    if cmd == "sync":
-        cmd_sync(args)
-    elif cmd == "backtest":
-        cmd_backtest(args)
-    elif cmd == "optimize":
-        cmd_optimize(args)
-    elif cmd == "serve":
-        cmd_serve(args)
-    elif cmd == "up":
-        cmd_up(args)
-    elif cmd == "agent":
-        cmd_agent(args)
-    elif cmd == "mcp":
-        cmd_mcp(args)
-    elif cmd == "mine-factors":
-        cmd_mine_factors(args)
-    else:
-        parser.print_help()
+    from quanti.data.source import DataSourceUnavailable
+    try:
+        if cmd == "sync":
+            cmd_sync(args)
+        elif cmd == "backtest":
+            cmd_backtest(args)
+        elif cmd == "optimize":
+            cmd_optimize(args)
+        elif cmd == "serve":
+            cmd_serve(args)
+        elif cmd == "up":
+            cmd_up(args)
+        elif cmd == "agent":
+            cmd_agent(args)
+        elif cmd == "mcp":
+            cmd_mcp(args)
+        elif cmd == "mine-factors":
+            cmd_mine_factors(args)
+        else:
+            parser.print_help()
+    except DataSourceUnavailable as e:
+        # Clean, actionable message instead of a traceback when the configured
+        # source can't be built (e.g. tushare with no token). No silent fallback.
+        logger.error(str(e))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

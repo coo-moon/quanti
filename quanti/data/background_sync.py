@@ -170,9 +170,11 @@ class BackgroundQuoteSyncer:
     # ----------------- adapter factory -----------------
 
     def _default_adapter_factory(self):
-        # Resolve the configured source (DB app_config > env > default tushare),
-        # falling back to akshare when tushare is unavailable. Built per batch so
-        # a UI source/token change takes effect without a restart.
+        # Resolve the configured source (DB app_config > env > default tushare).
+        # Built per batch so a UI source/token change takes effect without a
+        # restart. Raises DataSourceUnavailable when the source can't be built
+        # (e.g. tushare with no token) — we do NOT silently fall back to akshare;
+        # _process_batch catches it and skips the batch (next loop retries).
         from quanti.data.source import make_quote_adapter
         return make_quote_adapter(self._db)
 
@@ -481,9 +483,22 @@ class BackgroundQuoteSyncer:
                 latest_before = None
             start_d = None if latest_before is not None else cold_start
 
-            try:
-                if adapter is None:
+            if adapter is None:
+                try:
                     adapter = self._adapter_factory()
+                except Exception as e:
+                    # Source misconfigured (e.g. tushare selected, no token —
+                    # no silent akshare fallback). Don't fail every code in the
+                    # batch; requeue this one, record once, and abort. The next
+                    # loop retries so a UI token change recovers without restart.
+                    with self._lock:
+                        self._queue.appendleft(code)
+                        self._current_code = None
+                        self._last_error = f"数据源不可用: {e}"
+                    logger.warning("bg-sync skipped (data source): %s", e)
+                    return
+
+            try:
                 # repair_gaps=False because the background path values throughput
                 # over completeness; user-triggered sync still does gap repair.
                 count = adapter.sync_daily_quotes(

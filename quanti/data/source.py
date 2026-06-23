@@ -11,10 +11,16 @@ Resolution precedence (highest first):
 
 Token precedence (for tushare): DB app_config.data_source_token > env TUSHARE_TOKEN.
 
-If tushare is selected but unavailable (package not installed or no token),
-`make_quote_adapter` falls back to akshare with a warning (so a fresh / no-token
-install keeps working) unless `allow_fallback=False` (used by the explicit
-backfill so the user isn't silently downgraded).
+If the selected source is unavailable (e.g. tushare selected but the package is
+not installed or no token is configured), `make_quote_adapter` RAISES
+`DataSourceUnavailable` — it does NOT silently fall back to akshare, because a
+silent vendor swap pollutes the DB with a different-convention/shallower-history
+source and breaks "one source per code". To intentionally use akshare, select it
+explicitly (UI panel / `--source akshare` / `QUANTI_DATA_SOURCE=akshare`).
+Pass `allow_fallback=True` only where best-effort degradation is genuinely wanted.
+
+Call sites that surface errors to the user/UI (API, daemon, agent loop) should
+use `try_make_quote_adapter`, which returns `(None, message)` instead of raising.
 
 Kept import-light: the three adapters are imported lazily inside the factory so
 importing this module never requires akshare/tushare to be installed.
@@ -29,6 +35,12 @@ logger = logging.getLogger(__name__)
 
 VALID_SOURCES = ("tushare", "akshare", "xtdata")
 DEFAULT_SOURCE = "tushare"
+
+
+class DataSourceUnavailable(RuntimeError):
+    """Raised when the resolved data source can't be built (e.g. tushare
+    selected but not installed / no token). We refuse to silently fall back to
+    another vendor — the caller must fix config or pick a source explicitly."""
 
 
 def resolve_source(db=None, explicit: str | None = None) -> str:
@@ -71,21 +83,24 @@ def tushare_available(db=None) -> bool:
 
 
 def make_quote_adapter(db, source: str | None = None, *,
-                       allow_fallback: bool = True):
+                       allow_fallback: bool = False):
     """Build the daily-quote sync adapter for the resolved source.
 
-    Falls back to akshare (with a warning) when tushare is selected but
-    unavailable, unless allow_fallback=False."""
+    Raises `DataSourceUnavailable` when tushare is selected but unavailable
+    (no silent vendor swap). Pass allow_fallback=True to degrade to akshare
+    with a warning instead — only where best-effort is genuinely wanted."""
     src = resolve_source(db, source)
     if src == "tushare":
         if tushare_available(db):
             from quanti.data.tushare_adapter import TushareAdapter
             return TushareAdapter(db, token=tushare_token(db))
-        msg = ("tushare selected but unavailable (package not installed or no "
-               "token configured)")
+        msg = ("数据源 'tushare' 不可用:未安装 tushare 或未配置 token。"
+               "请在前端「数据源」面板填入 token,或设置环境变量 TUSHARE_TOKEN;"
+               "若确实要用 akshare,请显式将数据源切到 akshare"
+               "(--source akshare / QUANTI_DATA_SOURCE=akshare / 前端面板)。")
         if not allow_fallback:
-            raise RuntimeError(msg)
-        logger.warning("%s; falling back to akshare", msg)
+            raise DataSourceUnavailable(msg)
+        logger.warning("%s — allow_fallback 已开,降级到 akshare", msg)
         from quanti.data.akshare_adapter import AkShareAdapter
         return AkShareAdapter(db)
     if src == "xtdata":
@@ -96,10 +111,24 @@ def make_quote_adapter(db, source: str | None = None, *,
     return AkShareAdapter(db)
 
 
+def try_make_quote_adapter(db, source: str | None = None):
+    """Non-raising variant for user/UI-facing call sites. Returns
+    `(adapter, None)` on success or `(None, message)` when the source is
+    unavailable, so the caller can surface a clean error instead of a 500 /
+    crash-loop. Unexpected errors are also captured as a message."""
+    try:
+        return make_quote_adapter(db, source), None
+    except DataSourceUnavailable as e:
+        return None, str(e)
+    except Exception as e:  # noqa: BLE001 - any build failure → clean message
+        return None, f"数据源初始化失败: {e}"
+
+
 def make_stock_list_adapter(db, source: str | None = None, *,
-                            allow_fallback: bool = True):
+                            allow_fallback: bool = False):
     """Stock-list (roster) adapter for the resolved source. Same resolution as
-    quotes — so the default roster comes from tushare (incl. delisted)."""
+    quotes — so the default roster comes from tushare (incl. delisted). Raises
+    DataSourceUnavailable when the source can't be built (no silent fallback)."""
     return make_quote_adapter(db, source, allow_fallback=allow_fallback)
 
 

@@ -55,17 +55,35 @@ def test_make_adapter_tushare_when_available(db, monkeypatch):
     assert isinstance(src.make_quote_adapter(db, "tushare"), TushareAdapter)
 
 
-def test_make_adapter_falls_back_to_akshare_without_token(db, monkeypatch, caplog):
+def test_make_adapter_no_silent_fallback_by_default(db, monkeypatch):
+    """Default must NOT silently downgrade tushare→akshare: it raises so the
+    DB never gets polluted with a different-convention source unawares."""
     monkeypatch.setattr(src, "tushare_available", lambda _db=None: False)
-    adapter = src.make_quote_adapter(db, "tushare")
-    assert isinstance(adapter, AkShareAdapter)
-    assert any("falling back to akshare" in r.message for r in caplog.records)
-
-
-def test_make_adapter_no_fallback_raises(db, monkeypatch):
-    monkeypatch.setattr(src, "tushare_available", lambda _db=None: False)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(src.DataSourceUnavailable):
+        src.make_quote_adapter(db, "tushare")                 # no allow_fallback
+    with pytest.raises(src.DataSourceUnavailable):
         src.make_quote_adapter(db, "tushare", allow_fallback=False)
+
+
+def test_make_adapter_fallback_only_when_opted_in(db, monkeypatch, caplog):
+    """akshare degradation is opt-in via allow_fallback=True (best-effort sites)."""
+    monkeypatch.setattr(src, "tushare_available", lambda _db=None: False)
+    adapter = src.make_quote_adapter(db, "tushare", allow_fallback=True)
+    assert isinstance(adapter, AkShareAdapter)
+    assert any("akshare" in r.message for r in caplog.records)
+
+
+def test_try_make_quote_adapter_returns_message_not_raise(db, monkeypatch):
+    """The non-raising variant used by API/daemon returns (None, message)."""
+    monkeypatch.setattr(src, "tushare_available", lambda _db=None: False)
+    adapter, err = src.try_make_quote_adapter(db, "tushare")
+    assert adapter is None
+    assert err and "token" in err.lower()
+    # Available → (adapter, None).
+    monkeypatch.setattr(src, "tushare_available", lambda _db=None: True)
+    monkeypatch.setattr(src, "tushare_token", lambda _db=None: "tok")
+    adapter2, err2 = src.try_make_quote_adapter(db, "tushare")
+    assert adapter2 is not None and err2 is None
 
 
 def test_make_adapter_explicit_sources(db):

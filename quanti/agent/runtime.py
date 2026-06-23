@@ -372,7 +372,13 @@ class AgentRuntime:
         budget = max(20, len(held_set))
         missing = missing[:budget]
 
-        adapter = make_quote_adapter(self._db)
+        try:
+            adapter = make_quote_adapter(self._db)
+        except Exception as e:
+            # Source unavailable (e.g. tushare, no token — no silent akshare
+            # fallback). Skip the refresh this tick rather than crash the loop.
+            logger.warning(f"Agent data refresh skipped (data source): {e}")
+            return
         for c in missing:
             try:
                 adapter.sync_daily_quotes(c, start=start, end=end,

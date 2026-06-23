@@ -11,11 +11,11 @@ Quanti 是一个面向中国 A 股市场的开源量化交易系统，提供从*
 
 | 模块 | 功能 |
 |------|------|
-| **数据采集** | AkShare 数据源，自动同步全A股行情，SQLite 本地存储 |
+| **数据采集** | 可切换数据源（默认 Tushare 含退市股，支持 AkShare/xtdata），按 显式>DB配置>env>默认 解析；无 token 时报错提示配置 token 或显式切到 AkShare（不静默换源）；自动同步全A股行情，SQLite 本地存储 |
 | **后台同步守护** | 常驻增量同步：收盘后自动全市场扫一轮，盘中安静；停牌股/死数据源指数退避 |
 | **股票池管理** | 创建/删除股票池，批量添加/移除股票，一键同步K线数据 |
 | **技术因子** | 内置 MA/EMA/RSI/MACD/布林带/ATR/ADX 等技术指标 + 横截面因子，支持自定义 |
-| **因子 DSL（防前视）** | 声明式因子表达式（`Ref/Mean/Std/Sum/Max/Min/Log` + OHLCV/换手率）；结构上禁止引用未来数据，安全白名单解析（无 `eval`） |
+| **因子 DSL（防前视）** | 声明式因子表达式（`Ref/Mean/Std/Sum/Max/Min/Log` + OHLCV/换手率，及按公告日 PIT 合并的基本面字段 pe/pe_ttm/pb/ps/ps_ttm/total_mv/circ_mv/dv_ratio/roe/netprofit_yoy/revenue_yoy）；结构上禁止引用未来数据，安全白名单解析（无 `eval`） |
 | **策略框架** | 继承 `BaseStrategy` 即可编写策略，动态加载无需配置 |
 | **回测引擎** | 事件驱动，模拟A股T+1规则、涨跌停、佣金印花税 |
 | **走查式调参** | 网格搜参 + 多折样本外（OOS）夏普验证，跑赢默认才采纳，自动防过拟合 |
@@ -74,7 +74,7 @@ quanti backtest \
 
 | 页面 | 功能 |
 |------|------|
-| **Dashboard** | 全局股票池统计、真实数据最新日期、后台同步状态、一键下载K线（含进度条+ETA） |
+| **Dashboard** | 全局股票池统计、真实数据最新日期、后台同步状态、一键下载K线（含进度条+ETA）、**数据源切换面板（选源 tushare/akshare/xtdata + 填 Token + 测试连接 + 保存校验）** |
 | **AI Agent** | 目标设定（含每日定时运行）、启停/手动 tick、**参数优化**（走查调参）与 **因子挖掘 (LLM)** 面板、LLM 增强层开关、持仓与决策日志、手动下单 |
 | **股票池** | 创建/管理股票池，池内股票同步K线，实时进度 |
 | **选股器** | 选择选股策略，设定参数，运行选股得到评分排名 |
@@ -90,7 +90,11 @@ quanti/
 ├── data/                     # 数据层
 │   ├── database.py           #   SQLite 存储（线程安全）+ sync_jobs 任务追踪
 │   ├── provider.py           #   统一数据接口
+│   ├── source.py             #   数据源解析（显式>DB>env>默认tushare）+ 适配器工厂 + 连通性探测
 │   ├── akshare_adapter.py    #   AkShare 适配器（多源回退 + 增量同步）
+│   ├── tushare_adapter.py    #   Tushare 适配器（含退市股名册 + 原始价+adj_factor + 按日期回填 + daily_basic/财务）
+│   ├── xtdata_adapter.py     #   xtdata（QMT）适配器（经 qmt-bridge）
+│   ├── backfill.py           #   5 年逐日全市场回填（断点续 backfill_progress + 限速）
 │   └── background_sync.py    #   后台同步守护（交易时段感知 + 指数退避）
 │
 ├── agent/                    # AI Agent
@@ -212,9 +216,10 @@ class MyScreener(BaseScreener):
 
 因子用一套**防前视** DSL 声明——所有算子只能向后看，结构上无法引用未来数据；字符串形式经白名单解析（绝不 `eval`），是 LLM 生成因子的安全边界。
 
-- **数据字段**：`close / open / high / low / volume / turnover`
+- **数据字段**：`close / open / high / low / volume / turnover`；以及按公告日 (ann_date) point-in-time 合并的基本面字段 `pe / pe_ttm / pb / ps / ps_ttm / total_mv / circ_mv / dv_ratio / roe / netprofit_yoy / revenue_yoy`（无对应数据的股票求值为 NaN，安全降级，不会引发前视）
 - **函数**：`Ref(x, n)`（滞后 n 根，n≥0）、`Mean/Std/Sum/Max/Min(x, n)`（n 根滚动窗口）、`Log(x)`；算子 `+ - * /` 与一元负号（除零→NaN）
 - **防前视**：`Ref` 禁止负 shift、滚动窗口止于当前行 → 日期 t 的因子值只依赖 ≤t 的数据
+- **基本面（防前视合并）**：基本面字段在截面面板生成时按 point-in-time 合并——估值类（daily_basic：pe/pb/总市值等）按同日 `date` 对齐；财报类（roe/netprofit_yoy/revenue_yoy）用 `merge_asof(direction="backward")` 仅匹配公告日 `ann_date ≤ 当前 bar 日期` 的最新一期，因子在 t 日只看见 ≤t 已公告的财报，结构上无前视。无基本面数据时整段合并自动跳过，引用基本面的因子降级为 NaN。
 
 ```python
 from quanti.factors.expr import Close, Ref, Mean, Std, Log
@@ -240,9 +245,14 @@ expr = parse_expr("-Mean(turnover, 20)")                  # 低换手异象
 | `quanti sync --quotes --refetch` | 全量重拉历史(覆盖旧数据)——从 qfq 切到「原始价+复权因子」后须跑一次 |
 | `quanti sync --tushare-stocks` | 同步含退市股的全量名册（需 `TUSHARE_TOKEN`，可选依赖 `.[data]`） |
 | `quanti sync --tushare-quotes --delisted-only` | 补拉退市股历史行情（用于无幸存者偏差回测） |
+| `quanti sync --backfill --years 5` | 逐交易日全市场批量回填（含退市股，高效/可断点续）；需 `TUSHARE_TOKEN` |
+| `quanti sync --financials` | 逐股拉财务指标（ROE/同比增速，按公告日 PIT）；需 `TUSHARE_TOKEN`（高点数档） |
+| `quanti sync --source {tushare,akshare,xtdata}` | 指定历史源；默认按 DB app_config > env `QUANTI_DATA_SOURCE` > tushare，无 token 时报错（不静默回退，须显式 `--source akshare`） |
 | `quanti serve` | 启动 API 服务（端口 8000） |
 
 > **复权口径(Qlib 式)**:`daily_quotes` 存**原始价(不复权)+ 每日复权因子 `adj_factor`**(=后复权/原始);akshare/tushare/xtdata 三源同一口径。研究/回测/因子/策略由 `DataProvider` 读时**后复权(hfq,连续、跨除权无假跳变、可复现)**,实盘下单与图表展示用**原始价**。因子锚定上市首日 → 增量同步安全。旧库是 qfq,升级后跑一次 `quanti sync --quotes --refetch` 重置口径。
+
+> **数据源配置**:数据源可经三处切换(优先级 显式 CLI `--source` > DB `app_config`(Web/UI 设置) > env `QUANTI_DATA_SOURCE` > 默认 `tushare`);Tushare token 经 DB `app_config.data_source_token` > env `TUSHARE_TOKEN` 解析;tushare 未装或无 token 时**不静默回退**,统一报错(`DataSourceUnavailable` / UI 错误提示),要用 akshare 须显式切源——避免不同口径/纵深的源污染 DB、破坏「一票一源」。Web 端在 **Dashboard → 数据源** 面板可选源 / 填 token / 测试连接 / 保存校验。
 
 ### 无幸存者偏差回测 (survivorship-free)
 
@@ -253,16 +263,21 @@ export TUSHARE_TOKEN=...
 quanti sync --tushare-stocks
 quanti sync --tushare-quotes --delisted-only
 
+# 更高效的替代:逐交易日全市场批量回填(含退市股,可断点续)
+quanti sync --backfill --years 5
+
 # 2) 在"按日期时点正确、含退市股"的宇宙上回测
 quanti backtest --strategy my_strat --start 2021-01-01 --end 2022-12-31 --survivorship-free
 ```
+
+> **批量回填与财务同步**:`quanti sync --backfill [--years N]`(默认 5 年)按交易日逐日全市场回填(`quanti/data/backfill.py` `run_backfill`),每个交易日约 3 次调用(`pro.daily + pro.adj_factor + pro.daily_basic`),断点续传(`backfill_progress` 表记录已完成交易日,重跑时自动跳过已完成日)、按 `calls_per_min` 限速、含退市股、需 Tushare token 且**不静默回退 akshare**——比 per-stock 串行的 `--tushare-quotes --delisted-only` 明显更快。另有 `quanti sync --financials` 按 `ann_date` 拉取 PIT 安全的财务指标(ROE/同比)入 `financials` 表。
 
 手动同步通常不需要：服务启动后**后台同步守护**（`BackgroundQuoteSyncer`）会持续维护数据新鲜度——
 
 - **交易时段感知**：交易日 15:30（收盘宽限）后期待当天的 bar，自动触发一轮全市场增量同步（每只通常 1-2 根）；盘中与周末保持安静，不做无意义重拉；
 - **增量拉取**：已有数据的股票从最新 bar 续拉，只有空白股票付一次约一年的冷启动成本；
 - **退避机制**：硬失败（数据源不覆盖、网络异常）按 30 分钟 → 1h → 2h → 4h 封顶指数退避；同步成功但无新数据（停牌股）平退避 30 分钟，不会无限循环；
-- 优先级：持仓股 > 无数据 > 数据过期；状态可在 Dashboard 实时查看（含退避中数量）。
+- 优先级：挂单股 > 持仓股 > 无数据 > 数据过期；状态可在 Dashboard 实时查看（含退避中数量）。
 
 ## 配置
 
@@ -276,7 +291,7 @@ quanti backtest --strategy my_strat --start 2021-01-01 --end 2022-12-31 --surviv
 
 | 组件 | 技术 |
 |------|------|
-| 数据源 | [AkShare](https://github.com/akfamily/akshare) |
+| 数据源 | [Tushare](https://tushare.pro)（默认，可选依赖 `.[data]`）/ [AkShare](https://github.com/akfamily/akshare)（需显式切换，不静默回退）/ xtdata（QMT 实时/历史） |
 | 存储 | SQLite + WAL 模式 |
 | 后端 | FastAPI + Uvicorn + Pydantic |
 | 前端 | Vue 3 + TypeScript + ECharts + Axios |
@@ -328,12 +343,12 @@ quanti up --target 0.20 --max-drawdown -0.20 --risk medium
 
 - 在策略类里声明 `param_space`（如 `ma_cross`：`{"short_period": [3,5,8,10], "long_period": [20,30,60]}`），留空则不调参。
 - 触发：Web **AI Agent → 参数优化** 面板「运行优化」，或 CLI `quanti optimize`（`--universe / --end / --cash`）。
-- OOS 指标 = 多折走查的**平均夏普**；采纳门（全满足才 ✓）：有效折数 ≥2、OOS 成交 ≥5、调优 OOS 夏普 > 默认 + 0.1、且 > 0。默认 `train_days=365, n_folds=3, test_days=21, max_combos=64`。
+- OOS 指标 = 多折走查的**池化夏普**（合并各折 OOS 日收益后整体估一次，池化观测不足则记 0，避免短折夏普噪声）。hyperopt 采纳门（全满足才 ✓）：有效折数 ≥2、OOS 成交 ≥5、调优 OOS 夏普 > 默认 + 0.1、且 > 0；selector 侧另设最小 OOS 成交置信门（OOS 成交 <10 的夏普视为噪声，不计分也不获资金权重）。默认 `train_days=365, n_folds=3, test_days=21, max_combos=64`。
 - 采纳后参数经 `resolve_params` 自动叠加到下一轮策略初始化（`get_active_params` 仅在 `accepted` 时返回），未采纳则保持默认；结果存于各账户库的 `strategy_params` 表。
 
 ### LLM 因子挖掘
 
-让 LLM 用上文的因子 DSL 提出截面 alpha 表达式，经安全解析与 rank-IC 闸门筛选后入库，**可选**注入实盘选股排序（默认不参与）。
+让 LLM 用上文的因子 DSL 提出截面 alpha 表达式，经安全解析与 rank-IC 闸门筛选后入库，**可选**注入实盘选股排序（默认不参与）。可用字段除 OHLCV/换手率外，还包含 PIT 基本面 `pe/pe_ttm/pb/ps/ps_ttm/total_mv/circ_mv/dv_ratio/roe/netprofit_yoy/revenue_yoy`；函数限 `Ref/Mean/Std/Sum/Max/Min/Log` + `+ - * /` 与一元负号，仅整数窗口，禁止 `**`。
 
 - 触发：Web **AI Agent → 因子挖掘 (LLM)** 面板「运行挖掘」，或 CLI `quanti mine-factors`（`--universe / --n（默认 10）/ --end`）。复用 LLM 增强层的供应商配置（DeepSeek / Anthropic）。
 - **IC 闸门**（采纳条件，全满足）：`|训练IC| ≥ 0.02`、`OOS IC ≥ 0.03`、且与已采纳因子不冗余（秩相关 < 0.7）；训练/OOS 窗口留间隔防标签泄漏。
@@ -361,19 +376,20 @@ Agent 默认按固定间隔跑（`tick_interval_sec`，默认 4 小时）。设 
 
 ### MCP 接入（OpenClaw / Claude Desktop / Cursor 等）
 
-`quanti mcp` 以 stdio JSON-RPC 启动 MCP server，暴露 18 个工具：
+`quanti mcp` 以 stdio JSON-RPC 启动 MCP server，暴露 19 个工具：
 
 | 工具 | 用途 |
 |------|------|
 | `get_goal` / `set_goal` | 读写目标 |
 | `agent_start` / `agent_stop` / `agent_status` / `agent_tick` | 控制循环 |
-| `get_portfolio` / `list_positions` / `list_orders` / `list_trades` | 账户视图 |
+| `get_portfolio` / `list_orders` / `list_trades` | 账户视图 |
 | `place_order` | 手动覆盖买卖 |
 | `list_strategies` / `list_screeners` / `list_pools` | 资源清单 |
 | `run_backtest` / `run_screener` | 试跑（不影响实盘账户） |
-| `list_decisions` | 决策日志 |
+| `list_decisions` / `prune_decisions` | 决策日志（查看 / 清理 N 天前） |
 | `sync_stocks` / `sync_quotes` | 数据同步 |
-| `tune_strategy`（通过 `set_goal` 的 `params`） | 调策略参数 |
+
+> 策略调参不是独立 MCP 工具，而是通过 `set_goal` 的 `params` 传入（见 `set_goal`），故不计入上面 19 个工具。
 
 OpenClaw 配置示例（MCP client config）：
 ```json
@@ -386,6 +402,8 @@ OpenClaw 配置示例（MCP client config）：
   }
 }
 ```
+
+数据源切换也通过 Web API 暴露（挂载于 `/api`）：`GET /config/data-source`（读当前源 + `has_token`，绝不回明文 token）、`POST /config/data-source/test`（只探活不落库）、`POST /config/data-source`（先校验源 + 探活，通过才落库）。
 
 ### CLI 命令速查
 
@@ -416,6 +434,7 @@ OpenClaw 配置示例（MCP client config）：
 - [x] **防前视因子 DSL + 安全解析**（声明式表达式，禁止未来引用，无 `eval`）
 - [x] **LLM 因子挖掘**：提因子 → IC 闸门去冗余 → 自演化因子库，可选注入实盘排序（默认关）
 - [x] **可组合风控 protections**：StoplossGuard + MaxDrawdown 软锁（在 -15% 硬熔断之上）
+- [x] **回测≡实盘一致性加固（2026-06-22 审计修复）**：回测应用 -15% 组合回撤熔断（C1）、建仓复用实盘 sizing 读 signal.strength（C2）、回测滑点对齐实盘 FlatSlippage 10bps（C4）、单 bar 成交额参与率上限封顶巨单瞬时成交（B1）、PaperBroker T+1 按建仓批次冻结当日买入（F1）
 - [x] **Agent 每日定时运行**（`daily_run_time` + 仅交易日，含 Web 运行计划 控件）
 - [x] **无幸存者偏差回测数据源**（Tushare 退市股名册 + 历史行情）
 - [x] **实盘/模拟盘分库**：每账户独立交易库 + 共享行情库
@@ -423,7 +442,7 @@ OpenClaw 配置示例（MCP client config）：
 - [x] 决策日志自动保留（默认 90 天）+ 手动清理 (`quanti agent prune`)
 - [x] 前端按路由懒加载（ECharts 进 Backtest 才下载，首屏 -72%）
 - [ ] regime 检测 v1.1：observe-only 验证后按行情自动切换选股器/仓位
-- [~] 接入真实券商 API（QMT / miniQMT）—— **脚手架就绪、mock 端到端可跑、真机未验证、暂无启用入口**：`QmtBroker` + `bridge/qmt_bridge.py`（vnpy_xt 后端）+ `xtdata` 历史源；路线见 `docs/plans/2026-06-16-live-trading-qmt.md`
+- [~] 接入真实券商 API（QMT / miniQMT）—— **脚手架就绪、mock 端到端可跑、真机未验证、暂无启用入口**（已过 2026-06-22 实盘安全审计加固：require_live 门控 / 限价 tick+涨跌停 clamp / 持仓现价驱动逐票止损，G1/G4/C5/C6）：`QmtBroker` + `bridge/qmt_bridge.py`（vnpy_xt 后端）+ `xtdata` 历史源；路线见 `docs/plans/2026-06-16-live-trading-qmt.md`
 - [ ] 实时分钟级行情
 - [ ] PostgreSQL 后端
 
