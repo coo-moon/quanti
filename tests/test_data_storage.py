@@ -199,3 +199,60 @@ class TestAccountMarketSplit:
         assert len(live.list_positions()) == 0
         paper.close()
         live.close()
+
+
+class TestSourceGuard:
+    """One-source-per-code: never silently splice a different vendor onto an
+    existing series (units/adjustment differ → corrupt price line)."""
+
+    @staticmethod
+    def _bars(code, src, days=(2, 3)):
+        import pandas as pd
+        return pd.DataFrame({
+            "code": code, "date": [date(2024, 1, d) for d in days],
+            "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
+            "volume": 1e6, "amount": 1e7, "turnover": 1.0, "source": src,
+        })
+
+    def test_same_source_appends_normally(self, db):
+        db.save_daily_quotes(self._bars("000001", "tushare", (2, 3)))
+        n = db.save_daily_quotes(self._bars("000001", "tushare", (4, 5)))
+        assert n == 2
+        assert len(db.get_daily_quotes("000001", date(2024, 1, 1),
+                                       date(2024, 1, 9))) == 4
+        assert db.get_quote_source("000001") == "tushare"
+
+    def test_cross_source_is_skipped_not_spliced(self, db):
+        db.save_daily_quotes(self._bars("000001", "akshare", (2, 3)))
+        # tushare bars for the SAME code must be refused (no mix).
+        n = db.save_daily_quotes(self._bars("000001", "tushare", (4, 5)))
+        assert n == 0
+        out = db.get_daily_quotes("000001", date(2024, 1, 1), date(2024, 1, 9))
+        assert len(out) == 2                       # only the akshare bars
+        assert db.get_quote_source("000001") == "akshare"
+
+    def test_other_codes_still_written_when_one_conflicts(self, db):
+        import pandas as pd
+        db.save_daily_quotes(self._bars("000001", "akshare", (2, 3)))
+        frame = pd.concat([self._bars("000001", "tushare", (4,)),   # conflicts
+                           self._bars("600519", "tushare", (4,))])  # new code
+        n = db.save_daily_quotes(frame)
+        assert n == 1                              # only the non-conflicting code
+        assert db.get_quote_source("000001") == "akshare"
+        assert db.get_quote_source("600519") == "tushare"
+
+    def test_allow_source_mix_override(self, db):
+        db.save_daily_quotes(self._bars("000001", "akshare", (2, 3)))
+        n = db.save_daily_quotes(self._bars("000001", "tushare", (4, 5)),
+                                 allow_source_mix=True)
+        assert n == 2                              # explicit escape hatch
+
+    def test_purge_other_source_migrates_cleanly(self, db):
+        db.save_daily_quotes(self._bars("000001", "akshare", (2, 3)))
+        db.save_daily_quotes(self._bars("600519", "akshare", (2, 3)))
+        purged = db.purge_other_source_quotes("tushare")
+        assert purged == 4                         # all akshare rows gone
+        # Now tushare writes land for the same codes (no conflict).
+        n = db.save_daily_quotes(self._bars("000001", "tushare", (4, 5)))
+        assert n == 2
+        assert db.get_quote_source("000001") == "tushare"

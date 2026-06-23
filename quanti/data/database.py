@@ -198,6 +198,13 @@ class Database:
             if col not in cols:
                 self.conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        # Index on `source` AFTER the column is guaranteed (above) — keeps the
+        # one-source-per-code guard's distinct-source probe cheap. Created here,
+        # not in _create_tables, because legacy DBs lack the column until now.
+        m = "market." if self._market_db_path else ""
+        self.conn.execute(
+            f"CREATE INDEX IF NOT EXISTS {m}idx_daily_quotes_source "
+            "ON daily_quotes(source)")
         self.conn.commit()
 
     def close(self) -> None:
@@ -563,8 +570,42 @@ class Database:
 
     # --- Daily quote operations ---
 
-    def save_daily_quotes(self, df: pd.DataFrame) -> int:
-        """Save daily quotes from DataFrame. Returns number of rows inserted."""
+    def save_daily_quotes(self, df: pd.DataFrame,
+                          *, allow_source_mix: bool = False) -> int:
+        """Save daily quotes from DataFrame. Returns number of rows inserted.
+
+        One-source-per-code guard: a code's bars must all come from ONE vendor —
+        different vendors differ in unit/adjustment conventions, so splicing
+        (e.g. appending tushare onto an akshare series) corrupts the price line.
+        By default, rows for codes that ALREADY hold bars from a DIFFERENT source
+        are dropped with a warning (no silent mix); pass `allow_source_mix=True`
+        to override, or migrate cleanly first via `purge_other_source_quotes`
+        (what `quanti sync --backfill` does). Frames are single-source per
+        adapter; frames without a `source` column (legacy/tests) skip the guard."""
+        if df is None or len(df) == 0:
+            return 0
+        incoming = ""
+        if "source" in df.columns:
+            srcs = {str(s) for s in df["source"].dropna().unique() if str(s)}
+            incoming = next(iter(srcs)) if len(srcs) == 1 else ""
+        if incoming and not allow_source_mix:
+            # Cheap (source-indexed) probe: does the table hold ANY other vendor?
+            others = self.conn.execute(
+                "SELECT 1 FROM daily_quotes WHERE source<>'' AND source<>? LIMIT 1",
+                (incoming,)).fetchone()
+            if others is not None:
+                conflict = {c for (c,) in self.conn.execute(
+                    "SELECT DISTINCT code FROM daily_quotes "
+                    "WHERE source<>'' AND source<>?", (incoming,)).fetchall()}
+                hit = {str(c) for c in df["code"].unique()} & conflict
+                if hit:
+                    df = df[~df["code"].astype(str).isin(hit)]
+                    logger.warning(
+                        "save_daily_quotes: 跳过 %d 只已有异源历史的股票"
+                        "(本次源=%s),拒绝混源拼接;先跑 `quanti sync --backfill` "
+                        "迁移到该源,或设 allow_source_mix=True", len(hit), incoming)
+                    if len(df) == 0:
+                        return 0
         records = []
         for _, row in df.iterrows():
             d = row["date"]
@@ -612,6 +653,18 @@ class Database:
             (code,),
         ).fetchone()
         return row[0] if row else None
+
+    def purge_other_source_quotes(self, keep_source: str) -> int:
+        """Delete daily_quotes rows tagged with a vendor OTHER than `keep_source`
+        (untagged '' rows are left alone). One-shot clean migration to a single
+        source — `quanti sync --backfill` runs this so the one-source-per-code
+        guard then writes the new vendor's full history without conflicts.
+        Returns rows deleted."""
+        cur = self.conn.execute(
+            "DELETE FROM daily_quotes WHERE source<>'' AND source<>?",
+            (keep_source,))
+        self.conn.commit()
+        return cur.rowcount
 
     # --- Fundamentals (daily_basic + financials, point-in-time) ---
     _DAILY_BASIC_COLS = ("pe", "pe_ttm", "pb", "ps", "ps_ttm",
