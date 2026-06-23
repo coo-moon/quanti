@@ -97,11 +97,13 @@ class ScreenResponse(BaseModel):
 
 @router.post("/sync/quotes")
 async def sync_quotes(body: SyncRequest, request: Request):
-    """Sync daily quotes for given stock codes from AkShare."""
-    from quanti.data.source import make_quote_adapter
+    """Sync daily quotes for given stock codes from the configured source."""
+    from quanti.data.source import try_make_quote_adapter
 
     db = request.app.state.db
-    adapter = make_quote_adapter(db)
+    adapter, src_err = try_make_quote_adapter(db)
+    if src_err:
+        return SyncResult(synced={}, errors={"_source": src_err})
     results = {}
     errors = {}
     for code in body.codes:
@@ -137,13 +139,16 @@ async def sync_quotes_async(body: SyncRequest, request: Request):
 
 async def _run_quotes_sync(job_id: str, codes: list[str], db) -> None:
     from datetime import date, timedelta
-    from quanti.data.source import make_quote_adapter
+    from quanti.data.source import try_make_quote_adapter
     import asyncio
     from functools import partial
 
     end_d = date.today()
     start_d = end_d - timedelta(days=365)
-    adapter = make_quote_adapter(db)
+    adapter, src_err = try_make_quote_adapter(db)
+    if src_err:
+        db.update_sync_job(job_id, 0, "error", {"_source": src_err})
+        return
     errors: dict[str, str] = {}
     loop = asyncio.get_event_loop()
 
@@ -269,10 +274,12 @@ async def background_sync_resume(request: Request):
 @router.post("/sync/stocks")
 async def sync_stock_list(request: Request):
     """Sync the full A-share stock list (name, industry, exchange, list_date)."""
-    from quanti.data.source import make_quote_adapter
+    from quanti.data.source import try_make_quote_adapter
 
     db = request.app.state.db
-    adapter = make_quote_adapter(db)
+    adapter, src_err = try_make_quote_adapter(db)
+    if src_err:
+        return {"synced": 0, "error": src_err, "message": src_err}
     count = adapter.sync_stock_list()
     return {"synced": count, "message": f"成功同步 {count} 只股票到股票池"}
 
@@ -405,13 +412,16 @@ async def sync_pool_stocks(name: str, request: Request):
 async def _run_pool_sync(job_id: str, pool_name: str, codes: list[str], db) -> None:
     """Background task to sync pool stocks and update progress."""
     from datetime import date, timedelta
-    from quanti.data.source import make_quote_adapter
+    from quanti.data.source import try_make_quote_adapter
     import asyncio
     from functools import partial
 
     end_d = date.today()
     start_d = end_d - timedelta(days=365)
-    adapter = make_quote_adapter(db)
+    adapter, src_err = try_make_quote_adapter(db)
+    if src_err:
+        db.update_sync_job(job_id, 0, "error", {"_source": src_err})
+        return
     errors: dict[str, str] = {}
     loop = asyncio.get_event_loop()
 
@@ -566,16 +576,21 @@ async def run_screen(body: ScreenRequest, request: Request):
     start_d = end_d - timedelta(days=int(body.lookback_days * 1.5))  # extra margin
 
     # Auto-sync: fetch data for stocks with NO bars only (skip if already has data)
-    from quanti.data.source import make_quote_adapter
+    from quanti.data.source import try_make_quote_adapter
     import asyncio
 
-    adapter = make_quote_adapter(db)
+    # If the source is unavailable (e.g. tushare, no token — no silent akshare
+    # fallback), skip auto-sync and run the screener on whatever data exists.
+    adapter, src_err = try_make_quote_adapter(db)
+    if src_err:
+        logger.warning(f"Screener auto-sync skipped (data source): {src_err}")
     # Only sync stocks that have NO data at all (len == 0), skip stocks with partial data
     codes_to_sync = []
-    for code in codes:
-        bars = provider.get_daily_bars(code, start_d, end_d)
-        if len(bars) == 0:
-            codes_to_sync.append(code)
+    if adapter is not None:
+        for code in codes:
+            bars = provider.get_daily_bars(code, start_d, end_d)
+            if len(bars) == 0:
+                codes_to_sync.append(code)
 
     if codes_to_sync:
         # Limit to first 50 to avoid overwhelming the network; rest will be synced on next run
