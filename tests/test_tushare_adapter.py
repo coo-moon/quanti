@@ -197,3 +197,55 @@ def test_methods_raise_clearly_without_token(db, monkeypatch):
     adapter = TushareAdapter(db)
     with pytest.raises(RuntimeError):
         adapter.sync_stock_list()
+
+
+def test_retry_patient_waits_out_per_minute_limit(monkeypatch):
+    """Patient mode sleeps ~one minute on a per-minute rate limit, then retries
+    (so a 1/min endpoint like stock_basic eventually succeeds)."""
+    import quanti.data.tushare_adapter as ta
+    slept = []
+    monkeypatch.setattr(ta.time, "sleep", lambda s: slept.append(s))
+    n = {"i": 0}
+
+    def flaky(**kw):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise Exception("抱歉，您访问接口(stock_basic)频率超限(1次/分钟)")
+        return "ok"
+
+    assert ta.TushareAdapter._retry(flaky, _patient=True) == "ok"
+    assert ta.RATE_LIMIT_WAIT in slept            # waited the per-minute window
+
+
+def test_retry_nonpatient_uses_short_backoff(monkeypatch):
+    """Non-patient (API) fails fast: short backoff only, never the 60s wait."""
+    import quanti.data.tushare_adapter as ta
+    slept = []
+    monkeypatch.setattr(ta.time, "sleep", lambda s: slept.append(s))
+
+    def always(**kw):
+        raise Exception("抱歉，频率超限(1次/分钟)")
+
+    with pytest.raises(Exception, match="频率超限"):
+        ta.TushareAdapter._retry(always)          # non-patient
+    assert slept and all(s < ta.RATE_LIMIT_WAIT for s in slept)
+
+
+def test_sync_stock_list_patient_survives_rate_limit(db, monkeypatch):
+    """With patient=True, a stock_basic that's rate-limited on the first hit of
+    D/P still completes (the retry waits out the window — sleep mocked here)."""
+    import quanti.data.tushare_adapter as ta
+    monkeypatch.setattr(ta.time, "sleep", lambda s: None)
+
+    class RLPro(FakePro):
+        def __init__(self):
+            self.hits = {}
+
+        def stock_basic(self, list_status, fields):
+            self.hits[list_status] = self.hits.get(list_status, 0) + 1
+            if self.hits[list_status] == 1 and list_status in ("D", "P"):
+                raise Exception("抱歉，您访问接口(stock_basic)频率超限(1次/分钟)")
+            return FakePro.stock_basic(self, list_status, fields)
+
+    n = TushareAdapter(db, pro=RLPro()).sync_stock_list(patient=True)
+    assert n == 2                                  # L(000001) + D(600001)

@@ -36,8 +36,9 @@ class XtdataAdapter:
         self._db = db
         self._client: BridgeClient = client or HttpBridgeClient(bridge_url)
 
-    def sync_stock_list(self) -> int:
-        """Fetch + save the A-share list from xtdata. Returns count saved."""
+    def sync_stock_list(self, patient: bool = False) -> int:
+        """Fetch + save the A-share list from xtdata. Returns count saved.
+        `patient` accepted for adapter-signature parity (xtdata ignores it)."""
         data = self._client.get("/data/stock_list")
         count = 0
         for s in data.get("stocks", []):

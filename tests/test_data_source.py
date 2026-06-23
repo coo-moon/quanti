@@ -144,6 +144,23 @@ async def test_get_data_source_never_leaks_token(db, app, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sync_stocks_rate_limit_returns_clean_error_not_500(db, app, monkeypatch):
+    """A rate-limited stock_basic must yield a clean error payload, not a 500."""
+    class Boom:
+        def sync_stock_list(self):
+            raise Exception("抱歉，您访问接口(stock_basic)频率超限(1次/分钟)")
+
+    monkeypatch.setattr(src, "try_make_quote_adapter",
+                        lambda d, s=None: (Boom(), None))
+    async with _client(app) as c:
+        r = await c.post("/api/sync/stocks")
+    assert r.status_code == 200                 # clean, NOT 500
+    body = r.json()
+    assert body["synced"] == 0
+    assert "频率超限" in body["error"]
+
+
+@pytest.mark.asyncio
 async def test_set_data_source_persists_only_when_probe_ok(db, app, monkeypatch):
     monkeypatch.setattr(src, "probe_source",
                         lambda s, t=None, d=None: (False, "bad token"))

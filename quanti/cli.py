@@ -111,7 +111,9 @@ def cmd_sync(args):
 
     if args.stocks:
         logger.info("Syncing stock list...")
-        count = make_stock_list_adapter(db, source).sync_stock_list()
+        # patient=True: CLI can wait out per-minute rate limits (tushare
+        # stock_basic is 1/min on low tiers → L/D/P takes ~2 min).
+        count = make_stock_list_adapter(db, source).sync_stock_list(patient=True)
         logger.info(f"Synced {count} stocks")
 
     if getattr(args, "backfill", False):
