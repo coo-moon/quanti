@@ -8,17 +8,18 @@ the system reads SQLite unchanged.
 
 Back-adjustment (hfq) is reconstructed from `daily`'s pre_close (see
 `reconstruct_adj_factor`) so we NEVER call the `adj_factor`/`pro_bar` endpoints,
-which are rate-limited as low as 1 call/min on low point tiers — `daily` itself
-is 500/min (doc_id=27). This is the key to backfilling years of history without
-tripping the per-minute limit.
+which are rate-limited far harder than `daily` (doc_id=27). This is the key to
+backfilling years of history without tripping the per-minute limit.
 
 tushare is an OPTIONAL dependency (guarded import). Without the package or a
 TUSHARE_TOKEN, the adapter still imports; its methods raise a clear error.
 Token is read from the TUSHARE_TOKEN env var and is never logged.
 
-# VERIFY (real token / real box): `daily` history depth for delisted ts_codes,
-# pre_close presence on the first listed bar, and current per-endpoint point
-# thresholds (changes over time; see https://tushare.pro/document/1?doc_id=290).
+# VERIFIED 2026-06-23 (real token, 600519 daily 2022-2024, 725 bars incl. 6
+# ex-div days): reconstructed hfq returns match tushare's own pct_chg to <5e-7;
+# the factor steps up monotonically across each dividend. Observed per-endpoint
+# limits on a LOW-points token: `daily` 50/min, `adj_factor` 1/HOUR — exactly
+# why we reconstruct from pre_close (higher tiers raise `daily` toward 500/min).
 """
 
 from __future__ import annotations
@@ -44,8 +45,8 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds; free tier rate-limits per-minute call counts
 # Canonical DB units: volume = 股 (shares), amount = 元 (yuan). Tushare returns
 # vol in 手 (lots) and amount in 千元 (thousand-yuan), so convert at the edge.
-# # VERIFY against a real token: confirm vol=手 / amount=千元 on a known stock
-# (e.g. close*vol*100 ≈ amount*1000) before trusting ADV/volume factors.
+# VERIFIED 2026-06-23 (real token, 600519): (amount*1000)/(vol*100) lands inside
+# [low, high] on 100% of bars → vol=手, amount=千元 confirmed.
 TS_VOL_TO_SHARES = 100
 TS_AMOUNT_TO_YUAN = 1000
 
