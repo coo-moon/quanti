@@ -102,7 +102,6 @@ class TushareAdapter:
         self._db = db
         self._token = token
         self._pro = pro            # injected in tests; lazily built otherwise
-        self.last_basic_ok = None  # whether the last by-date daily_basic succeeded
 
     # --- ts_code <-> code mapping ---
 
@@ -273,8 +272,7 @@ class TushareAdapter:
 
     def sync_daily_quotes_by_date(self, trade_date: date,
                                   seed_state: dict | None = None,
-                                  patient: bool = False,
-                                  with_basic: bool = True) -> int:
+                                  patient: bool = False) -> int:
         """Pull the WHOLE market for ONE trading day — the efficient bulk path.
         Returns rows saved. Delisted names appear in pro.daily for dates they
         traded.
@@ -284,34 +282,28 @@ class TushareAdapter:
         is 500/min). `seed_state` is a caller-owned {code: (raw_close, factor)}
         map carried across days so the cumulative factor splices day-to-day
         WITHOUT re-querying the DB or re-fetching history; on a miss it seeds
-        from the DB's last stored bar (fresh anchor 1.0 if none). `patient` waits
-        out per-minute limits — applied to the ESSENTIAL `daily` call only.
-
-        `with_basic` controls the OPTIONAL daily_basic (turnover + valuation):
-        it is fetched in a SINGLE fast attempt (never patient/retried — it can
-        be ~1/min even at high tiers and would otherwise waste a minute per day);
-        `self.last_basic_ok` records the outcome so a bulk caller can auto-disable
-        it after repeated failures. Set with_basic=False to skip it entirely."""
+        from the DB's last stored bar (fresh anchor 1.0 if none). turnover +
+        valuation come from daily_basic when that endpoint is available
+        (gracefully skipped otherwise). `patient` waits out per-minute rate
+        limits (set by the bulk backfill so a slow `daily` cap doesn't drop days)."""
         pro = self._ensure_pro()
         td = trade_date.strftime("%Y%m%d")
         raw = self._retry(pro.daily, trade_date=td, _patient=patient)
         if raw is None or raw.empty:
             return 0
-        # daily_basic feeds BOTH the daily_basic table (valuation factors) and the
-        # quotes' turnover. ONE fast attempt — no retry/patient: it's optional and
-        # heavily rate-limited, so we never block the quote backfill on it.
+        # daily_basic (point-tier gated) feeds BOTH the daily_basic table (P4
+        # valuation factors) and the quotes' turnover — one call, not two.
+        # Degrade gracefully (turnover 0, no valuation) if it's unavailable.
         turn_by_code: dict[str, float] = {}
         basic = None
-        if with_basic:
-            try:
-                basic = pro.daily_basic(
-                    trade_date=td,
-                    fields=("ts_code,turnover_rate,pe,pe_ttm,pb,ps,ps_ttm,"
-                            "dv_ratio,total_mv,circ_mv"))
-            except Exception as e:  # noqa: BLE001 - optional; skip this day's basic
-                logger.debug("daily_basic unavailable for %s: %s", td, e)
-        self.last_basic_ok = basic is not None and not basic.empty
-        if self.last_basic_ok:
+        try:
+            basic = self._retry(
+                pro.daily_basic, trade_date=td, _patient=patient,
+                fields=("ts_code,turnover_rate,pe,pe_ttm,pb,ps,ps_ttm,"
+                        "dv_ratio,total_mv,circ_mv"))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("daily_basic unavailable for %s: %s", td, e)
+        if basic is not None and not basic.empty:
             turn_by_code = {str(r["ts_code"]): float(r["turnover_rate"] or 0)
                             for _, r in basic.iterrows()}
             self._save_daily_basic_frame(basic, trade_date)

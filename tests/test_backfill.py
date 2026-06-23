@@ -28,11 +28,8 @@ class _FakeAdapter:
     def sync_stock_list(self, patient: bool = False) -> int:
         return 0
 
-    last_basic_ok = True
-
     def sync_daily_quotes_by_date(self, d: date, seed_state=None,
-                                  patient: bool = False,
-                                  with_basic: bool = True) -> int:
+                                  patient: bool = False) -> int:
         self.seen.append(d)
         if d == date(2024, 1, 3):
             raise RuntimeError("boom")   # one transient failure
