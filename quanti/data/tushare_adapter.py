@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds; free tier rate-limits per-minute call counts
+RATE_LIMIT_WAIT = 61  # seconds to wait out a per-minute rate limit (patient mode)
 # Canonical DB units: volume = 股 (shares), amount = 元 (yuan). Tushare returns
 # vol in 手 (lots) and amount in 千元 (thousand-yuan), so convert at the edge.
 # VERIFIED 2026-06-23 (real token, 600519): (amount*1000)/(vol*100) lands inside
@@ -149,6 +150,11 @@ class TushareAdapter:
 
     @staticmethod
     def _retry(fn, *args, **kwargs):
+        # _patient (popped, not forwarded): on a PER-MINUTE rate-limit, wait out
+        # the ~60s window and retry instead of the short backoff. Used by patient
+        # callers (CLI/backfill) where a slow token (e.g. stock_basic 1/min) is
+        # worth waiting for; API stays non-patient so it fails fast + clean.
+        patient = kwargs.pop("_patient", False)
         last_err: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -158,22 +164,28 @@ class TushareAdapter:
                 logger.warning("tushare call attempt %d/%d failed: %s",
                                attempt, MAX_RETRIES, e)
                 if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY * attempt)
+                    msg = str(e)
+                    if patient and "频率超限" in msg and "分钟" in msg:
+                        time.sleep(RATE_LIMIT_WAIT)   # let the 1-min window reset
+                    else:
+                        time.sleep(RETRY_DELAY * attempt)
         if last_err is not None:
             raise last_err
         return None
 
     # --- public API ---
 
-    def sync_stock_list(self) -> int:
+    def sync_stock_list(self, patient: bool = False) -> int:
         """Fetch L (listed) + D (delisted) + P (paused) rosters and upsert each,
-        carrying delist_date for the delisted ones. Returns count saved."""
+        carrying delist_date for the delisted ones. Returns count saved.
+        `patient=True` waits out per-minute rate limits (stock_basic can be
+        1/min on low tiers → ~2 min for all three) — set it for CLI, not the API."""
         pro = self._ensure_pro()
         count = 0
         for status in ("L", "D", "P"):
             df = self._retry(
                 pro.stock_basic, list_status=status,
-                fields="ts_code,name,list_date,delist_date")
+                fields="ts_code,name,list_date,delist_date", _patient=patient)
             if df is None or df.empty:
                 continue
             for _, row in df.iterrows():

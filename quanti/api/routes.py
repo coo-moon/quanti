@@ -307,7 +307,16 @@ async def sync_stock_list(request: Request):
     adapter, src_err = try_make_quote_adapter(db)
     if src_err:
         return {"synced": 0, "error": src_err, "message": src_err}
-    count = adapter.sync_stock_list()
+    # Fail fast + clean: roster sync is a few stock_basic calls, which on a
+    # low-tier tushare token is 1/min. Don't 500 / block the request waiting out
+    # the limit — return a clear message; the CLI (`quanti sync --stocks`) syncs
+    # patiently (waits the per-minute window).
+    try:
+        count = adapter.sync_stock_list()
+    except Exception as e:  # noqa: BLE001
+        msg = (f"同步失败: {e}。若为频率超限,请稍后重试,"
+               f"或用 CLI `quanti sync --stocks`(自动按分钟错峰)。")
+        return {"synced": 0, "error": str(e), "message": msg}
     return {"synced": count, "message": f"成功同步 {count} 只股票到股票池"}
 
 

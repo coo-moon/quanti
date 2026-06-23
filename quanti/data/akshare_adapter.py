@@ -143,8 +143,10 @@ class AkShareAdapter:
 
         self._db.upsert_stock(code, name, exchange, list_date, industry)
 
-    def sync_stock_list(self) -> int:
+    def sync_stock_list(self, patient: bool = False) -> int:
         """Fetch and save A-share stock list (code + name only). Returns count.
+        `patient` accepted for adapter-signature parity (tushare uses it for
+        per-minute rate limits); akshare ignores it.
 
         Retries on network failure — AkShare upstream occasionally resets
         connections and a one-shot failure shouldn't bring down the bootstrap.

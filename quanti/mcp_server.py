@@ -416,7 +416,10 @@ def _handle_tool_call(ctx: QuantiContext, name: str, args: dict[str, Any]) -> An
         adapter, src_err = try_make_quote_adapter(ctx.db)
         if src_err:
             return {"error": src_err}
-        return {"synced": adapter.sync_stock_list()}
+        try:
+            return {"synced": adapter.sync_stock_list()}
+        except Exception as e:  # noqa: BLE001 - rate-limit/upstream → clean error
+            return {"error": str(e)}
     if name == "sync_quotes":
         from quanti.data.source import try_make_quote_adapter
         adapter, src_err = try_make_quote_adapter(ctx.db)
