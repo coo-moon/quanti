@@ -58,21 +58,22 @@ def run_backfill(db, *, years: int = 5, end: date | None = None,
     50/min on low-points tokens, 500/min on higher tiers) — set it at/under your
     token's `daily` limit. Even if over-paced, the by-date sweep retries
     patiently (waits out the minute) so days aren't dropped."""
-    from quanti.data.source import make_quote_adapter
+    from quanti.data.source import make_quote_adapter, make_stock_list_adapter
 
     end = end or date.today()
     start = end - timedelta(days=365 * years)
-    # Roster (universe / point-in-time membership incl. delisted) from akshare —
-    # FREE, survivorship-free, and independent of the quote source's stock_basic
-    # (which is rate-limited to ~1/hour on low tokens). Best-effort: the by-date
-    # `daily` sweep returns every stock that traded regardless, so a roster blip
-    # doesn't block the quote backfill.
+    # Roster (universe / point-in-time membership incl. delisted) from the
+    # CONFIGURED source — tushare's stock_basic carries delist_date too. Patient
+    # (waits out per-minute limits) + best-effort: the by-date `daily` sweep
+    # returns every stock regardless, so a roster blip never blocks the quote
+    # backfill, and we never silently swap vendors. Free akshare roster remains
+    # available via `quanti sync --stocks --source akshare`.
     try:
-        from quanti.data.akshare_adapter import AkShareAdapter
-        n_roster = AkShareAdapter(db).sync_stock_list()
-        logger.info("roster: %d 只(akshare,含退市股)", n_roster)
+        n_roster = make_stock_list_adapter(db, source).sync_stock_list(patient=True)
+        logger.info("roster: %d 只(%s,含退市股)", n_roster, source or "tushare")
     except Exception as e:  # noqa: BLE001 - roster is metadata; quotes don't need it
-        logger.warning("roster 同步跳过(%s)——逐日 daily 仍覆盖全市场", e)
+        logger.warning("roster 同步失败跳过(%s)——逐日 daily 仍覆盖全市场;"
+                       "可单独 `quanti sync --stocks`", e)
     adapter = make_quote_adapter(db, source, allow_fallback=False)
     if not hasattr(adapter, "sync_daily_quotes_by_date"):
         raise RuntimeError(f"source {source!r} has no by-date backfill path")

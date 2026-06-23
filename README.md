@@ -246,7 +246,7 @@ expr = parse_expr("-Mean(turnover, 20)")                  # 低换手异象
 | `quanti sync --tushare-stocks` | 同步含退市股的全量名册（需 `TUSHARE_TOKEN`，可选依赖 `.[data]`） |
 | `quanti sync --tushare-quotes --delisted-only` | 补拉退市股历史行情（用于无幸存者偏差回测） |
 | `quanti sync --backfill --years 5` | 逐交易日全市场批量回填（含退市股，高效/可断点续）；需 `TUSHARE_TOKEN` |
-| `quanti sync --financials` | 拉财务指标（ROE/净利/营收及同比，按公告日 PIT）——**akshare 业绩报表,免费、无需 token**,按 `--years` 覆盖报告期 |
+| `quanti sync --financials` | 拉财务指标（ROE/同比，按公告日 PIT）。默认 **tushare `fina_indicator`**（真实 ann_date，需 2000 积分）；`--source akshare` 用免费 `业绩报表`（额外含净利/营收绝对值） |
 | `quanti sync --source {tushare,akshare,xtdata}` | 指定历史源；默认按 DB app_config > env `QUANTI_DATA_SOURCE` > tushare，无 token 时报错（不静默回退，须显式 `--source akshare`） |
 | `quanti sync --clear {quotes,daily_basic,financials,all}` | 删除已同步数据，**默认预演(dry-run 只报行数)，加 `--yes` 才真删**；可配 `--codes` 限定股票、`--source` 限定行情源；全量清 quotes 时同步重置回填断点 |
 | `quanti serve` | 启动 API 服务（端口 8000） |
@@ -260,17 +260,17 @@ expr = parse_expr("-Mean(turnover, 20)")                  # 低换手异象
 ### 无幸存者偏差回测 (survivorship-free)
 
 ```bash
-# 1a) 含退市股的全量名册 —— akshare 免费、无需 token(SH/SZ/BJ 在市 + SH/SZ 退市,
-#     带真实上市日/退市日)。tushare stock_basic 在低积分档限频严重,首选 akshare:
-quanti sync --stocks --source akshare
-
-# 1b) 退市股历史行情(需 TUSHARE_TOKEN;PowerShell: $env:TUSHARE_TOKEN="...")
+# 1) 含退市股的全量名册 + 5 年历史(需 TUSHARE_TOKEN;PowerShell: $env:TUSHARE_TOKEN="...")
 export TUSHARE_TOKEN=...
-quanti sync --backfill --years 5      # 逐交易日全市场回填(含退市股,可断点续)
+quanti sync --stocks                   # 名册(tushare stock_basic,含退市股,需 2000 积分)
+quanti sync --backfill --years 5       # 逐交易日全市场回填(含退市股,可断点续)
+#   ↑ 积分不足?名册可免费走 akshare: quanti sync --stocks --source akshare
 
 # 2) 在"按日期时点正确、含退市股"的宇宙上回测
 quanti backtest --strategy my_strat --start 2021-01-01 --end 2022-12-31 --survivorship-free
 ```
+
+> 退市股**历史行情**只能靠 tushare 逐日 `daily`(每天返回全市场,含当天在市后退市的票);akshare 的免费源(东财/新浪)退市即下架,只提供退市股**名册**,不提供其历史行情。
 
 > **批量回填与财务同步**:`quanti sync --backfill [--years N]`(默认 5 年)按交易日逐日全市场回填(`quanti/data/backfill.py` `run_backfill`),每个交易日约 2 次调用(`pro.daily + pro.daily_basic`)。**复权因子不再调 `adj_factor` 接口**(低积分档限 1 次/分钟,是回填瓶颈),改由 `pro.daily` 自带的 `pre_close` 重建(`tushare_adapter.reconstruct_adj_factor`:`f[t]=f[t-1]·close[t-1]/pre_close[t]`,增量同步用上一根已存 bar 续接、接缝无跳变),只用限额宽松的 `daily`(500 次/分钟)。断点续传(`backfill_progress` 表记录已完成交易日,重跑自动跳过)、按 `calls_per_min` 限速、含退市股、需 Tushare token 且**不静默回退 akshare**——比 per-stock 串行的 `--tushare-quotes --delisted-only` 明显更快。后台同步守护对 tushare 改走**逐日 top-up**(整市场一天 ≈2 次调用,而非逐股两次×数千只),避免触发频率限制。另有 `quanti sync --financials`(默认 5 年报告期)从 **akshare 业绩报表**(免费、无需 token,按报告期全市场一次拉取)灌入 `financials` 表:ROE、净利润/营收**绝对值**及同比增速。`ann_date` 取该报告期的**法定披露截止日**(Q1→04-30、中报→08-31、Q3→10-31、年报→次年 04-30),而非 akshare 不可靠的「最新公告日期」字段——这样 `merge_asof(ann_date)` 严格防前视(财报必在截止日前公开,保守不漏未来)。财报与行情源正交(`financials` 独立表,不受「一票一源」约束),故 tushare 行情 + akshare 财报可干净共用。
 

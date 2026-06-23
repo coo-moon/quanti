@@ -141,21 +141,40 @@ def cmd_sync(args):
                     f"{res.dates_skipped} skipped, {len(res.errors)} errors")
 
     if getattr(args, "financials", False):
-        # Financials come from akshare 业绩报表 (free, no token, whole-market per
-        # report period, PIT by 公告日) — independent of the quote source, and
-        # works even when tushare's fina_indicator is permission-gated.
-        from quanti.data.akshare_adapter import AkShareAdapter
-        years = getattr(args, "years", 5)
-        periods = _report_periods(years)
-        ak_adapter = AkShareAdapter(db)
-        logger.info(f"Syncing financials over {len(periods)} report periods "
-                    f"(akshare 业绩报表, PIT by 公告日)...")
-        total = 0
-        for p in periods:
-            total += ak_adapter.sync_financials_by_period(p)
-            logger.info(f"  {p}: cumulative {total} rows")
-        logger.info(f"Financials sync complete: {total} rows "
-                    f"over {len(periods)} periods")
+        # Default: tushare fina_indicator (per-code, REAL ann_date — precise PIT;
+        # needs 2000-pt tier). `--source akshare` uses the free 业绩报表 (whole-
+        # market per report period, also carries net_profit/revenue absolutes,
+        # ann_date = statutory deadline).
+        if (source or "").lower() == "akshare":
+            from quanti.data.akshare_adapter import AkShareAdapter
+            years = getattr(args, "years", 5)
+            periods = _report_periods(years)
+            ak_adapter = AkShareAdapter(db)
+            logger.info(f"Syncing financials over {len(periods)} report periods "
+                        f"(akshare 业绩报表, PIT by 公告日)...")
+            total = 0
+            for p in periods:
+                total += ak_adapter.sync_financials_by_period(p)
+            logger.info(f"Financials sync complete: {total} rows (akshare)")
+        else:
+            import time as _time
+            adapter = make_quote_adapter(db, source or "tushare")
+            if not hasattr(adapter, "sync_financials"):
+                logger.error("source 无 financials 支持;用 --source akshare(免费)")
+            else:
+                codes = [s.code for s in db.list_stocks()]
+                logger.info(f"Syncing financials for {len(codes)} stocks "
+                            f"(tushare fina_indicator, PIT by 真实 ann_date)...")
+                total = 0
+                for i, code in enumerate(codes):
+                    try:
+                        total += adapter.sync_financials(code, patient=True)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"  {code}: {e}")
+                    if (i + 1) % 100 == 0:
+                        logger.info(f"  {i + 1}/{len(codes)} (rows={total})")
+                    _time.sleep(0.2)  # gentle pacing under the per-min cap
+                logger.info(f"Financials sync complete: {total} rows (tushare)")
 
     if args.quotes:
         adapter = make_quote_adapter(db, source)
