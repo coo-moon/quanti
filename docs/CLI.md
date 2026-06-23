@@ -90,6 +90,25 @@ quanti sync --clear quotes --source akshare --yes    # 只删某源日线
 > **复权**:`daily_quotes` 存原始价 + 每日 `adj_factor`;tushare 路径由 `daily` 的 `pre_close` 重建因子(不调限频的 `adj_factor` 接口)。读时后复权(hfq),下单/图表用原始价。
 > **一票一源**:`save_daily_quotes` 默认拒绝把异源 bar 拼到同一只票;`--backfill` 开跑前一次性清异源历史做干净迁移。
 
+### Tushare 限频与积分(重要)
+
+tushare 各接口按**积分**分档限频。下表是一个**低积分 token 的实测限额**(2026-06-23;你的档位可能不同,以报错信息为准):
+
+| 接口 | 用于 | 实测限额(低档) | 系统行为 |
+|------|------|----------|---------|
+| `daily` | 日线行情(`--quotes`/`--backfill`) | **50 次/分钟** | 5 年逐日回填 ≈ 1250 天 / 50 ≈ **25 分钟** |
+| `stock_basic` | 名册(`--stocks`) | **1 次/分钟** | L/D/P 三次调用,CLI 自动错峰 ≈ **2 分钟** |
+| `daily_basic` | 估值(PE/PB/市值…) | 可用 | 回填时随 `daily` 一并拉 |
+| `adj_factor` | 复权因子 | **1 次/小时** | **不调用**——改由 `pre_close` 重建 |
+| `fina_indicator` | 财报 | **无权限**(需更高积分) | 财报改走免费 **akshare**(`--financials`) |
+
+**关键建议**:
+
+- **名册同步用 CLI,别用 Web 按钮**。`quanti sync --stocks` 会**按分钟错峰耐心重试**(`stock_basic` 1/min 下约 2 分钟自动完成);Web 的「同步股票列表」为不阻塞请求采用**快失败**——撞限频时只返回错误提示(不再 500),不会自动等。
+- **回填期间别让其它进程抢同一 token**(另一台机/notebook/同时开着的 Web 后台同步),否则 `daily` 50/min 会被分食、频频限频。必要时先在 Web「数据源」面板或 `/sync/background/pause` 暂停后台守护。
+- **财报无需 token**:`--financials` 走 akshare,免费、不占 tushare 配额。
+- 想要更高频次(更快回填、解锁 `fina_indicator`):到 tushare 后台**提升积分**(见报错里的 doc_id=108 链接)。
+
 ---
 
 ## `backtest` — 回测
