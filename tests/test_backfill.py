@@ -45,6 +45,21 @@ def fake_adapter(monkeypatch):
     return a
 
 
+def test_backfill_skips_roster_when_already_present(db, fake_adapter, monkeypatch):
+    """A survivorship-free roster already on file (delisted names) → backfill
+    skips the slow ~1/min stock_basic re-sync."""
+    db.upsert_stock("600001", "邯郸钢铁", "SH", date(1998, 1, 22), "",
+                    delist_date=date(2009, 12, 29))
+    calls = {"n": 0}
+    orig = fake_adapter.sync_stock_list
+    monkeypatch.setattr(fake_adapter, "sync_stock_list",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         orig(*a, **k))[1])
+    run_backfill(db, years=1, end=date(2024, 1, 4), source="tushare",
+                 sleep_fn=lambda _x: None)
+    assert calls["n"] == 0              # roster sync skipped
+
+
 def test_backfill_runs_and_records_progress(db, fake_adapter):
     res = run_backfill(db, years=1, end=date(2024, 1, 4), source="tushare",
                        sleep_fn=lambda _x: None)
