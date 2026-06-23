@@ -44,6 +44,23 @@ class StubAdapter:
         return int(result)
 
 
+class ByDateStubAdapter:
+    """tushare-like adapter exposing the by-date sweep. The daemon must route to
+    this (whole-market-per-day) instead of per code on such sources."""
+
+    def __init__(self, db, fail_after: int | None = None, rows: int = 4000) -> None:
+        self._db = db
+        self.by_date_calls: list[date] = []
+        self._fail_after = fail_after  # raise on the Nth call (1-based)
+        self._rows = rows
+
+    def sync_daily_quotes_by_date(self, d: date, seed_state=None) -> int:
+        self.by_date_calls.append(d)
+        if self._fail_after and len(self.by_date_calls) >= self._fail_after:
+            raise RuntimeError("抱歉,您访问接口(adj_factor)频率超限(1次/分钟)")
+        return self._rows
+
+
 @pytest.fixture
 def db_with_stocks(tmp_path):
     """A DB with 3 stocks and varied quote freshness:
@@ -273,8 +290,8 @@ class TestBatchProcessing:
 
     def test_adapter_factory_failure_skips_batch_cleanly(self, db_with_stocks):
         """Source unbuildable (e.g. tushare, no token — no silent akshare
-        fallback): the batch aborts once, records last_error, requeues the
-        code, and does NOT count a per-code failure for every queued stock."""
+        fallback): the batch aborts once with last_error set, queued codes are
+        left untouched, and NO per-code failure is counted for every stock."""
         from quanti.data.source import DataSourceUnavailable
 
         def _boom():
@@ -288,7 +305,7 @@ class TestBatchProcessing:
         s = syncer.status()
         assert s.failed_session == 0                  # not a per-code failure
         assert s.last_error and "数据源" in s.last_error
-        assert "BBB" in list(syncer._queue)           # requeued, nothing dropped
+        assert "BBB" in list(syncer._queue)           # nothing dropped
         assert "CCC" in list(syncer._queue)
 
     def test_zero_rows_counts_as_failure(self, db_with_stocks):
@@ -505,4 +522,70 @@ class TestMarketHoursStaleness:
         s = self._syncer(db, datetime(2026, 6, 15, 16, 0))  # Mon post-close
         s._scan_and_enqueue()
         assert "DDD" in list(s._queue)
+        db.close()
+
+
+class TestByDateFastPath:
+    """tushare's per-endpoint rate limits (adj_factor as low as 1/min) make the
+    per-code path catastrophic. On a by-date-capable source the daemon must top
+    up the WHOLE market by trading DAY instead — a few calls/day, queue bypassed."""
+
+    def _db_at(self, tmp_path, latest):
+        db = Database(str(tmp_path / "bd.db"))
+        db.initialize()
+        if latest is not None:
+            db.save_daily_quotes(pd.DataFrame([{
+                "code": "AAA", "date": latest, "open": 1.0, "high": 1.0,
+                "low": 1.0, "close": 1.0, "volume": 1.0, "amount": 1.0,
+                "turnover": 0.0}]))
+        return db
+
+    def test_routes_by_date_for_missing_days(self, tmp_path):
+        clock = datetime(2024, 6, 12, 16, 0)        # Wed, post-close → exp 06-12
+        db = self._db_at(tmp_path, date(2024, 6, 7))  # Fri → 3 missing trade days
+        adapter = ByDateStubAdapter(db)
+        syncer = BackgroundQuoteSyncer(
+            db=db, adapter_factory=lambda: adapter, now_fn=lambda: clock,
+            config=BackgroundSyncConfig(by_date_sleep_sec=0.0, batch_idle_sec=0.0))
+        syncer._process_by_date(adapter)
+        assert adapter.by_date_calls == [
+            date(2024, 6, 10), date(2024, 6, 11), date(2024, 6, 12)]
+        assert syncer.status().synced_session == 3
+        db.close()
+
+    def test_empty_db_defers_to_backfill(self, tmp_path):
+        db = self._db_at(tmp_path, None)            # empty library
+        adapter = ByDateStubAdapter(db)
+        syncer = BackgroundQuoteSyncer(
+            db=db, adapter_factory=lambda: adapter,
+            config=BackgroundSyncConfig(idle_interval_sec=0))
+        syncer._process_by_date(adapter)
+        assert adapter.by_date_calls == []          # no hammering on empty DB
+        assert "backfill" in (syncer.status().last_error or "")
+        db.close()
+
+    def test_rate_limit_stops_batch_no_churn(self, tmp_path):
+        clock = datetime(2024, 6, 12, 16, 0)
+        db = self._db_at(tmp_path, date(2024, 6, 7))   # 3 missing days
+        adapter = ByDateStubAdapter(db, fail_after=1)  # first day rate-limited
+        syncer = BackgroundQuoteSyncer(
+            db=db, adapter_factory=lambda: adapter, now_fn=lambda: clock,
+            config=BackgroundSyncConfig(by_date_sleep_sec=0.0, idle_interval_sec=0))
+        syncer._process_by_date(adapter)
+        assert len(adapter.by_date_calls) == 1      # stops, doesn't churn 2 & 3
+        assert syncer.status().failed_session == 1
+        assert "失败" in (syncer.status().last_error or "")
+        db.close()
+
+    def test_far_behind_caps_to_max_topup(self, tmp_path):
+        clock = datetime(2024, 6, 28, 16, 0)         # Fri
+        db = self._db_at(tmp_path, date(2024, 1, 2))  # ~6 months behind
+        adapter = ByDateStubAdapter(db)
+        syncer = BackgroundQuoteSyncer(
+            db=db, adapter_factory=lambda: adapter, now_fn=lambda: clock,
+            config=BackgroundSyncConfig(max_topup_days=5, by_date_sleep_sec=0.0,
+                                        batch_idle_sec=0.0))
+        syncer._process_by_date(adapter)
+        assert len(adapter.by_date_calls) == 5       # capped, bulk deferred
+        assert max(adapter.by_date_calls) == date(2024, 6, 28)  # newest tail
         db.close()

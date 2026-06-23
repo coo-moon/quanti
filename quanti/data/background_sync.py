@@ -113,6 +113,15 @@ class BackgroundSyncConfig:
     max_queue_size: int = 6000
     """Safety valve: cap queue size so a buggy scan can't OOM."""
 
+    max_topup_days: int = 10
+    """By-date (tushare) fast-path: if the library is more than this many trading
+    days behind, the daemon tops up only the newest `max_topup_days` and defers
+    the bulk to `quanti sync --backfill` (checkpointed/throttled). Stops the live
+    loop from churning hundreds of rate-limited calls on a cold/stale DB."""
+
+    by_date_sleep_sec: float = 1.0
+    """Pause between successive per-trading-day sweeps on the by-date path."""
+
 
 @dataclass
 class BackgroundSyncStatus:
@@ -265,6 +274,27 @@ class BackgroundQuoteSyncer:
                 self._sleep_responsive(5)
                 continue
 
+            # Build the source adapter per loop so a UI source/token change
+            # applies without a restart. Misconfig (e.g. tushare, no token — no
+            # silent akshare fallback) → record once, idle, retry next loop.
+            try:
+                adapter = self._adapter_factory()
+            except Exception as e:
+                with self._lock:
+                    self._last_error = f"数据源不可用: {e}"
+                    self._state = "idle"
+                logger.warning("bg-sync skipped (data source): %s", e)
+                self._sleep_responsive(self._cfg.idle_interval_sec)
+                continue
+
+            # tushare (and any by-date-capable source): top up the WHOLE market
+            # by trading DAY (~3 calls/day), NOT per code (2 calls × thousands)
+            # — the per-code path instantly blows tushare's per-endpoint rate
+            # limits (adj_factor can be 1/min). This bypasses the per-code queue.
+            if hasattr(adapter, "sync_daily_quotes_by_date"):
+                self._process_by_date(adapter)
+                continue
+
             if not self._queue:
                 # Idle path: rebuild queue from DB scan.
                 self._scan_and_enqueue()
@@ -281,7 +311,7 @@ class BackgroundQuoteSyncer:
             # every batch, so an order queued mid-cycle is synced next instead
             # of waiting for the queue to drain and the next full rescan.
             self._prioritize_pending()
-            self._process_batch()
+            self._process_batch(adapter)
             self._sleep_responsive(self._cfg.batch_idle_sec)
 
         with self._lock:
@@ -456,11 +486,21 @@ class BackgroundQuoteSyncer:
 
     # ----------------- batch processing -----------------
 
-    def _process_batch(self) -> None:
+    def _process_batch(self, adapter=None) -> None:
         cfg = self._cfg
-        adapter = None
         end_d = date.today()
         cold_start = end_d - timedelta(days=cfg.lookback_days)
+        if adapter is None:
+            # Direct callers (tests) don't prebuild the adapter. Build it here,
+            # gracefully: a misconfigured source records the error and skips the
+            # batch rather than failing every queued code.
+            try:
+                adapter = self._adapter_factory()
+            except Exception as e:
+                with self._lock:
+                    self._last_error = f"数据源不可用: {e}"
+                logger.warning("bg-sync skipped (data source): %s", e)
+                return
 
         for _ in range(cfg.batch_size):
             if self._stop_flag.is_set() or self._pause_flag.is_set():
@@ -482,21 +522,6 @@ class BackgroundQuoteSyncer:
             except Exception:
                 latest_before = None
             start_d = None if latest_before is not None else cold_start
-
-            if adapter is None:
-                try:
-                    adapter = self._adapter_factory()
-                except Exception as e:
-                    # Source misconfigured (e.g. tushare selected, no token —
-                    # no silent akshare fallback). Don't fail every code in the
-                    # batch; requeue this one, record once, and abort. The next
-                    # loop retries so a UI token change recovers without restart.
-                    with self._lock:
-                        self._queue.appendleft(code)
-                        self._current_code = None
-                        self._last_error = f"数据源不可用: {e}"
-                    logger.warning("bg-sync skipped (data source): %s", e)
-                    return
 
             try:
                 # repair_gaps=False because the background path values throughput
@@ -536,6 +561,99 @@ class BackgroundQuoteSyncer:
 
         with self._lock:
             self._current_code = None
+
+    def _process_by_date(self, adapter) -> None:
+        """tushare fast-path: top up the WHOLE market by trading DAY (~3 calls/
+        day) instead of per code (2 calls × thousands of codes), which instantly
+        blows tushare's per-endpoint rate limits (adj_factor can be 1/min). The
+        per-code queue is bypassed entirely on this source. Self-manages the
+        sleep so the outer loop just `continue`s."""
+        cfg = self._cfg
+        expected = expected_latest_bar(self._now())
+        latest = self._db.get_global_latest_quote_date()
+
+        if latest is None:
+            # Empty library — a multi-year bulk load belongs in the explicit,
+            # checkpointed `quanti sync --backfill`, not the live loop.
+            with self._lock:
+                self._state = "idle"
+                self._last_error = ("行情库为空:请先运行 `quanti sync --backfill "
+                                    "--years 5`(逐日回填,可断点续/限速)")
+            logger.warning("bg-sync(by-date): empty DB — run "
+                           "`quanti sync --backfill` first")
+            self._sleep_responsive(cfg.idle_interval_sec)
+            return
+
+        if latest >= expected:
+            with self._lock:
+                self._state = "idle"
+            self._sleep_responsive(cfg.idle_interval_sec)
+            return
+
+        # Missing trading days (latest, expected]. Use the synced calendar; fall
+        # back to weekdays when it isn't populated.
+        start = latest + timedelta(days=1)
+        days = self._db.get_trade_dates(start, expected)
+        if not days:
+            days = [start + timedelta(days=i)
+                    for i in range((expected - start).days + 1)
+                    if (start + timedelta(days=i)).weekday() < 5]
+        if not days:
+            with self._lock:
+                self._state = "idle"
+            self._sleep_responsive(cfg.idle_interval_sec)
+            return
+
+        deferred = 0
+        if len(days) > cfg.max_topup_days:
+            deferred = len(days) - cfg.max_topup_days
+            days = days[-cfg.max_topup_days:]  # newest tail — most relevant
+            logger.warning("bg-sync(by-date): %d trading days behind — defer "
+                           "bulk to `quanti sync --backfill`; topping up newest %d",
+                           deferred + cfg.max_topup_days, cfg.max_topup_days)
+
+        with self._lock:
+            self._state = "active"
+        progressed = failed = False
+        seed_state: dict = {}  # carries adj-factor state across this batch's days
+        for d in days:
+            if self._stop_flag.is_set() or self._pause_flag.is_set():
+                break
+            with self._lock:
+                self._current_code = f"@{d.isoformat()}"
+            try:
+                rows = adapter.sync_daily_quotes_by_date(d, seed_state=seed_state)
+                with self._lock:
+                    self._current_code = None
+                    if rows > 0:
+                        self._synced_session += 1
+                        progressed = True
+                        self._last_full_scan_at = datetime.now().isoformat()
+                    self._last_error = (
+                        f"已补 {d};仍约 {deferred} 天待 `quanti sync --backfill`"
+                        if deferred else None)
+            except Exception as e:
+                # Rate-limit / upstream. Stop the batch — the remaining days
+                # would hit the same per-minute cap. The next loop (after the
+                # idle wait, which exceeds the 1-min window) retries the next
+                # day, so we catch up steadily instead of churning + spamming.
+                with self._lock:
+                    self._current_code = None
+                    self._failed_session += 1
+                    self._last_error = f"逐日同步 {d} 失败: {e}"
+                logger.warning("bg-sync(by-date) %s failed: %s", d, e)
+                failed = True
+                break
+            self._sleep_responsive(cfg.by_date_sleep_sec)
+
+        # On failure, wait out the rate-limit window before retrying. If we made
+        # progress with days still pending, loop again soon to keep catching up.
+        if failed:
+            self._sleep_responsive(cfg.idle_interval_sec)
+        elif progressed:
+            self._sleep_responsive(cfg.batch_idle_sec)
+        else:
+            self._sleep_responsive(cfg.idle_interval_sec)
 
     def _apply_backoff(self, code: str, *, hard: bool) -> None:
         """Schedule the next retry for `code`. Caller holds `_lock`.

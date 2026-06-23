@@ -1,23 +1,30 @@
-"""Tushare data adapter — A-share roster (incl. delisted) + qfq daily bars.
+"""Tushare data adapter — A-share roster (incl. delisted) + RAW daily bars.
 
 Closes survivorship bias for backtests: Tushare's free/low-tier `stock_basic`
-returns delisted names with their delist_date, and `pro_bar` returns the full
-price history of a delisted ts_code up to its delisting day. Both land through
-the SAME db.upsert_stock / db.save_daily_quotes exits as AkShare/xtdata, so the
-rest of the system reads SQLite unchanged.
+returns delisted names with their delist_date, and `daily` returns the full RAW
+price history of a ts_code up to its delisting day. Both land through the SAME
+db.upsert_stock / db.save_daily_quotes exits as AkShare/xtdata, so the rest of
+the system reads SQLite unchanged.
+
+Back-adjustment (hfq) is reconstructed from `daily`'s pre_close (see
+`reconstruct_adj_factor`) so we NEVER call the `adj_factor`/`pro_bar` endpoints,
+which are rate-limited as low as 1 call/min on low point tiers — `daily` itself
+is 500/min (doc_id=27). This is the key to backfilling years of history without
+tripping the per-minute limit.
 
 tushare is an OPTIONAL dependency (guarded import). Without the package or a
 TUSHARE_TOKEN, the adapter still imports; its methods raise a clear error.
 Token is read from the TUSHARE_TOKEN env var and is never logged.
 
-# VERIFY (real token / real box): pro_bar history depth for delisted ts_codes,
-# adj='qfq' availability for delisted names, and current per-endpoint point
+# VERIFY (real token / real box): `daily` history depth for delisted ts_codes,
+# pre_close presence on the first listed bar, and current per-endpoint point
 # thresholds (changes over time; see https://tushare.pro/document/1?doc_id=290).
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from datetime import date, datetime
@@ -29,7 +36,6 @@ try:
 except ImportError:  # pragma: no cover - exercised via monkeypatch
     ts = None
 
-from quanti.data.akshare_adapter import _attach_adj_factor
 from quanti.data.database import Database
 
 logger = logging.getLogger(__name__)
@@ -44,15 +50,56 @@ TS_VOL_TO_SHARES = 100
 TS_AMOUNT_TO_YUAN = 1000
 
 
+def reconstruct_adj_factor(raw_close, pre_close, *, seed_close=None,
+                           seed_factor=1.0):
+    """Back-adjustment (hfq) factor reconstructed from `daily`'s `pre_close` —
+    so we NEVER call the `adj_factor` endpoint (the rate-limited one, as low as
+    1 call/min on low point tiers; `daily` itself is 500/min).
+
+    On an ex-rights day tushare's `pre_close[t]` is the previous close adjusted
+    for the action, so it differs from the raw close[t-1]; that ratio captures
+    the corporate action. With the factor anchored at the first bar:
+
+        f[t] = f[t-1] * close[t-1] / pre_close[t]
+
+    making `raw_close[t] * f[t]` a continuous back-adjusted (hfq) series whose
+    bar-to-bar return equals tushare's own close/pre_close — identical returns
+    to native hfq (only the absolute anchor differs, which is irrelevant for
+    backtests). `seed_close`/`seed_factor` continue a previously stored bar so
+    INCREMENTAL syncs splice seamlessly (omit → fresh anchor f0 = 1.0). A
+    missing/non-positive pre_close contributes no adjustment (ratio 1.0).
+
+    Args are date-ASCENDING parallel sequences. Returns a list of factors."""
+    factors: list[float] = []
+    prev_close = seed_close            # None → first bar anchors at seed_factor
+    prev_factor = float(seed_factor)
+    for c, pc in zip(raw_close, pre_close):
+        c = float(c)
+        if prev_close is None:
+            f = prev_factor            # first-ever bar → anchor (no prior close)
+        else:
+            try:
+                pcv = float(pc)
+            except (TypeError, ValueError):
+                pcv = 0.0
+            ratio = (prev_close / pcv if pcv > 0 and prev_close > 0
+                     and math.isfinite(pcv) else 1.0)
+            if not math.isfinite(ratio) or ratio <= 0:
+                ratio = 1.0
+            f = prev_factor * ratio
+        factors.append(f)
+        prev_close, prev_factor = c, f
+    return factors
+
+
 class TushareAdapter:
     """Fetches A-share data (incl. delisted) from Tushare and saves to the DB."""
 
     def __init__(self, db: Database, token: str | None = None, *,
-                 pro=None, pro_bar=None) -> None:
+                 pro=None) -> None:
         self._db = db
         self._token = token
         self._pro = pro            # injected in tests; lazily built otherwise
-        self._pro_bar_fn = pro_bar  # injected in tests; ts.pro_bar otherwise
 
     # --- ts_code <-> code mapping ---
 
@@ -86,7 +133,7 @@ class TushareAdapter:
         except ValueError:
             return None
 
-    # --- lazy network seams (never invoked when fully injected) ---
+    # --- lazy network seam (never invoked when fully injected) ---
 
     def _ensure_pro(self):
         if self._pro is None:
@@ -96,18 +143,8 @@ class TushareAdapter:
             token = self._token or os.environ.get("TUSHARE_TOKEN")
             if not token:
                 raise RuntimeError("TUSHARE_TOKEN not set")
-            ts.set_token(token)  # so module-level ts.pro_bar works too
             self._pro = ts.pro_api(token)
         return self._pro
-
-    def _bar_fn(self):
-        if self._pro_bar_fn is not None:
-            return self._pro_bar_fn
-        if ts is None:
-            raise RuntimeError(
-                "tushare not installed; run: pip install 'quanti[data]'")
-        self._ensure_pro()  # ensures ts present + token registered
-        return ts.pro_bar
 
     @staticmethod
     def _retry(fn, *args, **kwargs):
@@ -172,9 +209,12 @@ class TushareAdapter:
     def sync_daily_quotes(self, code: str, start: date | None = None,
                           end: date | None = None,
                           repair_gaps: bool = True) -> int:
-        """Fetch RAW daily bars for `code` + adj_factor (incremental from the
-        last stored bar by default) and save them. turnover is 0 until P4 fills
-        it from daily_basic. Returns rows saved.
+        """Fetch RAW daily bars for `code` (incremental from the last stored bar
+        by default) and save them with a reconstructed adj_factor. ONE `daily`
+        call (500/min) — no `adj_factor`/`pro_bar` call (rate-limited as low as
+        1/min): the factor is rebuilt from `daily`'s pre_close (see
+        `reconstruct_adj_factor`). turnover stays 0 (the per-code path has no
+        daily_basic). Returns rows saved.
 
         `repair_gaps` is accepted for adapter-signature parity (sync sites pass
         it) but ignored — tushare is a single source, no cross-source repair."""
@@ -184,15 +224,14 @@ class TushareAdapter:
             latest = self._db.get_latest_quote_date(code)
             start = latest if latest else date(2010, 1, 1)
 
-        bar = self._bar_fn()
+        pro = self._ensure_pro()
         ts_code = self._code_to_ts_code(code)
         sd, ed = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-        raw = self._retry(
-            bar, ts_code=ts_code, asset="E", adj=None,  # RAW (不复权) prices
-            start_date=sd, end_date=ed)
+        raw = self._retry(pro.daily, ts_code=ts_code, start_date=sd, end_date=ed)
         if raw is None or raw.empty:
             return 0
 
+        raw = raw.sort_values("trade_date")  # tushare returns newest-first
         df = pd.DataFrame({
             "code": code,
             "date": pd.to_datetime(raw["trade_date"]).dt.date,
@@ -203,39 +242,40 @@ class TushareAdapter:
             # Normalize to canonical units (股 / 元) — see TS_* constants.
             "volume": raw["vol"].astype(float) * TS_VOL_TO_SHARES,
             "amount": raw["amount"].astype(float) * TS_AMOUNT_TO_YUAN,
-            "turnover": 0.0,  # filled from daily_basic.turnover_rate in P3/P4
+            "turnover": 0.0,  # the per-code path has no daily_basic
             "source": "tushare",
-        })
-        # adj_factor = hfq_close / raw_close, from a second back-adjusted pull
-        # (hfq is anchored to listing → window-independent → incremental-safe).
-        # Computing the ratio sidesteps tushare's adj_factor normalization
-        # convention. # VERIFY adj="hfq" availability for delisted ts_codes.
-        hfq = self._retry(
-            bar, ts_code=ts_code, asset="E", adj="hfq",
-            start_date=sd, end_date=ed)
-        df = _attach_adj_factor(df, hfq, "trade_date", "close")
+        }).reset_index(drop=True)
+        # Reconstruct adj_factor from pre_close, seeded by the stored bar just
+        # before this window so an incremental append splices seamlessly.
+        seed = self._db.get_latest_quote_before(code, df["date"].iloc[0])
+        seed_close, seed_factor = seed if seed else (None, 1.0)
+        df["adj_factor"] = reconstruct_adj_factor(
+            df["close"].tolist(), raw["pre_close"].astype(float).tolist(),
+            seed_close=seed_close, seed_factor=seed_factor)
         saved = self._db.save_daily_quotes(df)
         logger.info("%s: %d bars [%s~%s] via tushare", code, saved,
                     df["date"].min(), df["date"].max())
         return saved
 
-    def sync_daily_quotes_by_date(self, trade_date: date) -> int:
-        """Pull the WHOLE market for ONE trading day in a few calls — the
-        efficient path for bulk backfill (~3 calls/day vs ~2/stock). Returns
-        rows saved. Delisted names appear in pro.daily for dates they traded.
+    def sync_daily_quotes_by_date(self, trade_date: date,
+                                  seed_state: dict | None = None) -> int:
+        """Pull the WHOLE market for ONE trading day — the efficient bulk path.
+        Returns rows saved. Delisted names appear in pro.daily for dates they
+        traded.
 
-        Uses tushare's NATIVE adj_factor (listing-anchored), which equals the
-        per-stock path's hfq/raw ratio, so the two paths agree. turnover is
-        filled from daily_basic.turnover_rate when that endpoint is available."""
+        adj_factor is reconstructed from `daily`'s pre_close (NO `adj_factor`
+        endpoint call — that's the rate-limited one, 1/min on low tiers; `daily`
+        is 500/min). `seed_state` is a caller-owned {code: (raw_close, factor)}
+        map carried across days so the cumulative factor splices day-to-day
+        WITHOUT re-querying the DB or re-fetching history; on a miss it seeds
+        from the DB's last stored bar (fresh anchor 1.0 if none). turnover +
+        valuation come from daily_basic when that endpoint is available
+        (gracefully skipped otherwise)."""
         pro = self._ensure_pro()
         td = trade_date.strftime("%Y%m%d")
         raw = self._retry(pro.daily, trade_date=td)
         if raw is None or raw.empty:
             return 0
-        fac = self._retry(pro.adj_factor, trade_date=td)
-        fac_by_code = ({str(r["ts_code"]): float(r["adj_factor"])
-                        for _, r in fac.iterrows()} if fac is not None
-                       and not fac.empty else {})
         # daily_basic (point-tier gated) feeds BOTH the daily_basic table (P4
         # valuation factors) and the quotes' turnover — one call, not two.
         # Degrade gracefully (turnover 0, no valuation) if it's unavailable.
@@ -257,16 +297,27 @@ class TushareAdapter:
         for _, r in raw.iterrows():
             ts_code = str(r["ts_code"])
             code, _ex = self._ts_code_to_code(ts_code)
-            # # VERIFY: tushare native adj_factor satisfies raw×factor = hfq
-            # (provider._apply_adjust does raw×factor). Default 1.0 if missing.
+            close = float(r["close"])
+            # adj_factor = prev_factor × prev_close / pre_close (continuous hfq;
+            # provider._apply_adjust does raw×factor). Seed from carried state or
+            # the DB's last stored bar; fresh stocks anchor at 1.0.
+            seed = (seed_state.get(code) if seed_state is not None else None)
+            if seed is None:
+                seed = self._db.get_latest_quote_before(code, trade_date)
+            (factor,) = reconstruct_adj_factor(
+                [close], [r.get("pre_close")],
+                seed_close=seed[0] if seed else None,
+                seed_factor=seed[1] if seed else 1.0)
+            if seed_state is not None:
+                seed_state[code] = (close, factor)
             rows.append({
                 "code": code, "date": trade_date,
                 "open": float(r["open"]), "high": float(r["high"]),
-                "low": float(r["low"]), "close": float(r["close"]),
+                "low": float(r["low"]), "close": close,
                 "volume": float(r["vol"]) * TS_VOL_TO_SHARES,
                 "amount": float(r["amount"]) * TS_AMOUNT_TO_YUAN,
                 "turnover": turn_by_code.get(ts_code, 0.0),
-                "adj_factor": fac_by_code.get(ts_code, 1.0),
+                "adj_factor": factor,
                 "source": "tushare",
             })
         return self._db.save_daily_quotes(pd.DataFrame(rows))
