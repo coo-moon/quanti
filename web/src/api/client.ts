@@ -383,5 +383,25 @@ export const setFactorEnabled = (name: string, enabled: boolean) =>
   api.post<{ ok: boolean; name: string; enabled: boolean }>(
     `/factors/generated/${encodeURIComponent(name)}/enabled`, { enabled });
 
+// --- Data source config ---
+export interface DataSourceConfig {
+  source: string;
+  has_token: boolean;
+  available_sources: string[];
+}
+
+export const fetchDataSource = () =>
+  api.get<DataSourceConfig>("/config/data-source");
+export const testDataSource = (source: string, token?: string | null) =>
+  api.post<{ ok: boolean; message: string }>("/config/data-source/test", {
+    source,
+    token: token ?? null,
+  });
+export const saveDataSource = (source: string, token?: string | null) =>
+  api.post<{ ok: boolean; message: string }>("/config/data-source", {
+    source,
+    token: token ?? null,
+  });
+
 export default api;
 

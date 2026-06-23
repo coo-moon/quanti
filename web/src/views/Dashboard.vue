@@ -5,6 +5,33 @@
       <p class="page-desc">管理你的股票池和市场数据</p>
     </div>
 
+    <div class="card">
+      <div class="card-header">
+        <h2>数据源</h2>
+        <span class="card-header-hint">历史行情来源(实时盯盘始终用 xtdata)</span>
+      </div>
+      <div class="ds-row">
+        <label>历史源</label>
+        <select v-model="dsSource" :disabled="dsBusy">
+          <option v-for="s in dsConfig.available_sources" :key="s" :value="s">{{ s }}</option>
+        </select>
+      </div>
+      <div class="ds-row" v-if="dsNeedsToken">
+        <label>Token</label>
+        <input
+          v-model="dsToken"
+          type="password"
+          :placeholder="dsConfig.has_token ? '已配置 ✓(留空则不修改)' : '填入 TUSHARE_TOKEN'"
+          :disabled="dsBusy"
+        />
+      </div>
+      <div class="ds-actions">
+        <button class="btn-small" @click="testDS" :disabled="dsBusy">测试连接</button>
+        <button class="btn-small primary" @click="saveDS" :disabled="dsBusy">保存</button>
+        <span v-if="dsMsg" class="ds-msg" :class="dsError ? 'error' : 'ok'">{{ dsMsg }}</span>
+      </div>
+    </div>
+
     <div class="stats-row">
       <div class="stat-card">
         <div class="stat-icon blue">
@@ -191,10 +218,14 @@ import {
   fetchBackgroundSyncStatus,
   pauseBackgroundSync,
   resumeBackgroundSync,
+  fetchDataSource,
+  testDataSource,
+  saveDataSource,
   type StockInfo,
   type StockPoolStats,
   type SyncStatus,
   type BackgroundSyncStatus,
+  type DataSourceConfig,
 } from "../api/client";
 
 const stocks = ref<StockInfo[]>([]);
@@ -213,6 +244,59 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
 // Background syncer state (polled every 10s while the page is open).
 const bgSync = ref<BackgroundSyncStatus | null>(null);
 let bgSyncTimer: ReturnType<typeof setInterval> | null = null;
+
+// --- Data source config panel ---
+const dsConfig = ref<DataSourceConfig>({ source: "tushare", has_token: false, available_sources: ["tushare", "akshare", "xtdata"] });
+const dsSource = ref("tushare");
+const dsToken = ref("");          // blank = keep existing token
+const dsMsg = ref("");
+const dsError = ref(false);
+const dsBusy = ref(false);
+// Only tushare needs a key today.
+const dsNeedsToken = computed(() => dsSource.value === "tushare");
+
+async function loadDataSource() {
+  try {
+    const res = await fetchDataSource();
+    dsConfig.value = res.data;
+    dsSource.value = res.data.source || "tushare";
+  } catch (e) { /* leave defaults */ }
+}
+
+function setDsMsg(msg: string, err = false) {
+  dsMsg.value = msg;
+  dsError.value = err;
+}
+
+async function testDS() {
+  dsBusy.value = true;
+  setDsMsg("测试连接中…");
+  try {
+    const res = await testDataSource(dsSource.value, dsToken.value || null);
+    setDsMsg(res.data.message, !res.data.ok);
+  } catch (e: any) {
+    setDsMsg(e?.message || "测试失败", true);
+  } finally {
+    dsBusy.value = false;
+  }
+}
+
+async function saveDS() {
+  dsBusy.value = true;
+  setDsMsg("保存并校验中…");
+  try {
+    const res = await saveDataSource(dsSource.value, dsToken.value || null);
+    setDsMsg(res.data.message, !res.data.ok);
+    if (res.data.ok) {
+      dsToken.value = "";       // clear input; token now stored
+      await loadDataSource();   // refresh has_token / source
+    }
+  } catch (e: any) {
+    setDsMsg(e?.message || "保存失败", true);
+  } finally {
+    dsBusy.value = false;
+  }
+}
 
 // Newest bar date in the DB — NOT the wall clock. Showing `new Date()`
 // here (as before) claimed the data was current even when it wasn't.
@@ -280,6 +364,7 @@ async function resumeSync() {
 
 onMounted(async () => {
   await loadStocks();
+  await loadDataSource();
   await refreshBgSync();
   // Poll background sync every 10s — fast enough to feel live without
   // hammering the API.
@@ -748,6 +833,52 @@ async function syncAll() {
 .btn-small:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.btn-small.primary {
+  color: #fff;
+  background: var(--color-accent);
+}
+.btn-small.primary:hover {
+  background: var(--color-accent);
+  opacity: 0.9;
+}
+
+.ds-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 8px 0;
+}
+.ds-row label {
+  width: 56px;
+  font-size: 13px;
+  color: var(--color-text-secondary, #6b7280);
+}
+.ds-row select,
+.ds-row input {
+  flex: 1;
+  max-width: 360px;
+  padding: 6px 10px;
+  font-size: 13px;
+  border: 1px solid var(--color-border, #e4e7eb);
+  border-radius: 8px;
+  background: var(--color-bg, #fff);
+}
+.ds-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.ds-msg {
+  font-size: 12px;
+}
+.ds-msg.ok {
+  color: #16a34a;
+}
+.ds-msg.error {
+  color: #dc2626;
 }
 
 .empty-state {

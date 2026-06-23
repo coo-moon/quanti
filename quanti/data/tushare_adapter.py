@@ -148,10 +148,14 @@ class TushareAdapter:
         return count
 
     def sync_daily_quotes(self, code: str, start: date | None = None,
-                          end: date | None = None) -> int:
-        """Fetch qfq daily bars for `code` (incremental from the last stored bar
-        by default) and save them. turnover is set to 0 (free tier lacks it).
-        Returns rows saved."""
+                          end: date | None = None,
+                          repair_gaps: bool = True) -> int:
+        """Fetch RAW daily bars for `code` + adj_factor (incremental from the
+        last stored bar by default) and save them. turnover is 0 until P4 fills
+        it from daily_basic. Returns rows saved.
+
+        `repair_gaps` is accepted for adapter-signature parity (sync sites pass
+        it) but ignored — tushare is a single source, no cross-source repair."""
         if end is None:
             end = date.today()
         if start is None:

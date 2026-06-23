@@ -347,7 +347,7 @@ class AgentRuntime:
         Freshness: a bar from before yesterday is considered stale (was 7
         days, which left positions frozen for nearly a trading week).
         """
-        from quanti.data.akshare_adapter import AkShareAdapter
+        from quanti.data.source import make_quote_adapter
         end = date.today()
         start = end - timedelta(days=lookback_days)
         stale_after = end - timedelta(days=1)  # bars older than yesterday
@@ -372,7 +372,7 @@ class AgentRuntime:
         budget = max(20, len(held_set))
         missing = missing[:budget]
 
-        adapter = AkShareAdapter(self._db)
+        adapter = make_quote_adapter(self._db)
         for c in missing:
             try:
                 adapter.sync_daily_quotes(c, start=start, end=end,

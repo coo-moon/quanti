@@ -98,10 +98,10 @@ class ScreenResponse(BaseModel):
 @router.post("/sync/quotes")
 async def sync_quotes(body: SyncRequest, request: Request):
     """Sync daily quotes for given stock codes from AkShare."""
-    from quanti.data.akshare_adapter import AkShareAdapter
+    from quanti.data.source import make_quote_adapter
 
     db = request.app.state.db
-    adapter = AkShareAdapter(db)
+    adapter = make_quote_adapter(db)
     results = {}
     errors = {}
     for code in body.codes:
@@ -137,13 +137,13 @@ async def sync_quotes_async(body: SyncRequest, request: Request):
 
 async def _run_quotes_sync(job_id: str, codes: list[str], db) -> None:
     from datetime import date, timedelta
-    from quanti.data.akshare_adapter import AkShareAdapter
+    from quanti.data.source import make_quote_adapter
     import asyncio
     from functools import partial
 
     end_d = date.today()
     start_d = end_d - timedelta(days=365)
-    adapter = AkShareAdapter(db)
+    adapter = make_quote_adapter(db)
     errors: dict[str, str] = {}
     loop = asyncio.get_event_loop()
 
@@ -269,10 +269,10 @@ async def background_sync_resume(request: Request):
 @router.post("/sync/stocks")
 async def sync_stock_list(request: Request):
     """Sync the full A-share stock list (name, industry, exchange, list_date)."""
-    from quanti.data.akshare_adapter import AkShareAdapter
+    from quanti.data.source import make_quote_adapter
 
     db = request.app.state.db
-    adapter = AkShareAdapter(db)
+    adapter = make_quote_adapter(db)
     count = adapter.sync_stock_list()
     return {"synced": count, "message": f"成功同步 {count} 只股票到股票池"}
 
@@ -405,13 +405,13 @@ async def sync_pool_stocks(name: str, request: Request):
 async def _run_pool_sync(job_id: str, pool_name: str, codes: list[str], db) -> None:
     """Background task to sync pool stocks and update progress."""
     from datetime import date, timedelta
-    from quanti.data.akshare_adapter import AkShareAdapter
+    from quanti.data.source import make_quote_adapter
     import asyncio
     from functools import partial
 
     end_d = date.today()
     start_d = end_d - timedelta(days=365)
-    adapter = AkShareAdapter(db)
+    adapter = make_quote_adapter(db)
     errors: dict[str, str] = {}
     loop = asyncio.get_event_loop()
 
@@ -566,10 +566,10 @@ async def run_screen(body: ScreenRequest, request: Request):
     start_d = end_d - timedelta(days=int(body.lookback_days * 1.5))  # extra margin
 
     # Auto-sync: fetch data for stocks with NO bars only (skip if already has data)
-    from quanti.data.akshare_adapter import AkShareAdapter
+    from quanti.data.source import make_quote_adapter
     import asyncio
 
-    adapter = AkShareAdapter(db)
+    adapter = make_quote_adapter(db)
     # Only sync stocks that have NO data at all (len == 0), skip stocks with partial data
     codes_to_sync = []
     for code in codes:
@@ -655,6 +655,49 @@ class ManualOrderBody(BaseModel):
     direction: str  # buy / sell
     strength: float = 1.0
     reason: str = "manual"
+
+
+class DataSourceBody(BaseModel):
+    source: str  # tushare | akshare | xtdata
+    token: str | None = None  # only for sources needing a key; None = keep existing
+
+
+@router.get("/config/data-source")
+async def get_data_source(request: Request):
+    """Current data source + whether a token is configured. The token itself is
+    NEVER returned (secret)."""
+    from quanti.data.source import VALID_SOURCES, resolve_source, tushare_token
+    db = request.app.state.db
+    return {
+        "source": resolve_source(db),
+        "has_token": bool(tushare_token(db)),
+        "available_sources": list(VALID_SOURCES),
+    }
+
+
+@router.post("/config/data-source/test")
+async def test_data_source(body: DataSourceBody, request: Request):
+    """Probe connectivity for a source (using the passed token, or the stored
+    one if omitted). Does NOT persist anything."""
+    from quanti.data.source import probe_source
+    ok, message = probe_source(body.source, body.token, request.app.state.db)
+    return {"ok": ok, "message": message}
+
+
+@router.post("/config/data-source")
+async def set_data_source(body: DataSourceBody, request: Request):
+    """Validate connectivity first; only persist (source + token) if it passes."""
+    from quanti.data.source import VALID_SOURCES, probe_source
+    if body.source not in VALID_SOURCES:
+        raise HTTPException(status_code=422,
+                            detail=f"invalid source: {body.source!r}; "
+                                   f"expected one of {VALID_SOURCES}")
+    db = request.app.state.db
+    ok, message = probe_source(body.source, body.token, db)
+    if not ok:
+        return {"ok": False, "message": message}
+    db.upsert_app_config(body.source, body.token)
+    return {"ok": True, "message": message}
 
 
 @router.get("/goal")
@@ -901,7 +944,7 @@ async def list_strategies(request: Request):
 async def run_backtest(body: BacktestRequest, request: Request):
     import logging
 
-    from quanti.data.akshare_adapter import AkShareAdapter
+    from quanti.data.source import make_quote_adapter
 
     logger = logging.getLogger(__name__)
     db = request.app.state.db
@@ -925,7 +968,7 @@ async def run_backtest(body: BacktestRequest, request: Request):
             if len(bars) == 0:
                 logger.info(f"No data for {code}, auto-syncing...")
                 try:
-                    adapter = AkShareAdapter(db)
+                    adapter = make_quote_adapter(db)
                     adapter.sync_daily_quotes(code, start=start_d, end=end_d,
                                               repair_gaps=False)
                 except Exception as e:

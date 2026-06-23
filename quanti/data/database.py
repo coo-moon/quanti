@@ -345,6 +345,13 @@ class Database:
 
             -- Agent / goal -----------------------------------------------
 
+            CREATE TABLE IF NOT EXISTS app_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                data_source TEXT NOT NULL DEFAULT 'tushare',
+                data_source_token TEXT DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS agent_goal (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 target_annual_return REAL NOT NULL,
@@ -1135,6 +1142,42 @@ class Database:
              "market_value": r[2], "total_value": r[3]}
             for r in rows
         ]
+
+    # --- App config (data source + credential) ---
+
+    def get_app_config(self) -> dict:
+        """Singleton app config (data source + token). Returns defaults when
+        unset. NOTE: the token is stored plaintext in the local SQLite — fine
+        for a local single-user tool; never expose it over the API unmasked."""
+        row = self.conn.execute(
+            "SELECT data_source, data_source_token FROM app_config WHERE id=1"
+        ).fetchone()
+        if row is None:
+            return {"data_source": "", "data_source_token": ""}
+        return {"data_source": row[0] or "",
+                "data_source_token": row[1] or ""}
+
+    def upsert_app_config(self, data_source: str,
+                          data_source_token: str | None = None) -> None:
+        """Persist the data source; only overwrite the token when a non-None
+        value is passed (so the UI can change source without re-entering it)."""
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        existing = self.get_app_config()
+        token = (existing["data_source_token"] if data_source_token is None
+                 else data_source_token)
+        self.conn.execute(
+            """
+            INSERT INTO app_config (id, data_source, data_source_token, updated_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                data_source=excluded.data_source,
+                data_source_token=excluded.data_source_token,
+                updated_at=excluded.updated_at
+            """,
+            (data_source, token, now),
+        )
+        self.conn.commit()
 
     # --- Agent goal & decisions ---
 
