@@ -62,18 +62,29 @@ def run_backfill(db, *, years: int = 5, end: date | None = None,
 
     end = end or date.today()
     start = end - timedelta(days=365 * years)
-    # Roster (universe / point-in-time membership incl. delisted) from the
-    # CONFIGURED source — tushare's stock_basic carries delist_date too. Patient
-    # (waits out per-minute limits) + best-effort: the by-date `daily` sweep
-    # returns every stock regardless, so a roster blip never blocks the quote
-    # backfill, and we never silently swap vendors. Free akshare roster remains
-    # available via `quanti sync --stocks --source akshare`.
+    # Roster (universe / point-in-time membership incl. delisted). SKIP if a
+    # survivorship-free roster is already present (any delisted name on file) —
+    # tushare's stock_basic is ~1/min even at high tiers (it's a one-shot full
+    # dump; points barely raise it), so L/D/P each backfill would just add ~2 min
+    # of patient waiting. Refresh explicitly with `quanti sync --stocks`.
     try:
-        n_roster = make_stock_list_adapter(db, source).sync_stock_list(patient=True)
-        logger.info("roster: %d 只(%s,含退市股)", n_roster, source or "tushare")
-    except Exception as e:  # noqa: BLE001 - roster is metadata; quotes don't need it
-        logger.warning("roster 同步失败跳过(%s)——逐日 daily 仍覆盖全市场;"
-                       "可单独 `quanti sync --stocks`", e)
+        has_roster = any(getattr(s, "delist_date", None) for s in db.list_stocks())
+    except Exception:  # noqa: BLE001
+        has_roster = False
+    if has_roster:
+        logger.info("roster 已含退市股 → 跳过名册同步(刷新:quanti sync --stocks)")
+    else:
+        # CONFIGURED source (tushare's stock_basic carries delist_date too).
+        # Patient (waits per-minute limits) + best-effort: the by-date `daily`
+        # sweep returns every stock regardless, so a roster blip never blocks the
+        # backfill and we never silently swap vendors. Free akshare roster:
+        # `quanti sync --stocks --source akshare`.
+        try:
+            n_roster = make_stock_list_adapter(db, source).sync_stock_list(patient=True)
+            logger.info("roster: %d 只(%s,含退市股)", n_roster, source or "tushare")
+        except Exception as e:  # noqa: BLE001 - roster is metadata; quotes don't need it
+            logger.warning("roster 同步失败跳过(%s)——逐日 daily 仍覆盖全市场;"
+                           "可单独 `quanti sync --stocks`", e)
     adapter = make_quote_adapter(db, source, allow_fallback=False)
     if not hasattr(adapter, "sync_daily_quotes_by_date"):
         raise RuntimeError(f"source {source!r} has no by-date backfill path")
