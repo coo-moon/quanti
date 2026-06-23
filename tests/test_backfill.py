@@ -25,7 +25,7 @@ class _FakeAdapter:
     def __init__(self):
         self.seen: list[date] = []
 
-    def sync_stock_list(self) -> int:
+    def sync_stock_list(self, patient: bool = False) -> int:
         return 0
 
     def sync_daily_quotes_by_date(self, d: date, seed_state=None,
@@ -39,12 +39,9 @@ class _FakeAdapter:
 @pytest.fixture
 def fake_adapter(monkeypatch):
     a = _FakeAdapter()
+    # Roster goes through the configured source (tushare) again; quotes too.
+    monkeypatch.setattr(src, "make_stock_list_adapter", lambda *x, **k: a)
     monkeypatch.setattr(src, "make_quote_adapter", lambda *x, **k: a)
-    # Roster now comes from akshare (free, survivorship-free) — neutralize the
-    # real network call in tests; the by-date sweep is what we're exercising.
-    import quanti.data.akshare_adapter as aks
-    monkeypatch.setattr(aks.AkShareAdapter, "sync_stock_list",
-                        lambda self, *a_, **k: 0)
     return a
 
 

@@ -352,15 +352,17 @@ class TushareAdapter:
             })
         return self._db.save_daily_basic(pd.DataFrame(rows))
 
-    def sync_financials(self, code: str) -> int:
+    def sync_financials(self, code: str, patient: bool = False) -> int:
         """Per-code financial indicators (ROE + YoY growth) keyed by report
-        period, carrying ann_date for point-in-time alignment. Higher tushare
-        point-tier; degrades to 0 rows (logged) if the endpoint is unavailable."""
+        period, carrying the REAL ann_date for point-in-time alignment (more
+        precise than akshare's statutory-deadline proxy). Needs the 2000-point
+        tier; degrades to 0 rows (logged) if the endpoint is unavailable.
+        `patient` waits out per-minute rate limits (set by the CLI loop)."""
         pro = self._ensure_pro()
         ts_code = self._code_to_ts_code(code)
         try:
             df = self._retry(
-                pro.fina_indicator, ts_code=ts_code,
+                pro.fina_indicator, ts_code=ts_code, _patient=patient,
                 fields="ts_code,ann_date,end_date,roe,netprofit_yoy,or_yoy")
         except Exception as e:  # noqa: BLE001 - point-tier / availability
             logger.info("fina_indicator unavailable for %s: %s", code, e)
