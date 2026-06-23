@@ -256,3 +256,55 @@ class TestSourceGuard:
         n = db.save_daily_quotes(self._bars("000001", "tushare", (4, 5)))
         assert n == 2
         assert db.get_quote_source("000001") == "tushare"
+
+
+class TestClear:
+    """quanti sync --clear — scoped, dry-run-by-default deletion of synced data."""
+
+    @staticmethod
+    def _q(code, src, days):
+        import pandas as pd
+        return pd.DataFrame({
+            "code": code, "date": [date(2024, 1, d) for d in days],
+            "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
+            "volume": 1e6, "amount": 1e7, "turnover": 1.0, "source": src})
+
+    def test_delete_quotes_dry_run_then_actual(self, db):
+        db.save_daily_quotes(self._q("000001", "tushare", (2, 3, 4)))
+        assert db.delete_quotes(dry_run=True) == 3        # counts, deletes nothing
+        assert len(db.get_daily_quotes("000001", date(2024, 1, 1),
+                                       date(2024, 1, 9))) == 3
+        assert db.delete_quotes() == 3                    # actual delete
+        assert len(db.get_daily_quotes("000001", date(2024, 1, 1),
+                                       date(2024, 1, 9))) == 0
+
+    def test_delete_quotes_scoped_by_code(self, db):
+        db.save_daily_quotes(self._q("000001", "tushare", (2, 3)))
+        db.save_daily_quotes(self._q("600519", "tushare", (2, 3)))
+        assert db.delete_quotes(codes=["000001"]) == 2
+        assert db.get_quote_source("000001") is None       # gone
+        assert db.get_quote_source("600519") == "tushare"  # kept
+
+    def test_delete_quotes_scoped_by_source(self, db):
+        db.save_daily_quotes(self._q("000001", "tushare", (2, 3)))
+        db.save_daily_quotes(self._q("600519", "akshare", (2, 3)))  # different code
+        assert db.delete_quotes(source="akshare") == 2
+        assert db.get_quote_source("600519") is None        # akshare gone
+        assert db.get_quote_source("000001") == "tushare"   # tushare kept
+
+    def test_delete_daily_basic_and_financials(self, db):
+        import pandas as pd
+        db.save_daily_basic(pd.DataFrame([
+            {"code": "000001", "date": date(2024, 1, 2), "pe": 10.0}]))
+        db.save_financials(pd.DataFrame([
+            {"code": "000001", "end_date": "20231231", "ann_date": "20240430",
+             "report_type": "", "roe": 15.0}]))
+        assert db.delete_daily_basic() == 1
+        assert db.delete_financials() == 1
+        assert db.get_daily_basic("000001", date(2024, 1, 1), date(2024, 1, 3)).empty
+        assert db.get_financials_asof("000001", date(2024, 5, 1)).empty
+
+    def test_clear_backfill_progress(self, db):
+        db.mark_backfill_done(date(2024, 1, 2), 100)
+        assert db.clear_backfill_progress() == 1
+        assert db.get_backfilled_dates() == set()
