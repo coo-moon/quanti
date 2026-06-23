@@ -49,6 +49,22 @@ def cmd_sync(args):
         count = make_stock_list_adapter(db, source).sync_stock_list()
         logger.info(f"Synced {count} stocks")
 
+    if getattr(args, "backfill", False):
+        from quanti.data.backfill import run_backfill
+        years = getattr(args, "years", 5)
+        logger.info(f"Backfilling {years}y of history by trading date "
+                    f"(source={source or 'default'})...")
+
+        def _prog(i, total, d, res):
+            if i % 50 == 0 or i == total:
+                logger.info(f"  {i}/{total} @ {d} — rows={res.rows} "
+                            f"skipped={res.dates_skipped} errors={len(res.errors)}")
+
+        res = run_backfill(db, years=years, source=source or "tushare",
+                           on_progress=_prog)
+        logger.info(f"Backfill complete: {res.dates_done} dates, {res.rows} rows, "
+                    f"{res.dates_skipped} skipped, {len(res.errors)} errors")
+
     if args.quotes:
         adapter = make_quote_adapter(db, source)
         codes = args.codes.split(",") if args.codes else db.list_stocks()
@@ -365,6 +381,11 @@ def main():
     sync_parser.add_argument("--tushare-quotes", action="store_true",
                              dest="tushare_quotes",
                              help="Sync daily history via Tushare")
+    sync_parser.add_argument("--backfill", action="store_true",
+                             help="逐交易日全市场批量回填(含退市股,高效/可断点续),"
+                                  "配合 --years;需 Tushare token")
+    sync_parser.add_argument("--years", type=int, default=5,
+                             help="--backfill 回填年数(默认 5)")
     sync_parser.add_argument("--refetch", action="store_true",
                              help="全量重拉历史(覆盖旧数据)。从 qfq 切到"
                                   "「原始价+adj_factor」后须跑一次,否则旧 qfq "

@@ -37,6 +37,45 @@ class FakePro:
     def trade_cal(self, exchange, is_open):
         return pd.DataFrame([{"cal_date": "20240102"}, {"cal_date": "20240103"}])
 
+    # --- by-date (whole-market) endpoints for backfill ---
+    def daily(self, trade_date):
+        return pd.DataFrame([
+            {"ts_code": "000001.SZ", "open": 10.0, "high": 10.5, "low": 9.8,
+             "close": 10.2, "vol": 1000.0, "amount": 1020.0},
+            {"ts_code": "600001.SH", "open": 3.0, "high": 3.1, "low": 2.9,
+             "close": 3.0, "vol": 500.0, "amount": 150.0},  # delisted-style code
+        ])
+
+    def adj_factor(self, trade_date):
+        return pd.DataFrame([
+            {"ts_code": "000001.SZ", "adj_factor": 1.5},
+            {"ts_code": "600001.SH", "adj_factor": 2.0},
+        ])
+
+    def daily_basic(self, trade_date, fields):
+        return pd.DataFrame([
+            {"ts_code": "000001.SZ", "turnover_rate": 1.2},
+            {"ts_code": "600001.SH", "turnover_rate": 0.8},
+        ])
+
+
+def test_sync_by_date_whole_market(db):
+    """One call set covers the whole market for a day: units normalized, native
+    adj_factor stored, turnover from daily_basic, delisted code lands too (P3)."""
+    adapter = TushareAdapter(db, pro=FakePro())
+    n = adapter.sync_daily_quotes_by_date(date(2024, 1, 2))
+    assert n == 2
+    out = db.get_daily_quotes("000001", date(2024, 1, 1), date(2024, 1, 3))
+    row = out.iloc[0]
+    assert row["close"] == 10.2
+    assert row["volume"] == 1000.0 * 100        # 手 → 股
+    assert row["amount"] == 1020.0 * 1000        # 千元 → 元
+    assert row["adj_factor"] == 1.5              # tushare native factor
+    assert row["turnover"] == 1.2                # from daily_basic
+    assert db.get_quote_source("000001") == "tushare"
+    # the delisted-style 600001 also landed
+    assert len(db.get_daily_quotes("600001", date(2024, 1, 1), date(2024, 1, 3))) == 1
+
 
 def _fake_pro_bar(ts_code, asset, adj, start_date, end_date):
     # tushare returns newest-first; columns trade_date/open/high/low/close/vol/amount
