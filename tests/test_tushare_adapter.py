@@ -189,6 +189,36 @@ def test_by_date_reconstructs_factor_across_dividend(db):
     assert by_date["2024-01-03"] == pytest.approx(10.0 / 9.0)
 
 
+def test_by_date_daily_basic_is_optional_and_fast_fail(db):
+    """daily_basic is single-attempt (never patient/retried): if it raises, the
+    day's OHLCV still lands (turnover 0) and last_basic_ok=False; with_basic=False
+    skips it entirely. This is what lets a rate-limited daily_basic not stall the
+    bulk backfill."""
+    calls = {"basic": 0}
+
+    class RLBasicPro(FakePro):
+        def daily(self, ts_code=None, trade_date=None, **kw):
+            return pd.DataFrame([{
+                "ts_code": "000001.SZ", "trade_date": trade_date, "open": 10.0,
+                "high": 10.0, "low": 10.0, "close": 10.0, "pre_close": 10.0,
+                "vol": 100.0, "amount": 1000.0}])
+
+        def daily_basic(self, trade_date, fields):
+            calls["basic"] += 1
+            raise Exception("抱歉，您访问接口(daily_basic)频率超限(1次/分钟)")
+
+    adapter = TushareAdapter(db, pro=RLBasicPro())
+    # daily_basic raises → ONE attempt only (no patient/retry), day still saves.
+    n = adapter.sync_daily_quotes_by_date(date(2024, 1, 2))
+    assert n == 1 and calls["basic"] == 1          # single fast attempt
+    assert adapter.last_basic_ok is False
+    out = db.get_daily_quotes("000001", date(2024, 1, 1), date(2024, 1, 3))
+    assert out.iloc[0]["turnover"] == 0            # OHLCV landed, no valuation
+    # with_basic=False → daily_basic not called at all.
+    adapter.sync_daily_quotes_by_date(date(2024, 1, 3), with_basic=False)
+    assert calls["basic"] == 1                     # unchanged
+
+
 def test_methods_raise_clearly_without_token(db, monkeypatch):
     # No pro injected, no TUSHARE_TOKEN → clear error, no token leak.
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
