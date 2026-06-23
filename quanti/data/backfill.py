@@ -63,6 +63,14 @@ def run_backfill(db, *, years: int = 5, end: date | None = None,
     if not hasattr(adapter, "sync_daily_quotes_by_date"):
         raise RuntimeError(f"source {source!r} has no by-date backfill path")
 
+    # Clean source migration: a full backfill REPLACES history with `source`, so
+    # purge any other-vendor bars up front. Otherwise the one-source-per-code
+    # guard in save_daily_quotes would skip every existing (e.g. akshare) code
+    # and the backfill couldn't overwrite them. Untagged '' rows are kept.
+    purged = db.purge_other_source_quotes(source)
+    if purged:
+        logger.warning("数据源迁移:清除 %d 行非 %s 历史(单源一致)", purged, source)
+
     dates = _trade_dates(db, start, end)
     done = db.get_backfilled_dates() if resume else set()
     res = BackfillResult()

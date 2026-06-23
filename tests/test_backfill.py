@@ -69,3 +69,21 @@ def test_backfill_throttles(db, fake_adapter):
                  calls_per_min=600, sleep_fn=slept.append)
     # ~2 calls/date (daily + daily_basic; no adj_factor) at 600/min → 0.2s/date.
     assert slept and all(s == pytest.approx(0.2) for s in slept)
+
+
+def test_backfill_purges_other_source_for_clean_migration(db, fake_adapter):
+    """A full backfill is a source migration: pre-existing akshare bars are
+    purged up front so the new vendor's history isn't blocked by the
+    one-source-per-code guard. Untagged ('') rows are kept."""
+    import pandas as pd
+    db.save_daily_quotes(pd.DataFrame({
+        "code": ["000001", "000001"], "date": [date(2023, 6, 1), date(2023, 6, 2)],
+        "open": 9.0, "high": 9.0, "low": 9.0, "close": 9.0,
+        "volume": 1e6, "amount": 1e7, "turnover": 1.0, "source": "akshare"}))
+    assert db.get_quote_source("000001") == "akshare"
+    run_backfill(db, years=1, end=date(2024, 1, 4), source="tushare",
+                 sleep_fn=lambda _x: None)
+    # akshare history is gone; the guard would now accept tushare for 000001.
+    assert db.get_quote_source("000001") is None
+    assert len(db.get_daily_quotes("000001", date(2023, 1, 1),
+                                   date(2024, 1, 9))) == 0

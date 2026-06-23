@@ -254,6 +254,8 @@ expr = parse_expr("-Mean(turnover, 20)")                  # 低换手异象
 
 > **数据源配置**:数据源可经三处切换(优先级 显式 CLI `--source` > DB `app_config`(Web/UI 设置) > env `QUANTI_DATA_SOURCE` > 默认 `tushare`);Tushare token 经 DB `app_config.data_source_token` > env `TUSHARE_TOKEN` 解析;tushare 未装或无 token 时**不静默回退**,统一报错(`DataSourceUnavailable` / UI 错误提示),要用 akshare 须显式切源——避免不同口径/纵深的源污染 DB、破坏「一票一源」。Web 端在 **Dashboard → 数据源** 面板可选源 / 填 token / 测试连接 / 保存校验。
 
+> **一票一源守卫**:`daily_quotes` 每行带 `source`,`save_daily_quotes` **默认拒绝把不同源的 bar 拼到已有序列上**(跳过+告警,不静默混源——不同源单位/复权约定不同,拼接会污染价序),除非显式 `allow_source_mix=True`。换源是**迁移**而非混用:`quanti sync --backfill` 开跑前会一次性 `purge_other_source_quotes` 清除异源历史,之后整库单源一致。日更/增量遇到异源股票会跳过并提示先跑 `--backfill` 迁移。
+
 ### 无幸存者偏差回测 (survivorship-free)
 
 ```bash
