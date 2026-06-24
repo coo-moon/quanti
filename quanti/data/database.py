@@ -399,6 +399,21 @@ class Database:
                 done_at TEXT NOT NULL
             );
 
+            -- Runtime-editable risk-control thresholds (P0-3). Singleton;
+            -- absent row → RiskConfig dataclass defaults. Brokers read this
+            -- live so edits take effect without a restart.
+            CREATE TABLE IF NOT EXISTS risk_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                stop_loss_pct REAL NOT NULL,
+                portfolio_stop_loss_pct REAL NOT NULL,
+                take_profit_activate_pct REAL NOT NULL,
+                take_profit_trail_pct REAL NOT NULL,
+                strategy_exit_enabled INTEGER NOT NULL,
+                atr_stop_k REAL NOT NULL DEFAULT 0,
+                atr_stop_n INTEGER NOT NULL DEFAULT 14,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS agent_goal (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 target_annual_return REAL NOT NULL,
@@ -1447,6 +1462,61 @@ class Database:
                 updated_at=excluded.updated_at
             """,
             (data_source, token, now),
+        )
+        self.conn.commit()
+
+    # --- Runtime risk-control config (P0-3) ---
+
+    _RISK_CONFIG_FIELDS = (
+        "stop_loss_pct", "portfolio_stop_loss_pct", "take_profit_activate_pct",
+        "take_profit_trail_pct", "strategy_exit_enabled", "atr_stop_k",
+        "atr_stop_n",
+    )
+
+    def get_risk_config(self) -> dict:
+        """Runtime risk thresholds. Empty dict when unset → caller falls back to
+        RiskConfig defaults (so a fresh DB behaves exactly as before)."""
+        row = self.conn.execute(
+            "SELECT stop_loss_pct, portfolio_stop_loss_pct, "
+            "take_profit_activate_pct, take_profit_trail_pct, "
+            "strategy_exit_enabled, atr_stop_k, atr_stop_n "
+            "FROM risk_config WHERE id=1"
+        ).fetchone()
+        if row is None:
+            return {}
+        return {
+            "stop_loss_pct": row[0], "portfolio_stop_loss_pct": row[1],
+            "take_profit_activate_pct": row[2], "take_profit_trail_pct": row[3],
+            "strategy_exit_enabled": bool(row[4]),
+            "atr_stop_k": row[5], "atr_stop_n": int(row[6]),
+        }
+
+    def upsert_risk_config(self, cfg: dict) -> None:
+        """Persist the singleton risk config. `cfg` must carry all fields in
+        _RISK_CONFIG_FIELDS (the API validates before calling)."""
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO risk_config (
+                id, stop_loss_pct, portfolio_stop_loss_pct,
+                take_profit_activate_pct, take_profit_trail_pct,
+                strategy_exit_enabled, atr_stop_k, atr_stop_n, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                stop_loss_pct=excluded.stop_loss_pct,
+                portfolio_stop_loss_pct=excluded.portfolio_stop_loss_pct,
+                take_profit_activate_pct=excluded.take_profit_activate_pct,
+                take_profit_trail_pct=excluded.take_profit_trail_pct,
+                strategy_exit_enabled=excluded.strategy_exit_enabled,
+                atr_stop_k=excluded.atr_stop_k,
+                atr_stop_n=excluded.atr_stop_n,
+                updated_at=excluded.updated_at
+            """,
+            (cfg["stop_loss_pct"], cfg["portfolio_stop_loss_pct"],
+             cfg["take_profit_activate_pct"], cfg["take_profit_trail_pct"],
+             int(bool(cfg["strategy_exit_enabled"])), cfg["atr_stop_k"],
+             int(cfg["atr_stop_n"]), now),
         )
         self.conn.commit()
 

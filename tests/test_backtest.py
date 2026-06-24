@@ -446,3 +446,40 @@ def test_backtest_protections_block_buys_after_stop_cluster(tmp_path):
     assert smoke.equity_curve is not None
 
     db.close()
+
+
+def test_backtest_atr_stop_fires_when_fixed_would_not(tmp_path):
+    """P1-1 end-to-end: a calm name (tiny ATR) that drops -6% is NOT cut by the
+    fixed -8% stop, but IS cut by the ATR-adaptive stop (k=2, ratio≈1.7% → stop
+    ≈-3.3%). Proves the engine precomputes ATR ratios and injects them into
+    check_exits. k=0 on the same data holds."""
+    from quanti.risk.manager import RiskConfig, RiskManager
+
+    db = Database(str(tmp_path / "atr.db"))
+    db.initialize()
+    # 9 flat low-vol bars, a -6% drop on bar 10, a trailing bar for next-open fill.
+    closes = [10.0] * 9 + [9.4, 9.4]
+    dates = pd.bdate_range("2024-01-02", periods=len(closes))
+    df = pd.DataFrame({
+        "code": "000001", "date": [d.date() for d in dates],
+        "open": closes, "high": [c + 0.02 for c in closes],
+        "low": [c - 0.02 for c in closes], "close": closes,
+        "volume": 1e6, "amount": [c * 1e6 for c in closes], "turnover": 1.0,
+    })
+    db.save_daily_quotes(df)
+    provider = DataProvider(db)
+    codes, start, end = ["000001"], date(2024, 1, 1), date(2024, 2, 28)
+
+    def run(k):
+        s = AlwaysBuyStrategy()
+        s.init({})
+        rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=k,
+                                    atr_stop_n=5, take_profit_activate_pct=0.0))
+        return BacktestEngine(provider, 100_000.0, risk_manager=rm).run(
+            s, codes, start, end)
+
+    atr_exits = [t for t in run(2.0).trades
+                 if t.strategy == "risk_exit" and "ATR" in (t.reason or "")]
+    assert atr_exits, "ATR-adaptive stop should have fired on the -6% drop"
+    # Fixed-only (k=0): -6% never breaches -8% → no risk_exit.
+    assert not [t for t in run(0.0).trades if t.strategy == "risk_exit"]

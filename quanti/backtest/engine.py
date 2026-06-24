@@ -162,6 +162,24 @@ class BacktestEngine:
                 last_close = bar.close
         self._adv20 = adv20
 
+        # Precompute per-(code, date) ATR(n)/close ratio for the ATR-adaptive
+        # stop, ONLY when armed (atr_stop_k>0). A ratio is adjust-agnostic, so
+        # it's the same number the live path computes; done once here keeps the
+        # per-day exit check an O(1) lookup. See RiskManager.check_exits.
+        atr_ratio: dict[str, dict[date, float]] = {}
+        if self._risk is not None and self._risk.config.atr_stop_k > 0:
+            from quanti.factors.technical import compute_atr
+            n = self._risk.config.atr_stop_n
+            for code, bars in all_bars.items():
+                if len(bars) < n + 1:
+                    continue
+                df = pd.DataFrame({"high": [b.high for b in bars],
+                                   "low": [b.low for b in bars],
+                                   "close": [b.close for b in bars]})
+                ratios = (compute_atr(df, n) / df["close"]).tolist()
+                atr_ratio[code] = {b.date: r for b, r in zip(bars, ratios)
+                                   if r == r}  # r==r drops NaN warm-up bars
+
         for idx, current_date in enumerate(sorted_dates):
             if self._risk is not None:
                 self._risk.reset_daily()
@@ -244,7 +262,11 @@ class BacktestEngine:
                 # strategy's OWN sells still flow through on_bar, so we leave
                 # strategy_sell_codes empty to avoid double-counting.
                 if self._risk is not None:
-                    for sl in self._risk.check_exits(portfolio, peaks=peaks):
+                    atr_r = {c: atr_ratio[c][current_date]
+                             for c in portfolio.positions
+                             if c in atr_ratio and current_date in atr_ratio[c]}
+                    for sl in self._risk.check_exits(
+                            portfolio, peaks=peaks, atr_ratios=atr_r):
                         if sl.stock_code in today_bars:
                             _queue(sl, "risk_exit")
 

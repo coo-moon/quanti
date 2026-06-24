@@ -32,6 +32,36 @@ def compute_peaks(db, positions: list[dict]) -> dict[str, float]:
     return peaks
 
 
+def compute_atr_ratios(provider, positions: list[dict],
+                       n: int) -> dict[str, float]:
+    """Per-code ATR(n)/latest_close — the dimensionless volatility ratio the
+    ATR-adaptive stop needs. A ratio is adjust-agnostic (hfq vs raw give the
+    same number), matching the backtest, and comparable to pos.pnl_pct. Uses
+    only recent history (ATR is a current-volatility measure, not tied to
+    buy_date). Never raises into the exit cycle."""
+    import pandas as pd
+
+    from quanti.factors.technical import compute_atr
+    out: dict[str, float] = {}
+    start = date.today() - timedelta(days=n * 4 + 40)  # enough bars to warm ATR
+    for p in positions:
+        code = p["code"]
+        try:
+            bars = provider.get_daily_bars(code, start, date.today())
+            if len(bars) < n + 1:
+                continue
+            df = pd.DataFrame({"high": [b.high for b in bars],
+                               "low": [b.low for b in bars],
+                               "close": [b.close for b in bars]})
+            atr = compute_atr(df, n).iloc[-1]
+            close = df["close"].iloc[-1]
+            if atr == atr and close > 0:  # atr==atr filters NaN warm-up
+                out[code] = float(atr / close)
+        except Exception as e:  # noqa: BLE001 - one bad code can't stop exits
+            logger.debug("ATR ratio skipped for %s: %s", code, e)
+    return out
+
+
 def load_strategies(strategies_dir: str) -> dict:
     """Load strategy classes by name. Returns {} if the loader/dir is
     unavailable, so exits degrade to stop-loss + take-profit only."""
