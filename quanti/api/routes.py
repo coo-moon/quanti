@@ -57,6 +57,12 @@ class SyncRequest(BaseModel):
     # days) is below this are recorded as ERRORS, not just warnings. None/0 →
     # completeness is reported as warnings only (job still 'done').
     min_coverage: float | None = None
+    # Sync granularity (from the UI 同步设置 card). years → history window;
+    # with_basic → also pull daily_basic (turnover + valuation); with_financials
+    # → run a whole-market financials pass after the quotes.
+    years: int = 1
+    with_basic: bool = False
+    with_financials: bool = False
 
 
 class SyncResult(BaseModel):
@@ -101,24 +107,36 @@ class ScreenResponse(BaseModel):
 
 @router.post("/sync/quotes")
 async def sync_quotes(body: SyncRequest, request: Request):
-    """Sync daily quotes for given stock codes from the configured source."""
+    """Sync daily quotes for given stock codes from the configured source.
+    Honors the UI 同步设置: years (window), with_basic (turnover+valuation),
+    with_financials (whole-market financials pass after)."""
+    from datetime import date, timedelta
     from quanti.data.source import try_make_quote_adapter
 
     db = request.app.state.db
     adapter, src_err = try_make_quote_adapter(db)
     if src_err:
         return SyncResult(synced={}, errors={"_source": src_err})
+    end_d = date.today()
+    start_d = end_d - timedelta(days=365 * max(1, body.years))
     results = {}
     errors = {}
     for code in body.codes:
         try:
-            count = adapter.sync_daily_quotes(code)
+            count = adapter.sync_daily_quotes(code, start=start_d, end=end_d,
+                                              with_basic=body.with_basic)
             results[code] = count
             if count == 0:
                 errors[code] = "未获取到数据，可能是网络问题或股票代码无效"
         except Exception as e:
             results[code] = 0
             errors[code] = str(e)
+    if body.with_financials:
+        from quanti.data.source import sync_financials_years
+        try:
+            sync_financials_years(db, body.years)  # follows source, akshare backstop
+        except Exception as e:  # noqa: BLE001 - optional
+            errors["_financials"] = str(e)
     return SyncResult(synced=results, errors=errors)
 
 
@@ -136,14 +154,18 @@ async def sync_quotes_async(body: SyncRequest, request: Request):
 
     job_id = f"q_{str(uuid.uuid4())[:8]}"
     db.create_sync_job(job_id, "_quotes_sync", len(codes))
-    asyncio.create_task(_run_quotes_sync(job_id, codes, db,
-                                         min_coverage=body.min_coverage))
+    asyncio.create_task(_run_quotes_sync(
+        job_id, codes, db, min_coverage=body.min_coverage,
+        years=body.years, with_basic=body.with_basic,
+        with_financials=body.with_financials))
 
     return {"job_id": job_id}
 
 
 async def _run_quotes_sync(job_id: str, codes: list[str], db,
-                           min_coverage: float | None = None) -> None:
+                           min_coverage: float | None = None,
+                           years: int = 1, with_basic: bool = False,
+                           with_financials: bool = False) -> None:
     from datetime import date, timedelta
     from quanti.data.source import try_make_quote_adapter
     from quanti.data.integrity import (check_quote_completeness,
@@ -152,7 +174,7 @@ async def _run_quotes_sync(job_id: str, codes: list[str], db,
     from functools import partial
 
     end_d = date.today()
-    start_d = end_d - timedelta(days=365)
+    start_d = end_d - timedelta(days=365 * max(1, years))
     adapter, src_err = try_make_quote_adapter(db)
     if src_err:
         db.update_sync_job(job_id, 0, "error", {"_source": src_err})
@@ -165,7 +187,8 @@ async def _run_quotes_sync(job_id: str, codes: list[str], db,
 
     for i, code in enumerate(codes):
         try:
-            fn = partial(adapter.sync_daily_quotes, code, start=start_d, end=end_d, repair_gaps=False)
+            fn = partial(adapter.sync_daily_quotes, code, start=start_d,
+                         end=end_d, repair_gaps=False, with_basic=with_basic)
             count = await loop.run_in_executor(None, fn)
             if count == 0:
                 errors[code] = "未获取到数据"
@@ -182,6 +205,14 @@ async def _run_quotes_sync(job_id: str, codes: list[str], db,
         except Exception as e:
             errors[code] = str(e)
         db.update_sync_job(job_id, i + 1, "running", errors, warnings)
+
+    if with_financials:
+        from quanti.data.source import sync_financials_years
+        try:
+            await loop.run_in_executor(
+                None, partial(sync_financials_years, db, years))  # follows source
+        except Exception as e:  # noqa: BLE001 - financials optional; don't fail job
+            warnings["_financials"] = str(e)
 
     final_status = "error" if errors else "done"
     db.update_sync_job(job_id, len(codes), final_status, errors, warnings)

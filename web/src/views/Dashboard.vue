@@ -34,6 +34,34 @@
       </div>
     </details>
 
+    <details class="card ds-card">
+      <summary class="card-header ds-summary">
+        <h2>同步设置</h2>
+        <span class="card-header-hint">
+          下载 {{ syncYears }} 年 · {{ syncWithBasic ? "含估值" : "仅行情" }}{{ syncWithFinancials ? " · 含财报" : "" }}
+        </span>
+      </summary>
+      <div class="ds-body">
+        <div class="ds-row">
+          <label>下载年数</label>
+          <input type="number" min="1" max="25" v-model.number="syncYears" />
+        </div>
+        <div class="ds-row">
+          <label>拉估值</label>
+          <input type="checkbox" v-model="syncWithBasic" />
+          <span class="card-header-hint">daily_basic:换手 + PE/PB/市值(逐股多 1 次调用)</span>
+        </div>
+        <div class="ds-row">
+          <label>拉财报</label>
+          <input type="checkbox" v-model="syncWithFinancials" />
+          <span class="card-header-hint">同步后跑一遍全市场财报(akshare,免费)</span>
+        </div>
+        <div class="card-header-hint" style="padding-top:4px">
+          作用于「添加并同步 / 下载K线」;后台守护进程每日自动补最新财报。
+        </div>
+      </div>
+    </details>
+
     <div class="stats-row">
       <div class="stat-card">
         <div class="stat-icon blue">
@@ -209,7 +237,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted } from "vue";
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from "vue";
 import {
   fetchStocks,
   fetchStockStats,
@@ -236,6 +264,24 @@ const addInput = ref("");
 const syncing = ref(false);
 const syncingAll = ref(false);
 const syncingPool = ref(false);
+
+// 同步设置 (persisted in localStorage). Applied to 添加并同步 / 下载K线.
+const _ss = JSON.parse(localStorage.getItem("quanti.syncSettings") || "{}");
+const syncYears = ref<number>(_ss.years ?? 5);
+const syncWithBasic = ref<boolean>(_ss.with_basic ?? true);
+const syncWithFinancials = ref<boolean>(_ss.with_financials ?? false);
+function syncOpts() {
+  return {
+    years: syncYears.value,
+    with_basic: syncWithBasic.value,
+    with_financials: syncWithFinancials.value,
+  };
+}
+// Persist on every toggle (not just when a sync runs), so the checkbox state
+// survives a page refresh.
+watch([syncYears, syncWithBasic, syncWithFinancials], () => {
+  localStorage.setItem("quanti.syncSettings", JSON.stringify(syncOpts()));
+});
 const syncMsg = ref("");
 const syncError = ref(false);
 const syncingCodes = reactive(new Set<string>());
@@ -426,7 +472,7 @@ async function addStocks() {
   syncMsg.value = "";
   syncError.value = false;
   try {
-    const res = await syncQuotes(codes);
+    const res = await syncQuotes(codes, syncOpts());
     const data = res.data;
     const okCount = Object.values(data.synced).filter((n) => n > 0).length;
     const errCount = Object.keys(data.errors).length;
@@ -494,7 +540,7 @@ async function syncAll() {
   syncError.value = false;
   syncProgress.value = { job_id: "", current: 0, total: 0, status: "running", errors: {}, message: "启动中...", eta_seconds: null };
   try {
-    const res = await syncQuotesAsync();
+    const res = await syncQuotesAsync(syncOpts());
     if (res.data.job_id) {
       startPolling(res.data.job_id);
     }

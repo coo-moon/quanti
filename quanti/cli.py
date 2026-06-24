@@ -159,7 +159,7 @@ def cmd_sync(args):
         else:
             import time as _time
             adapter = make_quote_adapter(db, source or "tushare")
-            if not hasattr(adapter, "sync_financials"):
+            if not hasattr(adapter, "sync_financials_for_code"):
                 logger.error("source 无 financials 支持;用 --source akshare(免费)")
             else:
                 codes = [s.code for s in db.list_stocks()]
@@ -168,7 +168,7 @@ def cmd_sync(args):
                 total = 0
                 for i, code in enumerate(codes):
                     try:
-                        total += adapter.sync_financials(code, patient=True)
+                        total += adapter.sync_financials_for_code(code, patient=True)
                     except Exception as e:  # noqa: BLE001
                         logger.warning(f"  {code}: {e}")
                     if (i + 1) % 100 == 0:

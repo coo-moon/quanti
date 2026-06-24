@@ -132,6 +132,55 @@ def make_stock_list_adapter(db, source: str | None = None, *,
     return make_quote_adapter(db, source, allow_fallback=allow_fallback)
 
 
+def make_financials_adapter(db, source: str | None = None):
+    """Financials adapter following the configured source, exposing
+    ``sync_financials_by_period(period)``.
+
+    Unlike quotes, `financials` is its OWN table with no one-source guard (PIT
+    via ann_date works regardless of vendor), so here we DO silently fall back to
+    free akshare when the configured source can't do financials — the daemon
+    must still refresh. Falls back when: tushare is selected but unavailable
+    (no token / not installed), the source is xtdata (no financials endpoint),
+    or any build error. tushare's path uses the VIP tier (real ann_date); if
+    that tier isn't available it logs and returns 0 — but the
+    ``*_with_backstop`` helpers below heal that by falling through to akshare.
+
+    The returned adapter exposes BOTH ``sync_financials_by_period(period)`` and
+    ``sync_financials(years)`` with uniform semantics across akshare/tushare."""
+    adapter, _err = try_make_quote_adapter(db, source)
+    if adapter is not None and hasattr(adapter, "sync_financials_by_period"):
+        return adapter
+    from quanti.data.akshare_adapter import AkShareAdapter
+    return AkShareAdapter(db)
+
+
+def _financials_with_backstop(db, source, call):
+    """Run a financials sync via the configured source, falling through to free
+    akshare when it returns 0 rows (e.g. tushare selected but no VIP tier) — so
+    the financials table always stays fresh. `call(adapter) -> int rows`."""
+    from quanti.data.akshare_adapter import AkShareAdapter
+    adapter = make_financials_adapter(db, source)
+    n = call(adapter)
+    if n == 0 and not isinstance(adapter, AkShareAdapter):
+        n = call(AkShareAdapter(db))
+    return n
+
+
+def refresh_latest_financials(db, source=None) -> int:
+    """Daemon's daily refresh: ONLY the latest report period (cheap), following
+    the configured source with an akshare backstop."""
+    from quanti.data.akshare_adapter import AkShareAdapter
+    period = AkShareAdapter.report_periods(1)[-1]
+    return _financials_with_backstop(
+        db, source, lambda a: a.sync_financials_by_period(period))
+
+
+def sync_financials_years(db, years: int, source=None) -> int:
+    """UI/CLI backfill: whole-market financials over `years` report periods,
+    following the configured source with an akshare backstop."""
+    return _financials_with_backstop(db, source, lambda a: a.sync_financials(years))
+
+
 def probe_source(source: str, token: str | None = None,
                  db=None) -> tuple[bool, str]:
     """Cheap connectivity check for a source. Returns (ok, message). Makes a

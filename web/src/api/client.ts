@@ -76,11 +76,17 @@ export interface SyncResult {
   errors: Record<string, string>;
 }
 
-export const syncQuotes = (codes: string[]) =>
-  api.post<SyncResult>("/sync/quotes", { codes });
+export interface SyncOpts {
+  years?: number;
+  with_basic?: boolean;
+  with_financials?: boolean;
+}
 
-export const syncQuotesAsync = () =>
-  api.post<{ job_id: string }>("/sync/quotes/async", { codes: [] });
+export const syncQuotes = (codes: string[], opts: SyncOpts = {}) =>
+  api.post<SyncResult>("/sync/quotes", { codes, ...opts });
+
+export const syncQuotesAsync = (opts: SyncOpts = {}) =>
+  api.post<{ job_id: string }>("/sync/quotes/async", { codes: [], ...opts });
 
 export const fetchQuotesSyncStatus = (jobId: string) =>
   api.get<SyncStatus>(`/sync/quotes/status`, { params: { job_id: jobId } });

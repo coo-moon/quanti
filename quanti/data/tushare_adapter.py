@@ -135,6 +135,21 @@ class TushareAdapter:
         except ValueError:
             return None
 
+    @staticmethod
+    def _keep_latest_report(df):
+        """fina_indicator[_vip] returns MULTIPLE rows per (ts_code, end_date)
+        when a report is restated, distinguished by `update_flag` (1=corrected,
+        0=original). Keep only the latest per period — else INSERT OR REPLACE
+        on (code, end_date) can persist the STALE original. Prefers update_flag,
+        falls back to latest ann_date when the column is absent (some tiers)."""
+        if df is None or df.empty:
+            return df
+        sort_cols = [c for c in ("ann_date", "update_flag") if c in df.columns]
+        keys = [c for c in ("ts_code", "end_date") if c in df.columns]
+        if sort_cols and keys:
+            df = df.sort_values(sort_cols).drop_duplicates(keys, keep="last")
+        return df
+
     # --- lazy network seam (never invoked when fully injected) ---
 
     def _ensure_pro(self):
@@ -221,13 +236,17 @@ class TushareAdapter:
 
     def sync_daily_quotes(self, code: str, start: date | None = None,
                           end: date | None = None,
-                          repair_gaps: bool = True) -> int:
+                          repair_gaps: bool = True,
+                          with_basic: bool = False) -> int:
         """Fetch RAW daily bars for `code` (incremental from the last stored bar
         by default) and save them with a reconstructed adj_factor. ONE `daily`
         call (500/min) — no `adj_factor`/`pro_bar` call (rate-limited as low as
         1/min): the factor is rebuilt from `daily`'s pre_close (see
-        `reconstruct_adj_factor`). turnover stays 0 (the per-code path has no
-        daily_basic). Returns rows saved.
+        `reconstruct_adj_factor`). Returns rows saved.
+
+        `with_basic=True` also pulls per-code daily_basic (turnover + valuation),
+        so a per-code sync matches the by-date path's granularity (best-effort —
+        skipped if the endpoint is rate-limited).
 
         `repair_gaps` is accepted for adapter-signature parity (sync sites pass
         it) but ignored — tushare is a single source, no cross-source repair."""
@@ -265,10 +284,36 @@ class TushareAdapter:
         df["adj_factor"] = reconstruct_adj_factor(
             df["close"].tolist(), raw["pre_close"].astype(float).tolist(),
             seed_close=seed_close, seed_factor=seed_factor)
+        if with_basic:
+            self._attach_per_code_basic(code, ts_code, sd, ed, df)
         saved = self._db.save_daily_quotes(df)
         logger.info("%s: %d bars [%s~%s] via tushare", code, saved,
                     df["date"].min(), df["date"].max())
         return saved
+
+    def _attach_per_code_basic(self, code, ts_code, sd, ed, df) -> None:
+        """Per-code daily_basic over [sd, ed]: fill the quotes' turnover column
+        and save the valuation rows. Best-effort (rate-limited endpoint) —
+        leaves turnover 0 on failure."""
+        pro = self._ensure_pro()
+        try:
+            b = self._retry(
+                pro.daily_basic, ts_code=ts_code, start_date=sd, end_date=ed,
+                fields=("ts_code,trade_date,turnover_rate,pe,pe_ttm,pb,ps,ps_ttm,"
+                        "dv_ratio,total_mv,circ_mv"))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("daily_basic (per-code) unavailable for %s: %s", code, e)
+            return
+        if b is None or b.empty:
+            return
+        b = b.copy()
+        b["date"] = pd.to_datetime(b["trade_date"]).dt.date
+        turn = dict(zip(b["date"], b["turnover_rate"].fillna(0).astype(float)))
+        df["turnover"] = df["date"].map(lambda d: turn.get(d, 0.0))
+        b["code"] = code
+        self._db.save_daily_basic(b[[
+            "code", "date", "pe", "pe_ttm", "pb", "ps", "ps_ttm",
+            "total_mv", "circ_mv", "dv_ratio", "turnover_rate"]])
 
     def sync_daily_quotes_by_date(self, trade_date: date,
                                   seed_state: dict | None = None,
@@ -352,23 +397,27 @@ class TushareAdapter:
             })
         return self._db.save_daily_basic(pd.DataFrame(rows))
 
-    def sync_financials(self, code: str, patient: bool = False) -> int:
+    def sync_financials_for_code(self, code: str, patient: bool = False) -> int:
         """Per-code financial indicators (ROE + YoY growth) keyed by report
         period, carrying the REAL ann_date for point-in-time alignment (more
         precise than akshare's statutory-deadline proxy). Needs the 2000-point
         tier; degrades to 0 rows (logged) if the endpoint is unavailable.
+
+        NOTE: distinct from :meth:`sync_financials` (whole-market, multi-period)
+        — the per-code name avoids colliding with AkShareAdapter.sync_financials.
         `patient` waits out per-minute rate limits (set by the CLI loop)."""
         pro = self._ensure_pro()
         ts_code = self._code_to_ts_code(code)
         try:
             df = self._retry(
                 pro.fina_indicator, ts_code=ts_code, _patient=patient,
-                fields="ts_code,ann_date,end_date,roe,netprofit_yoy,or_yoy")
+                fields="ts_code,ann_date,end_date,roe,netprofit_yoy,or_yoy,update_flag")
         except Exception as e:  # noqa: BLE001 - point-tier / availability
             logger.info("fina_indicator unavailable for %s: %s", code, e)
             return 0
         if df is None or df.empty:
             return 0
+        df = self._keep_latest_report(df)   # drop restated duplicates
         rows = []
         for _, r in df.iterrows():
             ann = self._parse_ts_date(r.get("ann_date"))
@@ -385,3 +434,57 @@ class TushareAdapter:
         if not rows:
             return 0
         return self._db.save_financials(pd.DataFrame(rows))
+
+    def sync_financials_by_period(self, period: date, patient: bool = False) -> int:
+        """Whole-market financial indicators for ONE report period via tushare's
+        VIP endpoint ``fina_indicator_vip(period=...)`` — one call covers the
+        market, carrying the REAL ann_date (precise PIT, better than akshare's
+        statutory-deadline proxy). Mirrors
+        :meth:`AkShareAdapter.sync_financials_by_period` so the daemon/CLI can
+        pick the source uniformly. Needs the VIP tier (~5000 pts); degrades to 0
+        rows (logged) if the endpoint is unavailable. `financials` is its own
+        table (no one-source guard), so coexisting with akshare rows is harmless.
+        `patient` waits out per-minute rate limits."""
+        pro = self._ensure_pro()
+        ds = period.strftime("%Y%m%d")
+        try:
+            df = self._retry(
+                pro.fina_indicator_vip, period=ds, _patient=patient,
+                fields="ts_code,ann_date,end_date,roe,netprofit_yoy,or_yoy,update_flag")
+        except Exception as e:  # noqa: BLE001 - VIP tier / availability
+            logger.info("fina_indicator_vip unavailable for %s: %s", ds, e)
+            return 0
+        if df is None or df.empty:
+            return 0
+        df = self._keep_latest_report(df)   # drop restated duplicates per period
+        rows = []
+        for _, r in df.iterrows():
+            ann = self._parse_ts_date(r.get("ann_date"))
+            end = self._parse_ts_date(r.get("end_date"))
+            code, _exch = self._ts_code_to_code(str(r.get("ts_code", "")))
+            if ann is None or end is None or not code:
+                continue  # ann_date is the PIT key — skip rows without it
+            rows.append({
+                "code": code, "end_date": end.isoformat(),
+                "ann_date": ann.isoformat(), "report_type": "",
+                "roe": r.get("roe"), "net_profit": None, "revenue": None,
+                "netprofit_yoy": r.get("netprofit_yoy"),
+                "revenue_yoy": r.get("or_yoy"),
+            })
+        if not rows:
+            return 0
+        n = self._db.save_financials(pd.DataFrame(rows))
+        logger.info("financials %s: %d rows via tushare fina_indicator_vip",
+                    period.isoformat(), n)
+        return n
+
+    def sync_financials(self, years: int = 5, patient: bool = False) -> int:
+        """Whole-market financials over the last `years` report periods via the
+        VIP by-period endpoint (real ann_date). Uniform with
+        :meth:`AkShareAdapter.sync_financials` so a source-agnostic caller can
+        use either adapter interchangeably. Returns total rows saved."""
+        # report_periods is a pure date helper; akshare is a hard dep so reusing
+        # it here avoids duplicating the quarterly-schedule logic.
+        from quanti.data.akshare_adapter import AkShareAdapter
+        return sum(self.sync_financials_by_period(p, patient=patient)
+                   for p in AkShareAdapter.report_periods(years))

@@ -249,3 +249,78 @@ def test_sync_stock_list_patient_survives_rate_limit(db, monkeypatch):
 
     n = TushareAdapter(db, pro=RLPro()).sync_stock_list(patient=True)
     assert n == 2                                  # L(000001) + D(600001)
+
+
+def test_per_code_with_basic_fills_turnover_and_daily_basic(db):
+    """sync_daily_quotes(with_basic=True) pulls per-code daily_basic → fills the
+    quotes' turnover and saves valuation rows (granularity parity with by-date)."""
+    class BasicPro(FakePro):
+        def daily_basic(self, ts_code=None, trade_date=None, start_date=None,
+                        end_date=None, fields=None):
+            return pd.DataFrame([
+                {"ts_code": ts_code, "trade_date": "20100119", "turnover_rate": 1.5,
+                 "pe": 12.0, "pe_ttm": 11.0, "pb": 1.2, "ps": 2.0, "ps_ttm": 1.9,
+                 "dv_ratio": 3.0, "total_mv": 1e6, "circ_mv": 9e5},
+                {"ts_code": ts_code, "trade_date": "20100120", "turnover_rate": 0.8,
+                 "pe": 13.0, "pe_ttm": 12.0, "pb": 1.3, "ps": 2.1, "ps_ttm": 2.0,
+                 "dv_ratio": 3.1, "total_mv": 1.1e6, "circ_mv": 9.5e5},
+            ])
+
+    db.upsert_stock("600001", "x", "SH", date(1998, 1, 22), "")
+    adapter = TushareAdapter(db, pro=BasicPro())
+    adapter.sync_daily_quotes("600001", start=date(2010, 1, 1),
+                              end=date(2010, 1, 31), with_basic=True)
+    out = db.get_daily_quotes("600001", date(2010, 1, 1), date(2010, 1, 31))
+    assert out[out["date"] == date(2010, 1, 19)].iloc[0]["turnover"] == 1.5
+    basic = db.get_daily_basic("600001", date(2010, 1, 1), date(2010, 1, 31))
+    assert len(basic) == 2 and set(basic["pe"]) == {12.0, 13.0}
+
+
+def test_sync_financials_by_period_vip(db):
+    """Whole-market financials for one period via fina_indicator_vip: maps real
+    ann_date/end_date, splits ts_code → code, lands in `financials` (PIT-keyed).
+    A row missing ann_date is dropped (ann_date is the PIT key)."""
+    class FinPro(FakePro):
+        def fina_indicator_vip(self, period=None, fields=None):
+            return pd.DataFrame([
+                {"ts_code": "000001.SZ", "ann_date": "20240428",
+                 "end_date": "20240331", "roe": 3.1, "netprofit_yoy": 12.0,
+                 "or_yoy": 5.0},
+                {"ts_code": "600519.SH", "ann_date": "20240427",
+                 "end_date": "20240331", "roe": 30.0, "netprofit_yoy": 8.0,
+                 "or_yoy": 18.0},
+                {"ts_code": "600001.SH", "ann_date": None,  # no ann_date → dropped
+                 "end_date": "20240331", "roe": 1.0, "netprofit_yoy": 0.0,
+                 "or_yoy": 0.0},
+            ])
+
+    adapter = TushareAdapter(db, pro=FinPro())
+    n = adapter.sync_financials_by_period(date(2024, 3, 31))
+    assert n == 2                                   # the no-ann_date row dropped
+    # PIT: visible only on/after the real ann_date (2024-04-28 for 000001).
+    assert db.get_financials_asof("000001", date(2024, 4, 27)).empty
+    after = db.get_financials_asof("000001", date(2024, 4, 28))
+    assert len(after) == 1 and after.iloc[0]["roe"] == 3.1
+
+
+def test_financials_by_period_keeps_latest_restatement(db):
+    """Restated reports return multiple rows per (ts_code, end_date) with
+    update_flag (1=corrected, 0=original). We must persist the CORRECTED value
+    regardless of the order tushare returns them in (stale-last here)."""
+    class RestatePro(FakePro):
+        def fina_indicator_vip(self, period=None, fields=None):
+            return pd.DataFrame([
+                # corrected first, stale (original) LAST — order must not matter
+                {"ts_code": "000001.SZ", "ann_date": "20240501",
+                 "end_date": "20240331", "roe": 9.9, "netprofit_yoy": 20.0,
+                 "or_yoy": 7.0, "update_flag": "1"},
+                {"ts_code": "000001.SZ", "ann_date": "20240428",
+                 "end_date": "20240331", "roe": 3.1, "netprofit_yoy": 12.0,
+                 "or_yoy": 5.0, "update_flag": "0"},
+            ])
+
+    adapter = TushareAdapter(db, pro=RestatePro())
+    n = adapter.sync_financials_by_period(date(2024, 3, 31))
+    assert n == 1                                    # one period, deduped
+    rows = db.get_financials_asof("000001", date(2024, 5, 2))
+    assert len(rows) == 1 and rows.iloc[0]["roe"] == 9.9   # corrected, not 3.1

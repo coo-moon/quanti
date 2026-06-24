@@ -589,3 +589,30 @@ class TestByDateFastPath:
         assert len(adapter.by_date_calls) == 5       # capped, bulk deferred
         assert max(adapter.by_date_calls) == date(2024, 6, 28)  # newest tail
         db.close()
+
+
+def test_financials_fn_runs_once_per_day(db_with_stocks):
+    """The daemon refreshes financials at most once per calendar day, and is a
+    no-op when no financials_fn is injected (tests/CI never hit the network)."""
+    calls = {"n": 0}
+
+    def _fin():
+        calls["n"] += 1
+        return 7
+
+    s = BackgroundQuoteSyncer(
+        db=db_with_stocks, adapter_factory=lambda: None,
+        financials_fn=_fin, now_fn=lambda: datetime(2026, 6, 24, 16, 0))
+    s._maybe_sync_financials()   # first call today → runs
+    s._maybe_sync_financials()   # same day → skipped
+    assert calls["n"] == 1
+    # next calendar day → runs again
+    s._now = lambda: datetime(2026, 6, 25, 16, 0)
+    s._maybe_sync_financials()
+    assert calls["n"] == 2
+
+    # default (no financials_fn) is a silent no-op — never raises, never calls
+    off = BackgroundQuoteSyncer(
+        db=db_with_stocks, adapter_factory=lambda: None,
+        now_fn=lambda: datetime(2026, 6, 24, 16, 0))
+    off._maybe_sync_financials()  # would raise if it tried anything

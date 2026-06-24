@@ -57,7 +57,8 @@ class XtdataAdapter:
 
     def sync_daily_quotes(self, code: str, start: date | None = None,
                           end: date | None = None,
-                          repair_gaps: bool = True) -> int:
+                          repair_gaps: bool = True,
+                          with_basic: bool = False) -> int:  # parity; ignored
         """Fetch daily bars for ``code`` from xtdata (incremental from the last
         stored bar by default) and save them. Returns rows saved.
 

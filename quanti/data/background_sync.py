@@ -151,11 +151,14 @@ class BackgroundQuoteSyncer:
         adapter_factory=None,  # callable returning an AkShareAdapter; for tests
         config: BackgroundSyncConfig | None = None,
         now_fn=None,  # () -> datetime; injectable clock for tests
+        financials_fn=None,  # () -> int; runs once/day if set (None = off, tests)
     ) -> None:
         self._db = db
         self._cfg = config or BackgroundSyncConfig()
         self._adapter_factory = adapter_factory or self._default_adapter_factory
         self._now = now_fn or datetime.now
+        self._financials_fn = financials_fn
+        self._last_fin_day = None  # date of the last financials sync (once/day)
 
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
@@ -262,6 +265,24 @@ class BackgroundQuoteSyncer:
                 },
             )
 
+    # ----------------- financials (once/day) -----------------
+
+    def _maybe_sync_financials(self) -> None:
+        """Run the injected financials sync at most once per calendar day. Off
+        (no-op) when no financials_fn was provided — e.g. in tests, so the loop
+        never makes a network call."""
+        if self._financials_fn is None:
+            return
+        today = self._now().date()
+        if self._last_fin_day == today:
+            return
+        self._last_fin_day = today  # set first → a failure won't retry till tomorrow
+        try:
+            n = self._financials_fn()
+            logger.info("bg-sync financials: %s rows", n)
+        except Exception as e:  # noqa: BLE001 - optional; never kills the loop
+            logger.warning("bg-sync financials failed: %s", e)
+
     # ----------------- main loop -----------------
 
     def _loop(self) -> None:
@@ -273,6 +294,8 @@ class BackgroundQuoteSyncer:
                 # Spin slowly while paused.
                 self._sleep_responsive(5)
                 continue
+
+            self._maybe_sync_financials()
 
             # Build the source adapter per loop so a UI source/token change
             # applies without a restart. Misconfig (e.g. tushare, no token — no
