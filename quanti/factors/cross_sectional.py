@@ -92,12 +92,18 @@ factor_reversal_1w = as_factor_fn(FACTOR_EXPRS["reversal_1w"])
 factor_turnover_20d = as_factor_fn(FACTOR_EXPRS["turnover_20d"])
 factor_realized_vol_20d = as_factor_fn(FACTOR_EXPRS["realized_vol_20d"])
 
+# Default composite: one/two per dimension across ALL data axes (量价/反转/
+# 波动/流动性 + 估值/股息/规模/质量/成长). value_sp stays library-only to avoid
+# triple-counting cheapness. Fundamental factors are NaN (→ ignored) when the DB
+# has no fundamentals, so this is safe on a quotes-only DB.
+# ponytail: naive equal-weight; if value/growth need category weighting, pass a
+# custom FactorConfig.weights rather than expanding this dict.
 DEFAULT_FACTORS: dict[str, FactorFn] = {
-    "momentum_3m": factor_momentum_3m,
-    "momentum_6m": factor_momentum_6m,
-    "reversal_1w": factor_reversal_1w,
-    "turnover_20d": factor_turnover_20d,
-    "realized_vol_20d": factor_realized_vol_20d,
+    n: as_factor_fn(FACTOR_EXPRS[n]) for n in (
+        "momentum_3m", "momentum_6m", "reversal_1w", "realized_vol_20d",
+        "turnover_20d", "value_ep", "value_bp", "dividend_yield",
+        "size", "quality_roe", "growth_earnings", "growth_revenue",
+    )
 }
 
 

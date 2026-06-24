@@ -50,6 +50,11 @@ def _ref(name, bars):
         if len(rets) < 2:
             return float("nan")
         return -float(rets.std() * np.sqrt(252))
+    # Fundamental factors read columns absent from these price-only test bars →
+    # the DSL yields NaN; reference matches.
+    if name in ("value_ep", "value_bp", "value_sp", "dividend_yield", "size",
+                "quality_roe", "growth_earnings", "growth_revenue"):
+        return float("nan")
     raise KeyError(name)
 
 
@@ -74,3 +79,26 @@ def test_evaluate_series_returns_full_series():
     bars = _bars(list(range(2, 60)))
     s = evaluate_series(momentum_6m, bars)
     assert len(s) == len(bars)
+
+
+def test_fundamental_factors_signs_and_values():
+    """Fundamental factors read merged columns, sign-flipped to higher=better."""
+    from quanti.factors.library import (
+        dividend_yield, growth_earnings, quality_roe, size, value_bp, value_ep,
+    )
+    bars = _bars([10.0] * 30)
+    bars["pe_ttm"] = 20.0      # earnings yield 1/20
+    bars["pb"] = 2.0           # book/price 1/2
+    bars["dv_ratio"] = 3.5
+    bars["total_mv"] = np.e ** 4   # -log → -4
+    bars["roe"] = 15.0
+    bars["netprofit_yoy"] = 25.0
+    assert as_factor_fn(value_ep)(bars) == pytest.approx(0.05)
+    assert as_factor_fn(value_bp)(bars) == pytest.approx(0.5)
+    assert as_factor_fn(dividend_yield)(bars) == pytest.approx(3.5)
+    assert as_factor_fn(size)(bars) == pytest.approx(-4.0)
+    assert as_factor_fn(quality_roe)(bars) == pytest.approx(15.0)
+    assert as_factor_fn(growth_earnings)(bars) == pytest.approx(25.0)
+    # Loss-maker (pe<0) scores LOW via 1/pe, not high like -pe would.
+    bars["pe_ttm"] = -10.0
+    assert as_factor_fn(value_ep)(bars) < 0
