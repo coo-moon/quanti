@@ -5,31 +5,51 @@
       <p class="page-desc">管理你的股票池和市场数据</p>
     </div>
 
-    <div class="card">
-      <div class="card-header">
-        <h2>数据源</h2>
-        <span class="card-header-hint">历史行情来源(实时盯盘始终用 xtdata)</span>
-      </div>
-      <div class="ds-row">
-        <label>历史源</label>
-        <select v-model="dsSource" :disabled="dsBusy">
-          <option v-for="s in dsConfig.available_sources" :key="s" :value="s">{{ s }}</option>
-        </select>
-      </div>
-      <div class="ds-row" v-if="dsNeedsToken">
-        <label>Token</label>
-        <input
-          v-model="dsToken"
-          type="password"
-          :placeholder="dsConfig.has_token ? '已配置 ✓(留空则不修改)' : '填入 TUSHARE_TOKEN'"
-          :disabled="dsBusy"
-        />
-      </div>
-      <div class="ds-actions">
-        <button class="btn-small" @click="testDS" :disabled="dsBusy">测试连接</button>
-        <button class="btn-small primary" @click="saveDS" :disabled="dsBusy">保存</button>
-        <span v-if="dsMsg" class="ds-msg" :class="dsError ? 'error' : 'ok'">{{ dsMsg }}</span>
-      </div>
+    <div class="card ds-card">
+      <button type="button" class="ds-toggle" @click="toggleDs" :aria-expanded="dsOpen">
+        <span class="ds-title">
+          <h2>数据源</h2>
+          <span class="card-header-hint">历史行情来源(实时盯盘始终用 xtdata)</span>
+        </span>
+        <span class="ds-head-right">
+          <span class="ds-badge">{{ dsConfig.source }}</span>
+          <span
+            v-if="dsConfig.source === 'tushare'"
+            class="ds-badge"
+            :class="dsConfig.has_token ? 'ok' : 'warn'"
+          >{{ dsConfig.has_token ? 'Token ✓' : '需 Token' }}</span>
+          <svg class="ds-chevron" :class="{ open: dsOpen }" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </span>
+      </button>
+      <transition name="ds-collapse">
+        <div class="ds-body" v-show="dsOpen">
+          <div class="ds-row">
+            <label>历史源</label>
+            <select v-model="dsSource" :disabled="dsBusy">
+              <option v-for="s in dsConfig.available_sources" :key="s" :value="s">{{ s }}</option>
+            </select>
+          </div>
+          <div class="ds-row" v-if="dsNeedsToken">
+            <label>Token</label>
+            <input
+              v-model="dsToken"
+              type="password"
+              :placeholder="dsConfig.has_token ? '已配置 ✓(留空则不修改)' : '填入 TUSHARE_TOKEN'"
+              :disabled="dsBusy"
+            />
+          </div>
+          <p v-if="dsNeedsToken && !dsConfig.has_token" class="ds-hint-text">
+            无 token 时 tushare 会报错(不静默回退);可填入 token,或把历史源切到 akshare（免费）。
+          </p>
+          <div class="ds-actions">
+            <button class="btn-small" @click="testDS" :disabled="dsBusy">测试连接</button>
+            <button class="btn-small primary" @click="saveDS" :disabled="dsBusy">保存</button>
+            <span v-if="dsMsg" class="ds-msg" :class="dsError ? 'error' : 'ok'">{{ dsMsg }}</span>
+          </div>
+        </div>
+      </transition>
     </div>
 
     <div class="stats-row">
@@ -255,6 +275,19 @@ const dsBusy = ref(false);
 // Only tushare needs a key today.
 const dsNeedsToken = computed(() => dsSource.value === "tushare");
 
+// Collapsible panel. Remembers the user's choice; first-time/no-token defaults
+// to open so setup is visible, otherwise collapsed to save space.
+const DS_OPEN_KEY = "quanti.ds.open";
+const dsOpen = ref(false);
+function toggleDs() {
+  dsOpen.value = !dsOpen.value;
+  localStorage.setItem(DS_OPEN_KEY, dsOpen.value ? "1" : "0");
+}
+function initDsOpen() {
+  const saved = localStorage.getItem(DS_OPEN_KEY);
+  dsOpen.value = saved !== null ? saved === "1" : !dsConfig.value.has_token;
+}
+
 async function loadDataSource() {
   try {
     const res = await fetchDataSource();
@@ -365,6 +398,7 @@ async function resumeSync() {
 onMounted(async () => {
   await loadStocks();
   await loadDataSource();
+  initDsOpen();
   await refreshBgSync();
   // Poll background sync every 10s — fast enough to feel live without
   // hammering the API.
@@ -842,6 +876,98 @@ async function syncAll() {
 .btn-small.primary:hover {
   background: var(--color-accent);
   opacity: 0.9;
+}
+
+/* Collapsible data-source header */
+.ds-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 24px;
+  background: none;
+  border: none;
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.ds-toggle:hover {
+  background: var(--color-blue-bg, #f5f8ff);
+}
+.ds-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.ds-title h2 {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.3px;
+}
+.ds-head-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.ds-badge {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: var(--color-blue-bg, #eef4ff);
+  color: var(--color-accent);
+  white-space: nowrap;
+}
+.ds-badge.ok {
+  background: rgba(22, 163, 74, 0.1);
+  color: #16a34a;
+}
+.ds-badge.warn {
+  background: rgba(220, 38, 38, 0.1);
+  color: #dc2626;
+}
+.ds-chevron {
+  color: var(--color-text-tertiary, #9ca3af);
+  transition: transform var(--transition);
+}
+.ds-chevron.open {
+  transform: rotate(180deg);
+}
+.ds-body {
+  padding: 0 24px 18px;
+}
+.ds-hint-text {
+  font-size: 12px;
+  color: var(--color-text-tertiary, #9ca3af);
+  margin: 6px 0 0;
+  max-width: 520px;
+  line-height: 1.5;
+}
+/* expand / collapse animation */
+.ds-collapse-enter-active,
+.ds-collapse-leave-active {
+  transition: max-height 0.25s ease, opacity 0.2s ease;
+  overflow: hidden;
+}
+.ds-collapse-enter-from,
+.ds-collapse-leave-to {
+  max-height: 0;
+  opacity: 0;
+}
+.ds-collapse-enter-to,
+.ds-collapse-leave-from {
+  max-height: 340px;
+  opacity: 1;
+}
+@media (max-width: 560px) {
+  .ds-title .card-header-hint {
+    display: none;
+  }
 }
 
 .ds-row {
