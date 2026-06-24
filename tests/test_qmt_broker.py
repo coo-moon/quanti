@@ -56,6 +56,19 @@ class DeadBridge:
         raise ConnectionError("bridge down")
 
 
+class RecordingBridge(InProcBridge):
+    """InProcBridge that records every /trader/order payload it submits."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.orders: list[dict] = []
+
+    def post(self, path: str, json: dict | None = None) -> dict:
+        if path == "/trader/order":
+            self.orders.append(json or {})
+        return super().post(path, json)
+
+
 def _make(db, provider, client=None, **kw):
     return QmtBroker(db, provider, client=client or InProcBridge(),
                      initial_cash=1_000_000, **kw)
@@ -309,3 +322,72 @@ def test_qmt_protection_blocks_buy(tmp_path):
         Signal("600519", Direction.BUY, 1.0, "buy"),
         broker._reconciled_portfolio()[0])
     assert ok is False and kind == "protection_block"
+
+
+# --- P0-2: forced exits submit at the limit-down price (must get out) -------
+
+def _limit_down(provider, code: str) -> float:
+    from quanti.utils.market import board_limit_pct, prev_bar_close
+    pc = prev_bar_close(provider, code, date.today())
+    return round(pc * (1 - board_limit_pct(code)), 2)
+
+
+def test_forced_stop_loss_submits_at_limit_down(env):
+    """A stop-loss exit (strategy 'risk_exit') must submit at today's 跌停价 so
+    it crosses any bid and earns time priority, not rest as an unfillable limit
+    near last price."""
+    db, provider = env
+    client = RecordingBridge()
+    broker = _make(db, provider, client=client)
+    # cost 30, live ~24.43 → ~-18.6%, past the -8% stop; fully T+1-settled.
+    broker._client.gw._mock_positions["000001"] = {
+        "volume": 1000, "can_use": 1000, "avg_price": 30.0}
+    assert broker.check_exits() == 1
+    sells = [o for o in client.orders if o["direction"] == "sell"]
+    assert sells and sells[-1]["price"] == _limit_down(provider, "000001")
+
+
+def test_kill_switch_flatten_submits_at_limit_down(env):
+    """The circuit-breaker / kill-switch flatten ('kill_switch') is also a forced
+    exit and must price at 跌停价."""
+    db, provider = env
+    client = RecordingBridge()
+    broker = _make(db, provider, client=client)
+    broker._client.gw._mock_positions["000001"] = {
+        "volume": 1000, "can_use": 1000, "avg_price": 10.0}
+    assert broker.flatten("组合回撤熔断") == 1
+    sells = [o for o in client.orders if o["direction"] == "sell"]
+    assert sells and sells[-1]["price"] == _limit_down(provider, "000001")
+
+
+def test_normal_sell_prices_near_last_not_limit_down(env):
+    """A non-forced SELL (e.g. a strategy rebalance) keeps the near-last limit —
+    it must NOT be floored to 跌停价."""
+    db, provider = env
+    client = RecordingBridge()
+    broker = _make(db, provider, client=client)
+    broker._client.gw._mock_positions["000001"] = {
+        "volume": 1000, "can_use": 1000, "avg_price": 10.0}
+    assert broker.execute_signal(
+        Signal("000001", Direction.SELL, 1.0, "rebalance"), "ma_cross") is True
+    sells = [o for o in client.orders if o["direction"] == "sell"]
+    assert sells and sells[-1]["price"] > _limit_down(provider, "000001")
+
+
+# --- P0-1: live QMT now runs all three exits, incl. trailing take-profit ----
+
+def test_check_exits_fires_trailing_tp_live(env, monkeypatch):
+    """Before P0-1 the live QMT check_exits passed peaks={} so the trailing
+    take-profit never fired. Now peaks come from the DB mirror; a settled winner
+    that has retraced ≥10% from its post-entry high exits."""
+    db, provider = env
+    broker = _make(db, provider)
+    # cost 20, live ~24.43 → +22% (TP armed, NOT a stop-loss).
+    broker._client.gw._mock_positions["000001"] = {
+        "volume": 1000, "can_use": 1000, "avg_price": 20.0}
+    # DB mirror supplies buy_date + a post-entry peak (35) well above live
+    # (24.43) → ~-30% retrace, past the 10% trail.
+    monkeypatch.setattr(broker._db, "list_positions", lambda: [
+        {"code": "000001", "buy_date": date(2000, 1, 1), "entry_strategy": ""}])
+    monkeypatch.setattr(broker._db, "get_high_water", lambda code, since: 35.0)
+    assert broker.check_exits() == 1  # trailing TP fired and landed

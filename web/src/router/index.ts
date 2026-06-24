@@ -6,6 +6,7 @@ import Pool from "../views/Pool.vue";
 
 // Heavy route loaded on demand — Backtest pulls in ECharts (~500 KB).
 const Backtest = () => import("../views/Backtest.vue");
+const RiskAudit = () => import("../views/RiskAudit.vue");
 
 const router = createRouter({
   history: createWebHistory(),
@@ -15,6 +16,7 @@ const router = createRouter({
     { path: "/backtest", name: "backtest", component: Backtest },
     { path: "/screener", name: "screener", component: Screener },
     { path: "/pool", name: "pool", component: Pool },
+    { path: "/risk", name: "risk", component: RiskAudit },
   ],
 });
 

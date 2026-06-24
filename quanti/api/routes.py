@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import date
+from datetime import date, timedelta
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -1059,6 +1059,120 @@ async def agent_prune_decisions(request: Request, older_than_days: int = 90):
                             detail="older_than_days must be >= 1")
     removed = request.app.state.db.prune_decisions(older_than_days)
     return {"removed": removed, "older_than_days": older_than_days}
+
+
+def _exit_kind(order: dict) -> str:
+    """Classify a risk-driven exit order by its reason/strategy tag."""
+    reason = order.get("reason") or ""
+    if order.get("strategy_name") == "kill_switch" or "熔断" in reason:
+        return "circuit_breaker"
+    if reason.startswith("止损"):
+        return "stop_loss"
+    if reason.startswith("移动止盈"):
+        return "trailing_tp"
+    if "策略离场" in reason:
+        return "strategy_exit"
+    return "other"
+
+
+def build_risk_audit(db, provider, broker, account: str,
+                     exits_limit: int = 50) -> dict:
+    """Aggregate the risk-control audit view: exit thresholds, three-channel
+    parity, the live protection-guard / circuit-breaker state, and recent
+    risk-driven exits. Pure (no Request) so it's unit-testable. Read-only."""
+    rc = broker._risk.config
+    pc = broker._protections.config
+    tp_on = rc.take_profit_activate_pct > 0
+    se_on = rc.strategy_exit_enabled
+
+    exits = {
+        "stop_loss": {"enabled": True, "threshold": rc.stop_loss_pct},
+        "trailing_take_profit": {"enabled": tp_on,
+                                 "activate": rc.take_profit_activate_pct,
+                                 "trail": rc.take_profit_trail_pct},
+        "strategy_exit": {"enabled": se_on},
+        "portfolio_circuit_breaker": {"threshold": rc.portfolio_stop_loss_pct},
+    }
+
+    # Three-channel parity. Reflects code behaviour + current config switches.
+    # Stop-loss is always on; trailing-TP/strategy-exit follow the switches.
+    # Backtest deliberately omits strategy-exit (the strategy's own SELL replays
+    # via on_bar, so check_exits passes an empty set — engine.py).
+    channel_parity = [
+        {"channel": "回测", "stop_loss": True, "trailing_tp": tp_on,
+         "strategy_exit": False,
+         "note": "策略 SELL 经 on_bar 重放,不重复计入 check_exits"},
+        {"channel": "模拟盘 Paper", "stop_loss": True, "trailing_tp": tp_on,
+         "strategy_exit": se_on, "note": ""},
+        {"channel": "实盘 QMT", "stop_loss": True, "trailing_tp": tp_on,
+         "strategy_exit": se_on,
+         "note": "三档与回测/Paper 对齐;触发为每 tick 收盘价粒度,非盘中"},
+    ]
+
+    # Live protection-guard state: locked = new BUYs are blocked right now.
+    guard: dict = {
+        "enabled": pc.enabled, "locked": False, "reason": "",
+        "stoploss_guard": {
+            "enabled": pc.stoploss_guard_enabled,
+            "lookback_days": pc.sg_lookback_days,
+            "trade_limit": pc.sg_trade_limit, "lock_days": pc.sg_lock_days},
+        "max_drawdown": {
+            "enabled": pc.max_drawdown_enabled,
+            "lookback_days": pc.md_lookback_days,
+            "max_drawdown_pct": pc.md_max_drawdown_pct,
+            "lock_days": pc.md_lock_days},
+    }
+    if pc.enabled:
+        try:
+            from quanti.risk.protection_context import build_db_context
+            ctx = build_db_context(db, provider, pc)
+            allowed, reason = broker._protections.check_entry(ctx)
+            guard["locked"] = not allowed
+            guard["reason"] = reason
+        except Exception:  # noqa: BLE001 - an audit view must never 500
+            pass
+    since = date.today() - timedelta(days=pc.sg_lookback_days * 2 + 14)
+    guard["recent_stop_losses"] = len(db.stop_loss_exit_dates(since))
+
+    # Circuit-breaker proximity: equity vs all-time high-water mark.
+    snaps = db.get_portfolio_snapshots(limit=1)
+    total = float(snaps[0]["total_value"]) if snaps else None
+    peak = db.get_peak_total_value()
+    if total is not None and peak and peak > 0:
+        peak = max(peak, total)
+        dd = (total - peak) / peak
+        cb = {"total_value": total, "peak_value": peak, "drawdown": dd,
+              "threshold": rc.portfolio_stop_loss_pct,
+              "tripped": dd <= rc.portfolio_stop_loss_pct,
+              "headroom": dd - rc.portfolio_stop_loss_pct}
+    else:
+        cb = {"total_value": total, "peak_value": peak or None,
+              "drawdown": None, "threshold": rc.portfolio_stop_loss_pct,
+              "tripped": False, "headroom": None}
+
+    # Recent risk-driven exits (filled SELLs from risk_exit / kill_switch).
+    # No strategy_name filter on the query, so scan the recent window and pick.
+    recent = [
+        {"ts": o.get("filled_at") or o.get("created_at"), "code": o.get("code"),
+         "kind": _exit_kind(o), "reason": o.get("reason") or "",
+         "price": o.get("filled_price"), "quantity": o.get("filled_quantity")}
+        for o in db.list_orders(limit=500)
+        if o.get("direction") == "sell" and o.get("status") == "filled"
+        and o.get("strategy_name") in ("risk_exit", "kill_switch")
+    ]
+    recent.sort(key=lambda x: x["ts"] or "", reverse=True)
+
+    return {"account": account, "is_live": account == "live",
+            "exits": exits, "channel_parity": channel_parity, "guard": guard,
+            "circuit_breaker": cb, "recent_exits": recent[:exits_limit]}
+
+
+@router.get("/risk/audit")
+async def risk_audit(request: Request, exits_limit: int = 50):
+    """Risk-control audit panel data. Read-only."""
+    st = request.app.state
+    return build_risk_audit(st.db, st.provider, st.broker,
+                            getattr(st, "account", "paper"), exits_limit)
 
 
 @router.get("/strategies")
