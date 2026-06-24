@@ -354,6 +354,7 @@ quanti up --target 0.20 --max-drawdown -0.20 --risk medium
 
 - 触发：Web **AI Agent → 因子挖掘 (LLM)** 面板「运行挖掘」，或 CLI `quanti mine-factors`（`--universe / --n（默认 10）/ --end`）。复用 LLM 增强层的供应商配置（DeepSeek / Anthropic）。
 - **IC 闸门**（采纳条件，全满足）：`|训练IC| ≥ 0.02`、`OOS IC ≥ 0.03`、且与已采纳因子不冗余（秩相关 < 0.7）；训练/OOS 窗口留间隔防标签泄漏。
+- **基本面参与打分**：IC 评估时按 point-in-time 把 `daily_basic`/`financials`（估值 + ROE/同比）并入每只票的求值帧（financials 用 `merge_asof(ann_date)` 防前视），所以 LLM 提的**估值/质量因子（pe/pb/roe/…）能算出真实 IC 并被采纳**；DB 无基本面时自动跳过该合并（零额外开销，仅量价/换手维度）。
 - **三态语义**：`采纳` = 挖掘时通过 IC 闸门（不可变）；`启用` = 逐因子开关（默认开）；`生效` = 采纳 ∧ 启用 ∧ 账户总开关 `use_generated_factors`（默认**关**）三者同时成立，才真正并入下单排序。
 - 生成因子存于各账户库的 `generated_factors` 表；接口 `GET /factors/generated`、`POST /factors/generated/{name}/enabled`。
 
