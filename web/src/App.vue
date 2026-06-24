@@ -45,6 +45,13 @@
             </svg>
             股票池
           </router-link>
+          <router-link to="/risk" class="nav-link">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <path d="M8 1l6 2.5V8c0 3.5-2.5 6-6 7-3.5-1-6-3.5-6-7V3.5L8 1z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+              <path d="M5.5 8l1.8 1.8L11 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            风控审计
+          </router-link>
         </div>
         <span class="account-badge" :class="isLive ? 'acct-live' : 'acct-paper'"
               :title="isLive ? '实盘 — 真实资金,下单会真实成交' : '模拟盘 — 不涉及真实资金'">

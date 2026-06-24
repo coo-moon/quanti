@@ -330,6 +330,53 @@ export const fetchAgentDecisions = (limit = 50, kind?: string) =>
 
 export const fetchStrategies = () => api.get<StrategyInfo[]>("/strategies");
 
+// --- Risk-control audit ---
+export interface ChannelParity {
+  channel: string;
+  stop_loss: boolean;
+  trailing_tp: boolean;
+  strategy_exit: boolean;
+  note: string;
+}
+export interface RiskExitEvent {
+  ts: string;
+  code: string;
+  kind: string; // stop_loss | trailing_tp | strategy_exit | circuit_breaker | other
+  reason: string;
+  price: number | null;
+  quantity: number | null;
+}
+export interface RiskAudit {
+  account: string;
+  is_live: boolean;
+  exits: {
+    stop_loss: { enabled: boolean; threshold: number };
+    trailing_take_profit: { enabled: boolean; activate: number; trail: number };
+    strategy_exit: { enabled: boolean };
+    portfolio_circuit_breaker: { threshold: number };
+  };
+  channel_parity: ChannelParity[];
+  guard: {
+    enabled: boolean;
+    locked: boolean;
+    reason: string;
+    recent_stop_losses: number;
+    stoploss_guard: { enabled: boolean; lookback_days: number; trade_limit: number; lock_days: number };
+    max_drawdown: { enabled: boolean; lookback_days: number; max_drawdown_pct: number; lock_days: number };
+  };
+  circuit_breaker: {
+    total_value: number | null;
+    peak_value: number | null;
+    drawdown: number | null;
+    threshold: number;
+    tripped: boolean;
+    headroom: number | null;
+  };
+  recent_exits: RiskExitEvent[];
+}
+export const fetchRiskAudit = (exitsLimit = 50) =>
+  api.get<RiskAudit>("/risk/audit", { params: { exits_limit: exitsLimit } });
+
 // --- Hyperopt / tuned params ---
 export interface OptimizeResultItem {
   strategy_name: string;

@@ -35,6 +35,8 @@ from quanti.bridge_client import BridgeClient, DEFAULT_BRIDGE_URL, HttpBridgeCli
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.base import BrokerResult, PendingFillResult
+from quanti.execution.exits import (
+    compute_peaks, compute_strategy_exits, load_strategies)
 from quanti.models import Direction, Portfolio, Position, PriceType, Signal
 from quanti.risk.manager import RiskConfig, RiskManager
 from quanti.risk.sizer import compute_buy_target_value
@@ -44,6 +46,11 @@ if TYPE_CHECKING:
     from quanti.risk.protections import ProtectionConfig
 
 logger = logging.getLogger(__name__)
+
+# Exits that MUST get filled: RiskManager exits (stop-loss / strategy / trailing
+# TP, all tagged 'risk_exit') and the circuit-breaker / kill-switch flatten
+# ('kill_switch'). These submit at the limit-down price; normal SELLs don't.
+_FORCED_EXIT_STRATEGIES = frozenset({"risk_exit", "kill_switch"})
 
 
 class QmtBroker:
@@ -78,6 +85,7 @@ class QmtBroker:
             else ProtectionConfig())
         self._slippage = slippage
         self._strategies_dir = strategies_dir
+        self._strategy_cache: dict | None = None  # name → strategy class
 
     # ----------------------------------------------------------- health
     def is_connected(self) -> bool:
@@ -271,12 +279,25 @@ class QmtBroker:
                     code=signal.stock_code, details={"venue": "qmt"})
                 return False, "rejected", r
             volume = can_sell
-            # Price off the live quote (like BUY via _latest_price), not the
-            # position's current_price — which, before C5, was the cost basis.
-            # Falls back to the reconciled current_price if the quote is down.
-            last = self._latest_price(signal.stock_code)
-            ref = last if last > 0 else pos.current_price
-            price = ref * (1 - self._slippage)
+            if strategy_name in _FORCED_EXIT_STRATEGIES:
+                # Forced exit (stop-loss / circuit-breaker flatten) MUST get out.
+                # A normal limit near last price won't fill on a fast drop or a
+                # 跌停 print — it rests behind the queue. Submit at the day's
+                # limit-down price instead: a SELL limit fills at any price ≥ its
+                # ask, so the floor crosses any available bid and earns time
+                # priority in the call/continuous auction; if 跌停封死 with no
+                # bid it still can't fill, but now it's queued first instead of
+                # unfillably high. ponytail: feed _order_price a floor sentinel
+                # (0.01) and reuse its band-clamp to land exactly on 跌停价 —
+                # don't key off the live quote, which may be stale/disconnected.
+                price = self._order_price(signal.stock_code, 0.01)
+            else:
+                # Price off the live quote (like BUY via _latest_price), not the
+                # position's current_price — which, before C5, was the cost basis.
+                # Falls back to the reconciled current_price if the quote is down.
+                last = self._latest_price(signal.stock_code)
+                ref = last if last > 0 else pos.current_price
+                price = ref * (1 - self._slippage)
 
         res = self._client.post("/trader/order", {
             "code": signal.stock_code, "direction": signal.direction.value,
@@ -378,16 +399,36 @@ class QmtBroker:
         return out
 
     def check_exits(self) -> int:
-        """Stop-loss exits against reconciled positions (phase ⑤ adds trailing
-        TP + owning-strategy replay + intraday triggering)."""
+        """All three exits against reconciled (venue-truth) positions: stop-loss,
+        owning-strategy SELL, and trailing take-profit — same RiskManager call
+        PaperBroker makes, so live and backtest can't drift apart (P0-1).
+
+        peaks / strategy-sell codes are computed from the local DB mirror
+        (buy_date / entry_strategy live there, not on the venue account) and are
+        keyed by code; a code absent from the mirror just degrades to plain
+        stop-loss. Triggering is still per-tick on the last price, not intraday
+        (phase ⑤)."""
         portfolio, _ = self._reconciled_portfolio()
-        sells = self._risk.check_exits(portfolio, peaks={},
-                                       strategy_sell_codes=set())
+        positions = self._db.list_positions()
+        peaks = compute_peaks(self._db, positions)
+        if self._risk.config.strategy_exit_enabled:
+            strategy_sells = compute_strategy_exits(
+                self._provider, self._load_strategies(), positions)
+        else:
+            strategy_sells = set()
+        sells = self._risk.check_exits(portfolio, peaks=peaks,
+                                       strategy_sell_codes=strategy_sells)
         landed = 0
         for s in sells:
             if self.execute_signal(s, strategy_name="risk_exit"):
                 landed += 1
         return landed
+
+    def _load_strategies(self) -> dict:
+        """Lazy-load strategy classes by name (cached), for strategy exits."""
+        if self._strategy_cache is None:
+            self._strategy_cache = load_strategies(self._strategies_dir)
+        return self._strategy_cache
 
     def pending_orders_detail(self) -> list[dict]:
         """Open orders at the venue, shaped for the UI."""

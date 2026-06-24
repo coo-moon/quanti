@@ -32,6 +32,8 @@ from quanti.backtest.commission import AShareCommission
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.base import BrokerResult, PendingFillResult
+from quanti.execution.exits import (
+    compute_peaks, compute_strategy_exits, load_strategies)
 from quanti.models import BarData, Direction, PriceType, Signal
 from quanti.risk.manager import RiskConfig, RiskManager
 from quanti.risk.sizer import Sizer, compute_buy_target_value
@@ -1000,62 +1002,19 @@ class PaperBroker:
         return self.check_exits()
 
     def _compute_peaks(self, positions: list[dict]) -> dict[str, float]:
-        """Per-code highest high since buy_date (post-entry peak)."""
-        peaks: dict[str, float] = {}
-        for p in positions:
-            bd = p.get("buy_date")
-            if bd is None:
-                continue
-            hw = self._db.get_high_water(p["code"], bd)
-            if hw is not None:
-                peaks[p["code"]] = hw
-        return peaks
+        """Per-code post-entry peak — shared with QmtBroker via exits.py."""
+        return compute_peaks(self._db, positions)
 
     def _compute_strategy_exits(self, positions: list[dict]) -> set[str]:
-        """Replay each holding's owning entry-strategy over its recent bars;
-        return codes whose latest bar emits a SELL. Defaults-only params (v1)
-        — close enough for an exit gate, and never raises into the cycle."""
+        """Codes whose owning entry-strategy now says SELL — shared helper."""
         if not self._risk.config.strategy_exit_enabled:
             return set()
-        out: set[str] = set()
-        strategies = self._load_strategies()
-        if not strategies:
-            return out
-        end = date.today()
-        start = end - timedelta(days=400)
-        for p in positions:
-            name = p.get("entry_strategy") or ""
-            strat_cls = strategies.get(name)
-            if strat_cls is None:
-                continue
-            try:
-                bars = self._provider.get_daily_bars(p["code"], start, end)
-                if not bars:
-                    continue
-                strat = strat_cls()
-                strat.init(getattr(strat, "params", {}) or {})
-                last_signals: list = []
-                for bar in bars:
-                    last_signals = strat.on_bar(bar) or []
-                if any(s.direction == Direction.SELL
-                       and s.stock_code == p["code"] for s in last_signals):
-                    out.add(p["code"])
-            except Exception as e:
-                logger.debug("strategy-exit replay skipped for %s/%s: %s",
-                             p["code"], name, e)
-        return out
+        return compute_strategy_exits(
+            self._provider, self._load_strategies(), positions)
 
     def _load_strategies(self) -> dict:
         """Lazy-load strategy classes by name (cached). Returns {} if the
         loader/dir is unavailable so exits degrade to stop-loss + TP only."""
-        if self._strategy_cache is not None:
-            return self._strategy_cache
-        cache: dict = {}
-        try:
-            from quanti.strategy.loader import StrategyLoader
-            for s in StrategyLoader().load_directory(self._strategies_dir):
-                cache[s.name] = type(s)
-        except Exception as e:
-            logger.debug("strategy load for exits failed: %s", e)
-        self._strategy_cache = cache
-        return cache
+        if self._strategy_cache is None:
+            self._strategy_cache = load_strategies(self._strategies_dir)
+        return self._strategy_cache
