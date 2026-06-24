@@ -37,12 +37,20 @@ def rank_ic(factor_vals: dict[str, float], fwd_rets: dict[str, float],
 
 def factor_ic(expr: Expr, provider, codes: list[str], start: date, end: date,
               *, fwd_days: int = 5, lookback_days: int = 200,
-              min_names: int = 5) -> float:
+              min_names: int = 5, with_fundamentals: bool = False) -> float:
     """Mean cross-sectional rank-IC over the trading dates in [start, end].
 
     For each code, evaluate the factor series (② batch) and the forward return
     series once, then assemble each date's cross-section. NaN if no scorable
-    dates."""
+    dates.
+
+    `with_fundamentals=True` merges point-in-time pe/pb/roe/... onto each code's
+    bars (via cross_sectional._merge_fundamentals) so fundamental factor
+    candidates can actually score — without it they read all-NaN and the gate
+    drops them. The merge is PIT-safe (financials via merge_asof on ann_date)."""
+    _merge = None
+    if with_fundamentals:
+        from quanti.factors.cross_sectional import _merge_fundamentals as _merge
     fac_by_code: dict[str, pd.Series] = {}
     fwd_by_code: dict[str, pd.Series] = {}
     fetch_start = start - timedelta(days=lookback_days)
@@ -52,6 +60,10 @@ def factor_ic(expr: Expr, provider, codes: list[str], start: date, end: date,
         if bars is None or bars.empty or len(bars) < 2:
             continue
         bars = bars.sort_values("date")
+        if _merge is not None:
+            # re-sort: merge_asof returns date-asc, but keep it explicit so the
+            # forward-return shift below is correct regardless of merge path.
+            bars = _merge(bars, provider, code, fetch_start, fetch_end).sort_values("date")
         s = evaluate_series(expr, bars)              # date-indexed factor
         closes = bars.set_index("date")["close"].astype(float)
         fwd = closes.shift(-fwd_days) / closes - 1.0  # forward return (research)

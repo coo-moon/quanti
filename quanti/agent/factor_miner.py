@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from quanti.agent.llm_runtime import LLMConfig, _complete_text
-from quanti.factors.cross_sectional import DEFAULT_FACTORS
+from quanti.factors.cross_sectional import DEFAULT_FACTORS, _merge_fundamentals
 from quanti.factors.evaluation import factor_ic
 from quanti.factors.library import evaluate_series
 from quanti.factors.parser import FactorParseError, parse_expr
@@ -66,14 +66,21 @@ def _build_user_prompt(n: int) -> str:
             f"{examples}\n\nPropose {n} new factor expressions.")
 
 
-def _cross_section(expr, provider, codes, as_of, lookback_days=200) -> dict:
-    """Factor value per code as-of `as_of` (for redundancy correlation)."""
+def _cross_section(expr, provider, codes, as_of, lookback_days=200,
+                   with_fundamentals=False) -> dict:
+    """Factor value per code as-of `as_of` (for redundancy correlation).
+    Merges PIT fundamentals when `with_fundamentals` so value/quality factors
+    produce a real cross-section (else NaN, mirroring the IC path)."""
     vals = {}
+    start = as_of - timedelta(days=lookback_days)
     for code in codes:
-        bars = provider.get_daily_df(code, as_of - timedelta(days=lookback_days), as_of)
+        bars = provider.get_daily_df(code, start, as_of)
         if bars is None or bars.empty:
             continue
-        s = evaluate_series(expr, bars.sort_values("date"))
+        bars = bars.sort_values("date")
+        if with_fundamentals:
+            bars = _merge_fundamentals(bars, provider, code, start, as_of).sort_values("date")
+        s = evaluate_series(expr, bars)
         if len(s) and not pd.isna(s.iloc[-1]):
             vals[code] = float(s.iloc[-1])
     return vals
@@ -86,6 +93,11 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
                  oos_days: int = 63, cfg: LLMConfig | None = None
                  ) -> list[MineResult]:
     cfg = cfg or LLMConfig()
+    # Merge PIT fundamentals into IC/cross-section eval ONLY when the DB has them,
+    # so LLM-proposed value/quality factors (pe/pb/roe/...) can actually score
+    # and be accepted (otherwise they read all-NaN → dropped). No-op + zero extra
+    # queries when there are no fundamentals.
+    with_fund = db.has_fundamentals()
     oos_start = end - timedelta(days=oos_days)
     # Gap >= fwd_days so the training forward-return labels (shift(-fwd_days)) do not
     # reach into the OOS window — keeps train and OOS truly disjoint.
@@ -109,28 +121,30 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
             logger.info("dropping unparseable factor %s: %s", name, e)
             continue
         train_ic = factor_ic(expr, provider, codes, train_start, train_end,
-                             fwd_days=fwd_days)
+                             fwd_days=fwd_days, with_fundamentals=with_fund)
         oos_ic = factor_ic(expr, provider, codes, oos_start, end,
-                           fwd_days=fwd_days)
+                           fwd_days=fwd_days, with_fundamentals=with_fund)
         reason, accepted, xs = _gate(expr, provider, codes, end, train_ic, oos_ic,
                                     accepted_xs, oos_ic_threshold, min_train_ic,
-                                    redundancy_max)
+                                    redundancy_max, with_fundamentals=with_fund)
         if accepted:
-            accepted_xs.append(xs if xs is not None else _cross_section(expr, provider, codes, end))
+            accepted_xs.append(xs if xs is not None else _cross_section(
+                expr, provider, codes, end, with_fundamentals=with_fund))
         db.save_generated_factor(name, expr_str, train_ic, oos_ic, accepted)
         results.append(MineResult(name, expr_str, train_ic, oos_ic, accepted, reason))
     return results
 
 
 def _gate(expr, provider, codes, end, train_ic, oos_ic, accepted_xs,
-          oos_ic_threshold, min_train_ic, redundancy_max) -> tuple[str, bool, dict | None]:
+          oos_ic_threshold, min_train_ic, redundancy_max,
+          with_fundamentals=False) -> tuple[str, bool, dict | None]:
     if np.isnan(train_ic) or abs(train_ic) < min_train_ic:
         return f"train_ic {train_ic:.3f} below {min_train_ic}", False, None
     if np.isnan(oos_ic) or oos_ic < oos_ic_threshold:
         return f"oos_ic {oos_ic:.3f} below {oos_ic_threshold}", False, None
     if not accepted_xs:
         return f"accepted (oos_ic={oos_ic:.3f})", True, None
-    xs = _cross_section(expr, provider, codes, end)
+    xs = _cross_section(expr, provider, codes, end, with_fundamentals=with_fundamentals)
     for prev in accepted_xs:
         common = [c for c in xs if c in prev]
         if len(common) >= 5:
