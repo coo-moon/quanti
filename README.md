@@ -43,8 +43,16 @@ git clone https://github.com/coo-moon/quanti.git
 cd quanti
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,data]"   # data extra 含 tushare(默认历史源)
 ```
+
+> **Windows**:`pip install` 后若提示 `quanti` 不是命令(`quanti.exe` 所在 `...\PythonXXX\Scripts` 不在 PATH),两种解决:
+> - 直接用模块跑(免配 PATH):`python -m quanti.cli sync --stocks`
+> - 或把那个 `Scripts` 目录加进用户 PATH(PowerShell,改完**重开终端**):
+>   ```powershell
+>   [Environment]::SetEnvironmentVariable("Path", $env:Path + ";<上面提示的 Scripts 路径>", "User")
+>   ```
+> 前端构建在 `web/` 目录:先 `npm install`(装 `npm-run-all2` 等,提供 `run-p`)再 `npm run build`。
 
 ### 一键同步全A股数据
 
