@@ -65,7 +65,36 @@ def create_app(
         from quanti.data.source import refresh_latest_financials
         return refresh_latest_financials(db)
 
-    bg_sync = BackgroundQuoteSyncer(db=db, financials_fn=_sync_latest_financials)
+    # Once/day, the daemon also keeps the generated-factor library current:
+    # always re-score existing factors against fresh data (no LLM), and mine a
+    # small batch of NEW candidates when an LLM is configured. Small n_candidates
+    # so one generation stays under the LLM client read timeout. Off via goal
+    # param auto_mine_daily=false; silently re-score-only without an LLM key.
+    def _auto_mine_factors() -> int:
+        from datetime import date as _date
+
+        from quanti.agent import factor_miner
+        from quanti.agent.goal import load_goal
+        from quanti.agent.universe import resolve_tradable_universe
+        goal = load_goal(db)
+        params = goal.params or {}
+        if not params.get("auto_mine_daily", True):
+            return 0
+        today = _date.today()
+        codes = resolve_tradable_universe(
+            db, provider, pool=goal.universe_pool, params=params, as_of=today)
+        rescored = factor_miner.rescore_generated_factors(db, provider, codes, today)
+        try:
+            from quanti.agent.llm_runtime import build_llm_client
+            llm = build_llm_client(params)
+        except Exception:  # noqa: BLE001 - no/invalid LLM key → re-score only
+            return len(rescored)
+        mined = factor_miner.mine_factors(
+            llm, db, provider, codes, today, n_candidates=12)
+        return len(rescored) + len(mined)
+
+    bg_sync = BackgroundQuoteSyncer(db=db, financials_fn=_sync_latest_financials,
+                                    mining_fn=_auto_mine_factors)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):

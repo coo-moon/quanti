@@ -153,3 +153,39 @@ def _gate(expr, provider, codes, end, train_ic, oos_ic, accepted_xs,
             if a.std() and b.std() and abs(np.corrcoef(a, b)[0, 1]) >= redundancy_max:
                 return f"redundant (|corr|>={redundancy_max})", False, None
     return f"accepted (oos_ic={oos_ic:.3f})", True, xs
+
+
+def rescore_generated_factors(db, provider, codes: list[str], end: date, *,
+                              fwd_days: int = 5, oos_ic_threshold: float = 0.03,
+                              min_train_ic: float = 0.02, train_days: int = 252,
+                              oos_days: int = 63) -> list[MineResult]:
+    """Recompute train/OOS rank-IC for every factor already in generated_factors
+    and refresh its `accepted` flag against the CURRENT data — for libraries
+    mined on thin data and now stale. No LLM; same IC gate as mining (redundancy
+    skipped — order-dependent and meaningless for a re-score).
+
+    Preserves each factor's `enabled` toggle: save_generated_factor INSERT OR
+    REPLACEs the whole row with enabled defaulting True, which would otherwise
+    clobber the user's per-factor choice."""
+    with_fund = db.has_fundamentals()
+    oos_start = end - timedelta(days=oos_days)
+    train_end = oos_start - timedelta(days=fwd_days * 2 + 3)
+    train_start = train_end - timedelta(days=train_days)
+    results: list[MineResult] = []
+    for row in db.list_generated_factors():
+        name, expr_str = row["name"], row["expr_str"]
+        try:
+            expr = parse_expr(expr_str)
+        except FactorParseError:
+            continue
+        train_ic = factor_ic(expr, provider, codes, train_start, train_end,
+                             fwd_days=fwd_days, with_fundamentals=with_fund)
+        oos_ic = factor_ic(expr, provider, codes, oos_start, end,
+                           fwd_days=fwd_days, with_fundamentals=with_fund)
+        accepted = (not np.isnan(train_ic) and abs(train_ic) >= min_train_ic
+                    and not np.isnan(oos_ic) and oos_ic >= oos_ic_threshold)
+        db.save_generated_factor(name, expr_str, train_ic, oos_ic, accepted,
+                                 enabled=row["enabled"])
+        results.append(MineResult(name, expr_str, train_ic, oos_ic, accepted,
+                                   "rescored"))
+    return results

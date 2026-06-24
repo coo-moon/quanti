@@ -154,3 +154,17 @@ def test_factor_ic_scores_fundamental_factor_only_when_merged(db):
                           fwd_days=5, with_fundamentals=False)
     assert not pd.isna(ic_with)        # merged → pe is a real column → scorable
     assert pd.isna(ic_without)         # not merged → pe all-NaN → unscorable
+
+
+def test_rescore_preserves_enabled_and_refreshes_accepted(db):
+    """re-score must NOT reset a user's disabled toggle — save_generated_factor
+    REPLACEs the whole row with enabled defaulting True, so rescore has to pass
+    the existing enabled back. (accepted goes False here: no bars → IC NaN.)"""
+    from quanti.agent.factor_miner import rescore_generated_factors
+
+    db.save_generated_factor("f_off", "close", 0.9, 0.9, accepted=True,
+                             enabled=False)
+    rescore_generated_factors(db, DataProvider(db), [], date(2024, 6, 1))
+    row = next(r for r in db.list_generated_factors() if r["name"] == "f_off")
+    assert row["enabled"] is False        # toggle preserved, not clobbered to True
+    assert row["accepted"] is False       # re-scored on no data → NaN IC → dropped

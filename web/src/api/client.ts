@@ -381,6 +381,8 @@ export interface MineStatus {
 
 export const runMineAsync = () =>
   api.post<{ job_id: string }>("/agent/mine-factors/async");
+export const runRescoreAsync = () =>
+  api.post<{ job_id: string }>("/factors/rescore/async");
 export const fetchMineStatus = (jobId: string) =>
   api.get<MineStatus>("/agent/mine-factors/status", { params: { job_id: jobId } });
 export const fetchGeneratedFactors = () =>
