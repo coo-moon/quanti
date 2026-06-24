@@ -14,10 +14,23 @@
 
     <template v-if="data">
       <!-- 退出阈值 -->
-      <div class="stats-row">
+      <div class="section-head">
+        <h2>退出阈值</h2>
+        <button class="btn-edit" @click="toggleEdit">{{ editing ? "取消" : "编辑" }}</button>
+      </div>
+
+      <div v-if="!editing" class="stats-row">
         <div class="stat-card">
           <span class="stat-label">单标的止损线</span>
           <span class="stat-value neg">{{ pct(data.exits.stop_loss.threshold) }}</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">ATR 自适应止损</span>
+          <span class="stat-value" v-if="data.exits.atr_stop.enabled">
+            ×{{ data.exits.atr_stop.k }}
+            <span class="stat-sub">ATR({{ data.exits.atr_stop.n }}) · 替代固定止损</span>
+          </span>
+          <span class="stat-value muted" v-else>关闭</span>
         </div>
         <div class="stat-card">
           <span class="stat-label">组合回撤熔断</span>
@@ -38,6 +51,40 @@
           </span>
         </div>
       </div>
+
+      <form v-else class="card edit-form" @submit.prevent="save">
+        <div class="form-grid">
+          <label>单标的止损线 (%)
+            <input type="number" step="0.5" v-model.number="form.stop_loss_pct" />
+          </label>
+          <label>组合回撤熔断 (%)
+            <input type="number" step="0.5" v-model.number="form.portfolio_stop_loss_pct" />
+          </label>
+          <label>移动止盈激活 (%)
+            <input type="number" step="0.5" min="0" v-model.number="form.take_profit_activate_pct" />
+          </label>
+          <label>移动止盈回撤 (%)
+            <input type="number" step="0.5" min="0" v-model.number="form.take_profit_trail_pct" />
+          </label>
+          <label>ATR 乘子 k (0=关闭)
+            <input type="number" step="0.5" min="0" v-model.number="form.atr_stop_k" />
+          </label>
+          <label>ATR 周期 n
+            <input type="number" step="1" min="1" v-model.number="form.atr_stop_n" />
+          </label>
+          <label class="chk">
+            <input type="checkbox" v-model="form.strategy_exit_enabled" />
+            启用策略离场
+          </label>
+        </div>
+        <p class="form-hint">
+          止损 / 熔断为负百分比(如 -8)。ATR k&gt;0 时,单标的止损改用 -k×(ATR/价),替代固定止损线;改动即时生效,无需重启。
+        </p>
+        <div class="form-actions">
+          <span v-if="saveMsg" class="save-msg" :class="saveErr ? 'err' : 'ok'">{{ saveMsg }}</span>
+          <button type="submit" class="btn-save" :disabled="saving">{{ saving ? "保存中…" : "保存" }}</button>
+        </div>
+      </form>
 
       <!-- 护栏 + 熔断状态 -->
       <div class="two-col">
@@ -166,8 +213,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
-import { fetchRiskAudit, type RiskAudit } from "../api/client";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import {
+  fetchRiskAudit, fetchRiskControl, saveRiskControl, type RiskAudit,
+} from "../api/client";
 
 const data = ref<RiskAudit | null>(null);
 const err = ref("");
@@ -203,6 +252,63 @@ async function load() {
     err.value = "";
   } catch (e: any) {
     err.value = e?.message || "加载风控审计失败";
+  }
+}
+
+// --- edit runtime risk config (P0-3) ---
+// form holds the % fields as human percentages (-8, 15…); converted on save.
+const editing = ref(false);
+const saving = ref(false);
+const saveMsg = ref("");
+const saveErr = ref(false);
+const form = reactive({
+  stop_loss_pct: -8, portfolio_stop_loss_pct: -15,
+  take_profit_activate_pct: 15, take_profit_trail_pct: 10,
+  strategy_exit_enabled: true, atr_stop_k: 0, atr_stop_n: 14,
+});
+
+async function toggleEdit() {
+  if (editing.value) {
+    editing.value = false;
+    return;
+  }
+  saveMsg.value = "";
+  try {
+    const { data: c } = await fetchRiskControl();
+    form.stop_loss_pct = +(c.stop_loss_pct * 100).toFixed(2);
+    form.portfolio_stop_loss_pct = +(c.portfolio_stop_loss_pct * 100).toFixed(2);
+    form.take_profit_activate_pct = +(c.take_profit_activate_pct * 100).toFixed(2);
+    form.take_profit_trail_pct = +(c.take_profit_trail_pct * 100).toFixed(2);
+    form.strategy_exit_enabled = c.strategy_exit_enabled;
+    form.atr_stop_k = c.atr_stop_k;
+    form.atr_stop_n = c.atr_stop_n;
+    editing.value = true;
+  } catch (e: any) {
+    err.value = e?.message || "读取风控配置失败";
+  }
+}
+
+async function save() {
+  saving.value = true;
+  saveMsg.value = "";
+  saveErr.value = false;
+  try {
+    await saveRiskControl({
+      stop_loss_pct: form.stop_loss_pct / 100,
+      portfolio_stop_loss_pct: form.portfolio_stop_loss_pct / 100,
+      take_profit_activate_pct: form.take_profit_activate_pct / 100,
+      take_profit_trail_pct: form.take_profit_trail_pct / 100,
+      strategy_exit_enabled: form.strategy_exit_enabled,
+      atr_stop_k: form.atr_stop_k,
+      atr_stop_n: form.atr_stop_n,
+    });
+    editing.value = false;
+    await load();
+  } catch (e: any) {
+    saveErr.value = true;
+    saveMsg.value = e?.response?.data?.detail || e?.message || "保存失败";
+  } finally {
+    saving.value = false;
   }
 }
 
@@ -389,4 +495,80 @@ tbody tr:last-child td { border-bottom: none; }
 
 .empty-state { padding: 40px 22px; text-align: center; color: var(--color-text-secondary); }
 .empty-hint { font-size: 13px; color: var(--color-text-tertiary); margin-top: 4px; }
+
+/* --- edit form (P0-3) --- */
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.section-head h2 { font-size: 18px; font-weight: 600; letter-spacing: -0.3px; }
+.btn-edit {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-accent);
+  background: var(--color-blue-bg, rgba(0, 113, 227, 0.1));
+  border: none;
+  border-radius: 12px;
+  padding: 4px 14px;
+  cursor: pointer;
+}
+.btn-edit:hover { background: rgba(0, 113, 227, 0.15); }
+.edit-form { padding: 20px 22px; }
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px 20px;
+}
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+.form-grid input[type="number"] {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: var(--radius-sm, 8px);
+  font-size: 14px;
+  font-family: var(--font-mono);
+  color: var(--color-text-primary);
+  background: var(--color-surface);
+}
+.form-grid label.chk {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+.form-hint {
+  margin: 14px 0 0;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  line-height: 1.5;
+}
+.form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 14px;
+}
+.save-msg { font-size: 13px; }
+.save-msg.ok { color: #2e9e4f; }
+.save-msg.err { color: #ff3b30; }
+.btn-save {
+  height: 36px;
+  padding: 0 22px;
+  background: var(--color-accent);
+  color: #fff;
+  border: none;
+  border-radius: 18px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.btn-save:disabled { opacity: 0.5; cursor: not-allowed; }
 </style>

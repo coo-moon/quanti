@@ -351,6 +351,7 @@ export interface RiskAudit {
   is_live: boolean;
   exits: {
     stop_loss: { enabled: boolean; threshold: number };
+    atr_stop: { enabled: boolean; k: number; n: number };
     trailing_take_profit: { enabled: boolean; activate: number; trail: number };
     strategy_exit: { enabled: boolean };
     portfolio_circuit_breaker: { threshold: number };
@@ -376,6 +377,21 @@ export interface RiskAudit {
 }
 export const fetchRiskAudit = (exitsLimit = 50) =>
   api.get<RiskAudit>("/risk/audit", { params: { exits_limit: exitsLimit } });
+
+// --- Runtime risk-control config (P0-3) ---
+export interface RiskControl {
+  stop_loss_pct: number;
+  portfolio_stop_loss_pct: number;
+  take_profit_activate_pct: number;
+  take_profit_trail_pct: number;
+  strategy_exit_enabled: boolean;
+  atr_stop_k: number;
+  atr_stop_n: number;
+}
+export const fetchRiskControl = () =>
+  api.get<RiskControl>("/config/risk-control");
+export const saveRiskControl = (cfg: RiskControl) =>
+  api.post<RiskControl & { ok: boolean }>("/config/risk-control", cfg);
 
 // --- Hyperopt / tuned params ---
 export interface OptimizeResultItem {

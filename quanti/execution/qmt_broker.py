@@ -36,9 +36,9 @@ from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.base import BrokerResult, PendingFillResult
 from quanti.execution.exits import (
-    compute_peaks, compute_strategy_exits, load_strategies)
+    compute_atr_ratios, compute_peaks, compute_strategy_exits, load_strategies)
 from quanti.models import Direction, Portfolio, Position, PriceType, Signal
-from quanti.risk.manager import RiskConfig, RiskManager
+from quanti.risk.manager import RiskConfig, RiskManager, risk_config_from_dict
 from quanti.risk.sizer import compute_buy_target_value
 from quanti.utils.market import board_limit_pct, prev_bar_close
 
@@ -408,6 +408,7 @@ class QmtBroker:
         keyed by code; a code absent from the mirror just degrades to plain
         stop-loss. Triggering is still per-tick on the last price, not intraday
         (phase ⑤)."""
+        self._sync_risk_config()
         portfolio, _ = self._reconciled_portfolio()
         positions = self._db.list_positions()
         peaks = compute_peaks(self._db, positions)
@@ -416,13 +417,29 @@ class QmtBroker:
                 self._provider, self._load_strategies(), positions)
         else:
             strategy_sells = set()
+        # ATR ratios key off the venue-truth holdings (a ratio needs only the
+        # code + recent history, not buy_date), so the ATR stop covers every
+        # real position even if the DB mirror lacks a row for it.
+        atr_ratios = (compute_atr_ratios(
+            self._provider, [{"code": c} for c in portfolio.positions],
+            self._risk.config.atr_stop_n)
+            if self._risk.config.atr_stop_k > 0 else {})
         sells = self._risk.check_exits(portfolio, peaks=peaks,
-                                       strategy_sell_codes=strategy_sells)
+                                       strategy_sell_codes=strategy_sells,
+                                       atr_ratios=atr_ratios)
         landed = 0
         for s in sells:
             if self.execute_signal(s, strategy_name="risk_exit"):
                 landed += 1
         return landed
+
+    def _sync_risk_config(self) -> None:
+        """Pull runtime risk thresholds from the DB so edits apply without a
+        restart (P0-3). When unset (no row), keep the config the broker was
+        built with — don't clobber it with bare defaults."""
+        overrides = self._db.get_risk_config()
+        if overrides:
+            self._risk.config = risk_config_from_dict(overrides)
 
     def _load_strategies(self) -> dict:
         """Lazy-load strategy classes by name (cached), for strategy exits."""
@@ -506,6 +523,7 @@ class QmtBroker:
 
         Reads the high-water mark BEFORE snapshot_portfolio() overwrites today's
         snapshot row, so a same-day top-then-drop still trips it (audit G3/L2)."""
+        self._sync_risk_config()
         prior_peak = self._db.get_peak_total_value()
         snap = self.snapshot_portfolio()  # persists today's snapshot (overwrite)
         total = snap["total_value"]

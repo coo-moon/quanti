@@ -260,6 +260,29 @@ def test_check_exits_runs_clean(env):
     assert _make(db, provider).check_exits() == 0
 
 
+def test_compute_atr_ratios(env):
+    """P1-1: ATR/close ratio is a small positive, dimensionless number."""
+    from quanti.execution.exits import compute_atr_ratios
+    _db, provider = env
+    ratios = compute_atr_ratios(provider, [{"code": "000001"}], n=5)
+    assert "000001" in ratios and 0 < ratios["000001"] < 1
+
+
+def test_qmt_check_exits_fires_atr_stop(env):
+    """P1-1 live wiring: with atr_stop_k>0 the QMT exit path injects ATR ratios
+    so a calm name past its (tighter) ATR stop is sold even when it hasn't
+    breached the flat stop."""
+    db, provider = env
+    broker = _make(db, provider,
+                   risk_config=RiskConfig(stop_loss_pct=-0.50, atr_stop_k=2.0,
+                                          atr_stop_n=5))
+    # Live ~24.43 vs cost 26 → ~-6%; flat stop -50% won't fire, but the ATR
+    # stop (calm 000001, ratio≈1% → ≈-2%) will.
+    broker._client.gw._mock_positions["000001"] = {
+        "volume": 1000, "can_use": 1000, "avg_price": 26.0}
+    assert broker.check_exits() == 1
+
+
 def test_reconciled_current_price_uses_live_quote_not_cost(env):
     """C5: the reconciled current_price must reflect the live last price, not be
     reverse-derived from a cost-based market_value (which pinned it to avg_cost

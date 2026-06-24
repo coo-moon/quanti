@@ -799,6 +799,60 @@ async def set_data_source(body: DataSourceBody, request: Request):
     return {"ok": True, "message": message}
 
 
+class RiskControlBody(BaseModel):
+    stop_loss_pct: float
+    portfolio_stop_loss_pct: float
+    take_profit_activate_pct: float
+    take_profit_trail_pct: float
+    strategy_exit_enabled: bool
+    atr_stop_k: float
+    atr_stop_n: int
+
+
+def _risk_config_dict(db) -> dict:
+    """Current effective risk thresholds (persisted overrides + defaults)."""
+    from quanti.risk.manager import risk_config_from_dict
+    cfg = risk_config_from_dict(db.get_risk_config())
+    return {
+        "stop_loss_pct": cfg.stop_loss_pct,
+        "portfolio_stop_loss_pct": cfg.portfolio_stop_loss_pct,
+        "take_profit_activate_pct": cfg.take_profit_activate_pct,
+        "take_profit_trail_pct": cfg.take_profit_trail_pct,
+        "strategy_exit_enabled": cfg.strategy_exit_enabled,
+        "atr_stop_k": cfg.atr_stop_k,
+        "atr_stop_n": cfg.atr_stop_n,
+    }
+
+
+@router.get("/config/risk-control")
+async def get_risk_control(request: Request):
+    """Current runtime risk thresholds (effective values, overrides + defaults)."""
+    return _risk_config_dict(request.app.state.db)
+
+
+@router.post("/config/risk-control")
+async def set_risk_control(body: RiskControlBody, request: Request):
+    """Validate + persist runtime risk thresholds. Brokers read these live, so
+    changes take effect on the next exit/breaker check — no restart (P0-3)."""
+    errs = []
+    if body.stop_loss_pct >= 0:
+        errs.append("单标的止损线必须 < 0(负百分比)")
+    if body.portfolio_stop_loss_pct >= 0:
+        errs.append("组合熔断线必须 < 0")
+    if body.stop_loss_pct < -0.9 or body.portfolio_stop_loss_pct < -0.9:
+        errs.append("止损/熔断线过深(< -90%),疑似填错")
+    if body.take_profit_activate_pct < 0 or body.take_profit_trail_pct < 0:
+        errs.append("止盈参数必须 ≥ 0")
+    if body.atr_stop_k < 0:
+        errs.append("atr_stop_k 必须 ≥ 0")
+    if body.atr_stop_n < 1:
+        errs.append("atr_stop_n 必须 ≥ 1")
+    if errs:
+        raise HTTPException(status_code=422, detail="; ".join(errs))
+    request.app.state.db.upsert_risk_config(body.model_dump())
+    return {"ok": True, **_risk_config_dict(request.app.state.db)}
+
+
 @router.get("/goal")
 async def get_goal_endpoint(request: Request):
     goal = load_goal(request.app.state.db)
@@ -1080,13 +1134,18 @@ def build_risk_audit(db, provider, broker, account: str,
     """Aggregate the risk-control audit view: exit thresholds, three-channel
     parity, the live protection-guard / circuit-breaker state, and recent
     risk-driven exits. Pure (no Request) so it's unit-testable. Read-only."""
-    rc = broker._risk.config
+    # Read the effective (runtime-overridable) config straight from the DB so
+    # the audit reflects edits even before a broker exit-cycle re-syncs (P0-3).
+    from quanti.risk.manager import risk_config_from_dict
+    rc = risk_config_from_dict(db.get_risk_config())
     pc = broker._protections.config
     tp_on = rc.take_profit_activate_pct > 0
     se_on = rc.strategy_exit_enabled
+    atr_on = rc.atr_stop_k > 0
 
     exits = {
         "stop_loss": {"enabled": True, "threshold": rc.stop_loss_pct},
+        "atr_stop": {"enabled": atr_on, "k": rc.atr_stop_k, "n": rc.atr_stop_n},
         "trailing_take_profit": {"enabled": tp_on,
                                  "activate": rc.take_profit_activate_pct,
                                  "trail": rc.take_profit_trail_pct},

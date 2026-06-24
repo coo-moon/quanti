@@ -165,3 +165,46 @@ def test_exit_kind_classification():
                        "strategy_name": "risk_exit"}) == "strategy_exit"
     assert _exit_kind({"reason": "组合回撤熔断",
                        "strategy_name": "kill_switch"}) == "circuit_breaker"
+
+
+class TestRiskControlConfig:
+    _FULL = {
+        "stop_loss_pct": -0.05, "portfolio_stop_loss_pct": -0.12,
+        "take_profit_activate_pct": 0.20, "take_profit_trail_pct": 0.08,
+        "strategy_exit_enabled": False, "atr_stop_k": 2.0, "atr_stop_n": 10,
+    }
+
+    @pytest.mark.asyncio
+    async def test_get_defaults(self, client):
+        r = await client.get("/api/config/risk-control")
+        assert r.status_code == 200
+        assert r.json()["stop_loss_pct"] == -0.08  # RiskConfig default
+        assert r.json()["atr_stop_k"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_post_persists_and_audit_reflects(self, client):
+        r = await client.post("/api/config/risk-control", json=self._FULL)
+        assert r.status_code == 200 and r.json()["stop_loss_pct"] == -0.05
+        # GET reflects it
+        assert (await client.get("/api/config/risk-control")
+                ).json()["atr_stop_k"] == 2.0
+        # /risk/audit reflects it (reads DB, not stale broker config)
+        audit = (await client.get("/api/risk/audit")).json()
+        assert audit["exits"]["stop_loss"]["threshold"] == -0.05
+        assert audit["exits"]["atr_stop"]["enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_post_rejects_nonneg_stop(self, client):
+        bad = {**self._FULL, "stop_loss_pct": 0.05}
+        r = await client.post("/api/config/risk-control", json=bad)
+        assert r.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_edit_takes_effect_live_no_restart(self, client, app):
+        broker = app.state.broker
+        broker._sync_risk_config()
+        assert broker._risk.config.stop_loss_pct == -0.08  # default before edit
+        await client.post("/api/config/risk-control", json=self._FULL)
+        broker._sync_risk_config()  # what check_exits/enforce do each cycle
+        assert broker._risk.config.stop_loss_pct == -0.05
+        assert broker._risk.config.atr_stop_k == 2.0

@@ -144,6 +144,55 @@ class TestCheckExits:
         sells = rm.check_exits(self._pf(10.0, 20.0), peaks={"X": 25.0})
         assert sells == []
 
+    # --- P1-1: ATR-adaptive stop ---
+    def test_atr_stop_tighter_for_calm_name(self):
+        # ratio 0.04, k=1 → stop -4%; a -6% loss exits though fixed -8% wouldn't.
+        rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=1.0))
+        sells = rm.check_exits(self._pf(10.0, 9.4), atr_ratios={"X": 0.04})
+        assert len(sells) == 1 and "止损" in sells[0].reason
+        assert "ATR" in sells[0].reason  # tagged as ATR-driven
+
+    def test_atr_disabled_falls_back_to_fixed(self):
+        # Same -6% loss but k=0 → fixed -8% governs → no exit.
+        rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=0.0))
+        assert rm.check_exits(self._pf(10.0, 9.4), atr_ratios={"X": 0.04}) == []
+
+    def test_atr_stop_wider_for_volatile_name(self):
+        # ratio 0.10, k=1 → stop -10%: a -9% loss holds (fixed -8% would exit)…
+        rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=1.0))
+        assert rm.check_exits(self._pf(10.0, 9.1), atr_ratios={"X": 0.10}) == []
+        # …but a -11% loss exits.
+        assert len(rm.check_exits(self._pf(10.0, 8.9),
+                                  atr_ratios={"X": 0.10})) == 1
+
+    def test_atr_stop_capped_at_hard_floor(self):
+        # ratio 0.5, k=1 → -50% but clamped to -20%: -15% holds, -21% exits.
+        rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=1.0))
+        assert rm.check_exits(self._pf(10.0, 8.5), atr_ratios={"X": 0.5}) == []
+        assert len(rm.check_exits(self._pf(10.0, 7.9),
+                                  atr_ratios={"X": 0.5})) == 1
+
+    def test_atr_armed_but_missing_ratio_uses_fixed(self):
+        # k>0 but no ratio for the code → fixed stop_loss_pct still applies.
+        rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=2.0))
+        assert len(rm.check_exits(self._pf(10.0, 9.0), atr_ratios={})) == 1
+        assert rm.check_exits(self._pf(10.0, 9.4), atr_ratios={}) == []
+
+    # --- P0-4: exit priority is 固化 (locked) ---
+    def test_exit_priority_locked(self):
+        """止损 > 策略离场 > 移动止盈. Reordering check_exits breaks this."""
+        cfg = RiskConfig(stop_loss_pct=-0.08, take_profit_activate_pct=0.15,
+                         take_profit_trail_pct=0.10, strategy_exit_enabled=True)
+        rm = RiskManager(cfg)
+        # Stop-loss beats strategy-exit: -10% loss + strategy says sell.
+        s1 = rm.check_exits(self._pf(10.0, 9.0), strategy_sell_codes={"X"})
+        assert len(s1) == 1 and "止损" in s1[0].reason
+        # Strategy-exit beats trailing-TP: +16% & retraced ≥10% from peak (TP
+        # would fire) AND strategy says sell → strategy-exit wins.
+        s2 = rm.check_exits(self._pf(10.0, 11.6), peaks={"X": 13.0},
+                            strategy_sell_codes={"X"})
+        assert len(s2) == 1 and "策略" in s2[0].reason
+
 
 def test_max_additional_buy_value_enforces_all_caps():
     rm = RiskManager(RiskConfig(max_position_pct=0.10, max_industry_pct=0.30))
@@ -175,6 +224,17 @@ def test_max_additional_buy_value_enforces_all_caps():
 
     # A name already over the single-stock cap still has 0 room.
     assert rm.max_additional_buy_value(pf_total, "600000", "银行") == 0.0
+
+
+def test_risk_config_from_dict():
+    """P0-3: build a RiskConfig from a partial runtime-override dict; absent or
+    None fields keep dataclass defaults, unknown keys are ignored."""
+    from quanti.risk.manager import risk_config_from_dict
+    assert risk_config_from_dict({}) == RiskConfig()  # empty → all defaults
+    c = risk_config_from_dict({"stop_loss_pct": -0.05, "atr_stop_k": 2.0,
+                               "bogus": 1, "take_profit_trail_pct": None})
+    assert c.stop_loss_pct == -0.05 and c.atr_stop_k == 2.0
+    assert c.take_profit_trail_pct == RiskConfig().take_profit_trail_pct
 
 
 def test_check_portfolio_stop():

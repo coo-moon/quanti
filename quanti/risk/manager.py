@@ -17,7 +17,7 @@ Layer 1 fires first and is softer; Layer 2 is the last resort.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import date
 
 from quanti.models import Direction, Portfolio, Signal
@@ -26,6 +26,10 @@ STOP_LOSS_REASON_PREFIX = "止损"
 """Single source of truth for the stop-loss exit reason prefix. `check_exits`
 emits it; protections identify stop-loss exits by it (plus strategy_name
 'risk_exit'). Changing the wording here keeps producer and consumer in sync."""
+
+_ATR_STOP_HARD_FLOOR = -0.20
+"""Widest a single-stock stop may ever be, even for a very high-vol name — caps
+the ATR-adaptive stop so it can't grow unbounded. Last-resort safety backstop."""
 
 
 @dataclass
@@ -52,6 +56,27 @@ class RiskConfig:
     strategy_exit_enabled: bool = True
     """Exit a holding when its owning entry-strategy emits a SELL on the
     latest bar (structure-based exit, coherent with why we bought)."""
+    atr_stop_k: float = 0.0
+    """ATR-adaptive stop multiplier. 0 disables it → the fixed stop_loss_pct
+    governs. When >0, the per-stock stop becomes -k·(ATR(atr_stop_n)/price)
+    instead of the flat stop_loss_pct, so volatile names get a wider stop and
+    calm names a tighter one. Capped at _ATR_STOP_HARD_FLOOR so a high-vol name
+    can't get an unbounded stop. The caller injects a per-code ATR/price ratio
+    (volatility, dimensionless → adjust-agnostic) into check_exits."""
+    atr_stop_n: int = 14
+    """Lookback (trading days) for the ATR behind atr_stop_k."""
+
+
+def risk_config_from_dict(overrides: dict) -> RiskConfig:
+    """Build a RiskConfig from a (partial) dict of runtime overrides — fields
+    absent (or None) keep their dataclass defaults. Lets brokers read the
+    runtime risk_config table live so edits apply without a restart (P0-3)."""
+    cfg = RiskConfig()
+    known = {f.name for f in fields(cfg)}
+    for k, v in (overrides or {}).items():
+        if k in known and v is not None:
+            setattr(cfg, k, v)
+    return cfg
 
 
 class RiskManager:
@@ -150,27 +175,58 @@ class RiskManager:
         portfolio: Portfolio,
         peaks: dict[str, float] | None = None,
         strategy_sell_codes: set[str] | None = None,
+        atr_ratios: dict[str, float] | None = None,
     ) -> list[Signal]:
-        """Decide which holdings to close, combining three exit reasons.
+        """Decide which holdings to close. One SELL per code.
 
-        Pure logic — the caller supplies `peaks` (per-code post-entry high,
-        for the trailing take-profit) and `strategy_sell_codes` (codes whose
-        owning strategy says SELL); this method just applies the thresholds.
-        One SELL per code, priority: stop-loss > strategy-exit > take-profit.
+        Exit priority (固化 — do not reorder; locked by test_exit_priority):
+            1. stop-loss   (always on; ATR-adaptive when atr_stop_k>0)
+            2. strategy-exit  (owning strategy flipped to SELL)
+            3. trailing take-profit
 
-        Falls back to plain stop-loss when peaks/strategy info aren't given,
-        so existing callers keep working.
+        NOTE this is the per-stock layer. The portfolio circuit-breaker
+        (check_portfolio_stop, -15% from the equity high-water mark) is a
+        SEPARATE, higher-priority mechanism the caller runs first — when it
+        trips it flattens everything, so in effect the full order is
+        circuit-breaker > stop-loss > strategy-exit > take-profit.
+
+        Price basis (固化 — 收盘确认型, matches the backtest's next-bar-open
+        model so live and backtest agree):
+          • pos.current_price is the latest CLOSE (EOD mark), not an intraday
+            print. Stops/TP are evaluated on the close, never intraday — a name
+            that pierced the stop intraday but closed above it does NOT exit.
+          • peaks[code] is the post-entry highest HIGH (intraday) since entry.
+            So the trailing TP measures an intraday peak vs a close retrace by
+            design (a deliberate close-confirmed trail), NOT a bug.
+          • atr_ratios[code] is ATR(atr_stop_n)/price — a dimensionless
+            volatility ratio, so it's adjust-agnostic (hfq vs raw both give the
+            same number); the stop derived from it is therefore comparable to
+            pos.pnl_pct regardless of price adjustment.
+
+        Pure logic — caller injects peaks / strategy_sell_codes / atr_ratios.
+        All optional, so existing callers keep working (degrade to fixed
+        stop-loss only).
         """
         peaks = peaks or {}
         strategy_sell_codes = strategy_sell_codes or set()
+        atr_ratios = atr_ratios or {}
         cfg = self.config
         signals: list[Signal] = []
         for code, pos in portfolio.positions.items():
-            # 1. Stop-loss — highest priority, always on.
-            if pos.pnl_pct <= cfg.stop_loss_pct:
+            # 1. Stop-loss — highest priority, always on. ATR-adaptive when
+            #    atr_stop_k>0 (per-name stop scales with volatility, capped by
+            #    the hard floor); otherwise the flat stop_loss_pct.
+            stop_pct = cfg.stop_loss_pct
+            atr_driven = False
+            ar = atr_ratios.get(code)
+            if cfg.atr_stop_k > 0 and ar is not None and ar > 0:
+                stop_pct = max(_ATR_STOP_HARD_FLOOR, -cfg.atr_stop_k * ar)
+                atr_driven = True
+            if pos.pnl_pct <= stop_pct:
+                tag = f" (ATR×{cfg.atr_stop_k:g})" if atr_driven else ""
                 signals.append(Signal(
                     stock_code=code, direction=Direction.SELL, strength=1.0,
-                    reason=f"{STOP_LOSS_REASON_PREFIX} {pos.pnl_pct:.1%} ≤ {cfg.stop_loss_pct:.1%}"))
+                    reason=f"{STOP_LOSS_REASON_PREFIX} {pos.pnl_pct:.1%} ≤ {stop_pct:.1%}{tag}"))
                 continue
             # 2. Strategy-coherent exit — the owning strategy flipped to SELL.
             if cfg.strategy_exit_enabled and code in strategy_sell_codes:
