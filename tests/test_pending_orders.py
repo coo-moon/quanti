@@ -526,3 +526,27 @@ class TestExitEngine:
         # If the strategies dir loaded, the crash must trigger turtle's exit.
         if broker._load_strategies():
             assert "AAA" in codes
+
+    def test_strategy_exit_uses_resolved_params(self, tmp_path, monkeypatch):
+        """Exit replay inits the owning strategy via resolve_params (tuned over
+        goal) — same as the entry path — not bare class defaults."""
+        import quanti.agent.params as params_mod
+        seen: list[str] = []
+        real = params_mod.resolve_params
+        monkeypatch.setattr(
+            params_mod, "resolve_params",
+            lambda db, name, goal: (seen.append(name), real(db, name, goal))[1])
+
+        today = pd.Timestamp.today().normalize()
+        bars = [((today - pd.Timedelta(days=n)).date(), 10, 10.2, 9.8, 10)
+                for n in range(24, 0, -1)]
+        bars.append((today.date(), 10, 10, 9, 9.5))
+        db = _exit_db(tmp_path, bars)
+        broker = PaperBroker(db, DataProvider(db), fill_mode="immediate",
+                             strategies_dir="strategies")
+        if not broker._load_strategies():
+            pytest.skip("strategies dir not loaded")
+        broker._compute_strategy_exits(
+            [{"code": "AAA", "buy_date": (today - pd.Timedelta(days=24)).date(),
+              "entry_strategy": "turtle_breakout"}])
+        assert "turtle_breakout" in seen  # resolved params, not class defaults

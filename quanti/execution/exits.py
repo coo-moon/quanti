@@ -46,13 +46,18 @@ def load_strategies(strategies_dir: str) -> dict:
 
 
 def compute_strategy_exits(provider, strategies: dict,
-                           positions: list[dict]) -> set[str]:
+                           positions: list[dict], db) -> set[str]:
     """Replay each holding's owning entry-strategy over its recent bars; return
-    codes whose latest bar emits a SELL. Defaults-only params (v1) — close
-    enough for an exit gate, and never raises into the cycle."""
+    codes whose latest bar emits a SELL. Replays with the strategy's ACTIVE
+    params (``resolve_params`` — tuned-if-accepted layered over goal params, the
+    same resolution the entry path uses), not bare class defaults, so the exit
+    matches how the position was opened. Never raises into the cycle."""
     out: set[str] = set()
     if not strategies:
         return out
+    from quanti.agent.goal import load_goal
+    from quanti.agent.params import resolve_params
+    goal = load_goal(db)
     end = date.today()
     start = end - timedelta(days=400)
     for p in positions:
@@ -65,7 +70,7 @@ def compute_strategy_exits(provider, strategies: dict,
             if not bars:
                 continue
             strat = strat_cls()
-            strat.init(getattr(strat, "params", {}) or {})
+            strat.init(resolve_params(db, name, goal))
             last_signals: list = []
             for bar in bars:
                 last_signals = strat.on_bar(bar) or []
