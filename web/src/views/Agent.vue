@@ -956,9 +956,11 @@ function kindClass(kind: string) {
   return "";
 }
 
-async function loadAll() {
-  const [g, p, a, d, str, scr, pend, ord] = await Promise.all([
-    fetchGoal(),
+// Status / portfolio / decisions / option lists — safe to refresh on a poll.
+// Does NOT touch goalDraft/advParams, so the background timer never overwrites
+// the parameters the user is editing.
+async function loadStatus() {
+  const [p, a, d, str, scr, pend, ord] = await Promise.all([
     fetchPortfolio(),
     fetchAgentStatus(),
     fetchAgentDecisions(50),
@@ -967,9 +969,6 @@ async function loadAll() {
     fetchPendingOrders(),
     fetchOrders(200),
   ]);
-  Object.assign(goalDraft, g.data);
-  syncAdvFromParams();
-  captureActiveSchedule();
   portfolio.value = p.data;
   agent.value = a.data;
   decisions.value = d.data;
@@ -977,6 +976,16 @@ async function loadAll() {
   screeners.value = scr.data;
   pendingOrders.value = pend.data;
   orders.value = ord.data;
+}
+
+// Loads the editable goal form FROM the server. Call only on mount and right
+// after an explicit save — never on the poll (else it clobbers unsaved edits).
+async function loadAll() {
+  const g = await fetchGoal();
+  Object.assign(goalDraft, g.data);
+  syncAdvFromParams();
+  captureActiveSchedule();
+  await loadStatus();
 }
 
 async function loadDecisions() {
@@ -1015,7 +1024,7 @@ async function startAgent() {
   try {
     await agentStart();
     setMessage("Agent 已启动");
-    await loadAll();
+    await loadStatus();
   } finally {
     busy.value = false;
   }
@@ -1026,7 +1035,7 @@ async function stopAgent() {
   try {
     await agentStop();
     setMessage("Agent 已停止");
-    await loadAll();
+    await loadStatus();
   } finally {
     busy.value = false;
   }
@@ -1037,7 +1046,7 @@ async function forceTick() {
   try {
     const r = await agentTick();
     setMessage("执行完成: " + JSON.stringify(r.data).slice(0, 200));
-    await loadAll();
+    await loadStatus();
   } catch (e: any) {
     setMessage("执行失败: " + (e?.message ?? e), true);
   } finally {
@@ -1051,7 +1060,7 @@ async function reset() {
   try {
     const cash = Number(prompt("新的初始资金?", "1000000") || "1000000");
     await resetPortfolio(cash);
-    await loadAll();
+    await loadStatus();
     setMessage("组合已重置");
   } finally {
     busy.value = false;
@@ -1095,7 +1104,7 @@ onMounted(() => {
   loadTuned();
   loadGenerated();
   loadMaster();
-  timer = window.setInterval(loadAll, 15000);
+  timer = window.setInterval(loadStatus, 15000);
   clockTimer = window.setInterval(() => (nowTs.value = Date.now()), 20000);
 });
 
