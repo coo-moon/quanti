@@ -413,7 +413,7 @@ class QmtBroker:
         peaks = compute_peaks(self._db, positions)
         if self._risk.config.strategy_exit_enabled:
             strategy_sells = compute_strategy_exits(
-                self._provider, self._load_strategies(), positions)
+                self._provider, self._load_strategies(), positions, self._db)
         else:
             strategy_sells = set()
         sells = self._risk.check_exits(portfolio, peaks=peaks,

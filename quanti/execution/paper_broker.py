@@ -1010,7 +1010,7 @@ class PaperBroker:
         if not self._risk.config.strategy_exit_enabled:
             return set()
         return compute_strategy_exits(
-            self._provider, self._load_strategies(), positions)
+            self._provider, self._load_strategies(), positions, self._db)
 
     def _load_strategies(self) -> dict:
         """Lazy-load strategy classes by name (cached). Returns {} if the
