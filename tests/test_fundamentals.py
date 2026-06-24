@@ -129,3 +129,28 @@ def test_dsl_whitelists_stay_in_sync():
     from quanti.agent.factor_miner import _SYSTEM
     for f in FUNDAMENTAL_FIELDS:
         assert f in _SYSTEM                    # LLM is told about each one
+
+
+def test_factor_ic_scores_fundamental_factor_only_when_merged(db):
+    """A fundamental factor (pe) gets a REAL IC only when fundamentals are merged
+    into the eval frame — proving factor mining now leverages daily_basic/
+    financials instead of silently dropping value/quality candidates."""
+    from quanti.factors.evaluation import factor_ic
+    dates = list(pd.bdate_range("2024-01-01", periods=60).date)
+    codes = [f"00000{i}" for i in range(1, 7)]            # 6 codes ≥ min_names
+    for i, code in enumerate(codes):
+        closes = [10.0 + i + 0.1 * t for t in range(len(dates))]  # varies by code
+        db.save_daily_quotes(pd.DataFrame({
+            "code": code, "date": dates, "open": closes, "high": closes,
+            "low": closes, "close": closes, "volume": 1e6, "amount": 1e7,
+            "turnover": 1.0}))
+        db.save_daily_basic(pd.DataFrame(
+            [{"code": code, "date": d, "pe": 10.0 + i} for d in dates]))  # distinct pe
+    prov = DataProvider(db)
+    start, end = dates[20], dates[40]
+    ic_with = factor_ic(parse_expr("pe"), prov, codes, start, end,
+                        fwd_days=5, with_fundamentals=True)
+    ic_without = factor_ic(parse_expr("pe"), prov, codes, start, end,
+                          fwd_days=5, with_fundamentals=False)
+    assert not pd.isna(ic_with)        # merged → pe is a real column → scorable
+    assert pd.isna(ic_without)         # not merged → pe all-NaN → unscorable
