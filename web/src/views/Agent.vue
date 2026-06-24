@@ -458,7 +458,10 @@
       <div class="card-header">
         <h2>因子挖掘 (LLM)</h2>
         <button class="btn-secondary" :disabled="mining" @click="startMine">
-          {{ mining ? `挖掘中 ${mineProgress.current}/${mineProgress.total}` : "运行挖掘" }}
+          {{ mining && !rescoring ? `挖掘中 ${mineProgress.current}/${mineProgress.total}` : "运行挖掘" }}
+        </button>
+        <button class="btn-secondary" :disabled="mining" @click="startRescore" title="不调 LLM，按当前数据重算已有因子的 IC 并刷新采纳">
+          {{ rescoring ? `重评中 ${mineProgress.current}/${mineProgress.total}` : "重评已有" }}
         </button>
       </div>
       <label class="master-toggle">
@@ -541,6 +544,7 @@ import {
   fetchOptimizeStatus,
   fetchTunedParams,
   runMineAsync,
+  runRescoreAsync,
   fetchMineStatus,
   fetchGeneratedFactors,
   setFactorEnabled,
@@ -723,6 +727,7 @@ const startOptimize = async () => {
 // ── Factor Mining ──────────────────────────────────────────────────────────
 const generated = ref<GeneratedFactor[]>([]);
 const mining = ref(false);
+const rescoring = ref(false); // re-score reuses the mining busy flag + progress
 const mineProgress = ref<{ current: number; total: number }>({ current: 0, total: 0 });
 let mineTimer: number | undefined;
 const useGenerated = ref(false); // master switch: goal.params.use_generated_factors
@@ -747,6 +752,7 @@ const startMine = async () => {
   mining.value = true;
   try {
     const jid = (await runMineAsync()).data.job_id;
+    if (mineTimer) window.clearInterval(mineTimer); // never stack pollers
     mineTimer = window.setInterval(async () => {
       const s = (await fetchMineStatus(jid)).data;
       mineProgress.value = { current: s.current, total: s.total };
@@ -760,6 +766,29 @@ const startMine = async () => {
   } catch (e) {
     console.error(e);
     mining.value = false;
+  }
+};
+const startRescore = async () => {
+  mining.value = true;
+  rescoring.value = true;
+  try {
+    const jid = (await runRescoreAsync()).data.job_id;
+    if (mineTimer) window.clearInterval(mineTimer); // never stack pollers
+    mineTimer = window.setInterval(async () => {
+      const s = (await fetchMineStatus(jid)).data;
+      mineProgress.value = { current: s.current, total: s.total };
+      generated.value = s.results;
+      if (s.status === "done" || s.status === "error") {
+        window.clearInterval(mineTimer);
+        mining.value = false;
+        rescoring.value = false;
+        if (s.status === "done") await loadGenerated();
+      }
+    }, 2000);
+  } catch (e) {
+    console.error(e);
+    mining.value = false;
+    rescoring.value = false;
   }
 };
 

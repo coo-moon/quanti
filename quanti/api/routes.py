@@ -928,6 +928,45 @@ async def _run_mine(job_id: str, state, n: int) -> None:
         db.update_sync_job(job_id, 0, "error", {"error": str(e)})
 
 
+@router.post("/factors/rescore/async")
+async def rescore_factors_async(request: Request):
+    """Re-validate every existing generated factor against current data (no
+    LLM): recompute IC, refresh `accepted`, keep `enabled`. Returns job_id;
+    poll the same /agent/mine-factors/status."""
+    db = request.app.state.db
+    job_id = f"rescore_{str(uuid.uuid4())[:8]}"
+    db.create_sync_job(job_id, "_rescore", len(db.list_generated_factors()))
+    asyncio.create_task(_run_rescore(job_id, request.app.state))
+    return {"job_id": job_id}
+
+
+async def _run_rescore(job_id: str, state) -> None:
+    """Background worker: re-score the generated-factor library in a thread pool."""
+    from quanti.agent import factor_miner
+    from quanti.agent.goal import load_goal
+    from quanti.agent.universe import resolve_tradable_universe
+    from quanti.data.provider import DataProvider
+
+    db = state.db
+    loop = asyncio.get_event_loop()
+
+    def work() -> None:
+        goal = load_goal(db)
+        provider = DataProvider(db)
+        codes = resolve_tradable_universe(
+            db, provider, pool=goal.universe_pool,
+            params=goal.params, as_of=date.today())
+        db.update_sync_job(job_id, 0, "running", {})
+        results = factor_miner.rescore_generated_factors(
+            db, provider, codes, date.today())
+        db.update_sync_job(job_id, len(results), "done", {})
+
+    try:
+        await loop.run_in_executor(None, work)
+    except Exception as e:  # noqa: BLE001
+        db.update_sync_job(job_id, 0, "error", {"error": str(e)})
+
+
 @router.get("/agent/mine-factors/status")
 async def mine_factors_status(job_id: str, request: Request):
     """Get async mine-factors job progress and results."""

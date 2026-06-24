@@ -152,6 +152,7 @@ class BackgroundQuoteSyncer:
         config: BackgroundSyncConfig | None = None,
         now_fn=None,  # () -> datetime; injectable clock for tests
         financials_fn=None,  # () -> int; runs once/day if set (None = off, tests)
+        mining_fn=None,      # () -> int; runs once/day if set (None = off, tests)
     ) -> None:
         self._db = db
         self._cfg = config or BackgroundSyncConfig()
@@ -159,6 +160,8 @@ class BackgroundQuoteSyncer:
         self._now = now_fn or datetime.now
         self._financials_fn = financials_fn
         self._last_fin_day = None  # date of the last financials sync (once/day)
+        self._mining_fn = mining_fn
+        self._last_mine_day = None  # date of the last factor mining (once/day)
 
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
@@ -283,6 +286,21 @@ class BackgroundQuoteSyncer:
         except Exception as e:  # noqa: BLE001 - optional; never kills the loop
             logger.warning("bg-sync financials failed: %s", e)
 
+    def _maybe_mine_factors(self) -> None:
+        """Run the injected factor mining at most once per calendar day. Off
+        (no-op) when no mining_fn was provided — e.g. tests / no LLM key."""
+        if self._mining_fn is None:
+            return
+        today = self._now().date()
+        if self._last_mine_day == today:
+            return
+        self._last_mine_day = today  # set first → a failure won't retry till tomorrow
+        try:
+            n = self._mining_fn()
+            logger.info("bg-sync factor mining: %s factors", n)
+        except Exception as e:  # noqa: BLE001 - optional; never kills the loop
+            logger.warning("bg-sync factor mining failed: %s", e)
+
     # ----------------- main loop -----------------
 
     def _loop(self) -> None:
@@ -296,6 +314,7 @@ class BackgroundQuoteSyncer:
                 continue
 
             self._maybe_sync_financials()
+            self._maybe_mine_factors()
 
             # Build the source adapter per loop so a UI source/token change
             # applies without a restart. Misconfig (e.g. tushare, no token — no
