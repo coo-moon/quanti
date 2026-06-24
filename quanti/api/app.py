@@ -56,7 +56,16 @@ def create_app(
     # agent's 4h tick. Auto-starts by default so cold-start users don't
     # have to know about it; tests pass autostart_background_sync=False
     # to keep test runs hermetic.
-    bg_sync = BackgroundQuoteSyncer(db=db)
+    # Once/day, the daemon also refreshes the latest report period's financials
+    # (free akshare 业绩报表) so quality/value factors stay current — quotes and
+    # financials kept fresh together.
+    # Follow the configured source (tushare VIP → real ann_date), backstopping
+    # to free akshare when it can't / returns 0. See source.refresh_latest_financials.
+    def _sync_latest_financials() -> int:
+        from quanti.data.source import refresh_latest_financials
+        return refresh_latest_financials(db)
+
+    bg_sync = BackgroundQuoteSyncer(db=db, financials_fn=_sync_latest_financials)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):

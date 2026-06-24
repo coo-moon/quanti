@@ -91,6 +91,86 @@ def test_make_adapter_explicit_sources(db):
     assert isinstance(src.make_quote_adapter(db, "xtdata"), XtdataAdapter)
 
 
+# --- make_financials_adapter (daemon follows source, akshare backstop) ------
+
+def test_financials_adapter_follows_source_with_akshare_backstop(db, monkeypatch):
+    from quanti.data.tushare_adapter import TushareAdapter
+
+    # tushare available → tushare (real ann_date via VIP); has the by-period method
+    monkeypatch.setattr(src, "tushare_available", lambda _db=None: True)
+    monkeypatch.setattr(src, "tushare_token", lambda _db=None: "tok")
+    a = src.make_financials_adapter(db, "tushare")
+    assert isinstance(a, TushareAdapter)
+    assert hasattr(a, "sync_financials_by_period")
+
+    # xtdata has no financials endpoint → silently backstops to free akshare
+    assert isinstance(src.make_financials_adapter(db, "xtdata"), AkShareAdapter)
+
+    # tushare selected but unavailable (no token) → akshare backstop, not a raise
+    monkeypatch.setattr(src, "tushare_available", lambda _db=None: False)
+    assert isinstance(src.make_financials_adapter(db, "tushare"), AkShareAdapter)
+
+
+def test_financials_backstop_falls_through_on_zero(db, monkeypatch):
+    """The follow-source helpers must heal a 0-row result (e.g. tushare selected
+    but no VIP tier) by falling through to free akshare — but NOT when the source
+    already returned rows, and NOT double-call when the source IS akshare."""
+    import quanti.data.akshare_adapter as ak_mod
+    from datetime import date
+
+    calls = []
+
+    def _rec(tag, n):
+        calls.append(tag)
+        return n
+
+    class FakeAk:
+        def __init__(self, _db):
+            pass
+
+        @staticmethod
+        def report_periods(_years):
+            return [date(2024, 3, 31)]
+
+        def sync_financials_by_period(self, _p):
+            return _rec("ak", 5)
+
+        def sync_financials(self, _y):
+            return _rec("ak", 5)
+
+    class FakeTu:   # tushare-like: returns 0 (no VIP)
+        def sync_financials_by_period(self, _p):
+            return _rec("tu", 0)
+
+        def sync_financials(self, _y):
+            return _rec("tu", 0)
+
+    monkeypatch.setattr(ak_mod, "AkShareAdapter", FakeAk)
+
+    # tushare returns 0 → backstop to akshare (both multi-period and latest)
+    monkeypatch.setattr(src, "make_financials_adapter", lambda _db, s=None: FakeTu())
+    calls.clear()
+    assert src.sync_financials_years(db, 3) == 5 and calls == ["tu", "ak"]
+    calls.clear()
+    assert src.refresh_latest_financials(db) == 5 and calls == ["tu", "ak"]
+
+    # source returns rows → no backstop
+    class FakeTuOK(FakeTu):
+        def sync_financials(self, _y):
+            return _rec("tu", 9)
+    monkeypatch.setattr(src, "make_financials_adapter", lambda _db, s=None: FakeTuOK())
+    calls.clear()
+    assert src.sync_financials_years(db, 3) == 9 and calls == ["tu"]
+
+    # source already IS akshare → never double-call even on 0
+    class FakeAkZero(FakeAk):
+        def sync_financials(self, _y):
+            return _rec("ak", 0)
+    monkeypatch.setattr(src, "make_financials_adapter", lambda _db, s=None: FakeAkZero(db))
+    calls.clear()
+    assert src.sync_financials_years(db, 3) == 0 and calls == ["ak"]
+
+
 # --- probe_source ----------------------------------------------------------
 
 def test_probe_tushare_success_and_failure(db, monkeypatch):

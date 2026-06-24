@@ -110,7 +110,8 @@ class _PartialAdapter:
         self._db = db
         self._bars = bars
 
-    def sync_daily_quotes(self, code, start=None, end=None, repair_gaps=True):
+    def sync_daily_quotes(self, code, start=None, end=None, repair_gaps=True,
+                          with_basic=False):
         days = self._bars.get(code, [])
         if not days:
             return 0

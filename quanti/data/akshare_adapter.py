@@ -398,6 +398,7 @@ class AkShareAdapter:
         start: date | None = None,
         end: date | None = None,
         repair_gaps: bool = True,
+        with_basic: bool = False,   # accepted for adapter parity; akshare ignores
     ) -> int:
         """Fetch, validate, and save daily quotes. Returns count of rows saved."""
         if end is None:
@@ -517,3 +518,22 @@ class AkShareAdapter:
         logger.info("financials %s (ann≤%s): %d rows via akshare 业绩报表",
                     period.isoformat(), ann.isoformat(), n)
         return n
+
+    @staticmethod
+    def report_periods(years: int) -> list[date]:
+        """Quarterly report-period ends within the last `years`, up to today."""
+        from datetime import date as _date
+        today = _date.today()
+        out = []
+        for y in range(today.year - years, today.year + 1):
+            for mo, day in ((3, 31), (6, 30), (9, 30), (12, 31)):
+                d = _date(y, mo, day)
+                if d <= today:
+                    out.append(d)
+        return out
+
+    def sync_financials(self, years: int = 5) -> int:
+        """Whole-market financials over the last `years` report periods (akshare
+        业绩报表, PIT by statutory deadline). Returns total rows saved."""
+        return sum(self.sync_financials_by_period(p)
+                   for p in self.report_periods(years))
