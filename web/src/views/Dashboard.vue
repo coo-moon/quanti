@@ -5,32 +5,34 @@
       <p class="page-desc">管理你的股票池和市场数据</p>
     </div>
 
-    <div class="card">
-      <div class="card-header">
+    <details class="card ds-card">
+      <summary class="card-header ds-summary">
         <h2>数据源</h2>
-        <span class="card-header-hint">历史行情来源(实时盯盘始终用 xtdata)</span>
+        <span class="card-header-hint">历史行情来源(实时盯盘始终用 xtdata)· 当前 {{ dsSource }}</span>
+      </summary>
+      <div class="ds-body">
+        <div class="ds-row">
+          <label>历史源</label>
+          <select v-model="dsSource" :disabled="dsBusy">
+            <option v-for="s in dsConfig.available_sources" :key="s" :value="s">{{ s }}</option>
+          </select>
+        </div>
+        <div class="ds-row" v-if="dsNeedsToken">
+          <label>Token</label>
+          <input
+            v-model="dsToken"
+            type="password"
+            :placeholder="dsConfig.has_token ? '已配置 ✓(留空则不修改)' : '填入 TUSHARE_TOKEN'"
+            :disabled="dsBusy"
+          />
+        </div>
+        <div class="ds-actions">
+          <button class="btn-small" @click="testDS" :disabled="dsBusy">测试连接</button>
+          <button class="btn-small primary" @click="saveDS" :disabled="dsBusy">保存</button>
+          <span v-if="dsMsg" class="ds-msg" :class="dsError ? 'error' : 'ok'">{{ dsMsg }}</span>
+        </div>
       </div>
-      <div class="ds-row">
-        <label>历史源</label>
-        <select v-model="dsSource" :disabled="dsBusy">
-          <option v-for="s in dsConfig.available_sources" :key="s" :value="s">{{ s }}</option>
-        </select>
-      </div>
-      <div class="ds-row" v-if="dsNeedsToken">
-        <label>Token</label>
-        <input
-          v-model="dsToken"
-          type="password"
-          :placeholder="dsConfig.has_token ? '已配置 ✓(留空则不修改)' : '填入 TUSHARE_TOKEN'"
-          :disabled="dsBusy"
-        />
-      </div>
-      <div class="ds-actions">
-        <button class="btn-small" @click="testDS" :disabled="dsBusy">测试连接</button>
-        <button class="btn-small primary" @click="saveDS" :disabled="dsBusy">保存</button>
-        <span v-if="dsMsg" class="ds-msg" :class="dsError ? 'error' : 'ok'">{{ dsMsg }}</span>
-      </div>
-    </div>
+    </details>
 
     <div class="stats-row">
       <div class="stat-card">
@@ -811,6 +813,28 @@ async function syncAll() {
 .card-header-hint {
   font-size: 13px;
   color: var(--color-text-tertiary);
+}
+
+/* collapsible 数据源 (native <details>) */
+.ds-summary {
+  cursor: pointer;
+  list-style: none;
+}
+.ds-summary::-webkit-details-marker {
+  display: none;
+}
+.ds-summary h2::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  color: var(--color-text-tertiary);
+  font-weight: 400;
+}
+.ds-card[open] .ds-summary h2::before {
+  content: "▾";
+}
+.ds-body {
+  padding: 0 24px 20px;
 }
 
 .btn-small {
