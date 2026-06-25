@@ -17,6 +17,7 @@ from datetime import date, timedelta
 
 from quanti.agent.walk_forward import make_folds, run_walk_forward
 from quanti.backtest.metrics import compute_metrics
+from quanti.utils.parallel import thread_map
 
 logger = logging.getLogger(__name__)
 
@@ -97,18 +98,24 @@ class HyperOptimizer:
         combos, total = build_grid(space, self.max_combos, self.seed)
         train_start, train_end = self._train_window(end)
 
-        # 1) Search on TRAIN: best combo by train Sharpe.
-        best_combo, best_train = None, float("-inf")
-        for combo in combos:
+        # 1) Search on TRAIN: best combo by train Sharpe. One thread per combo;
+        # each clones the engine (own RiskManager + caches) so concurrent run()s
+        # don't race. ponytail: thread_map, not a hand-rolled pool.
+        def _train_sharpe(combo: dict) -> float:
             try:
-                bt = self._engine.run(strategy=self._factory(strategy_cls, combo)(),
-                                      codes=codes, start=train_start, end=train_end)
+                bt = self._engine.clone().run(
+                    strategy=self._factory(strategy_cls, combo)(),
+                    codes=codes, start=train_start, end=train_end)
             except Exception as e:  # noqa: BLE001 - one combo failing != fatal
                 logger.warning("hyperopt train run failed %s %s: %s", name, combo, e)
-                continue
+                return float("-inf")
             curve = getattr(bt, "equity_curve", None)
             m = compute_metrics(curve) if curve is not None and len(curve) > 1 else {}
-            sharpe = float(m.get("sharpe_ratio", 0.0) or 0.0)
+            return float(m.get("sharpe_ratio", 0.0) or 0.0)
+
+        sharpes = thread_map(_train_sharpe, combos)
+        best_combo, best_train = None, float("-inf")
+        for combo, sharpe in zip(combos, sharpes):
             if sharpe > best_train:
                 best_train, best_combo = sharpe, combo
         if best_combo is None:

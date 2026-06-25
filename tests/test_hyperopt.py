@@ -38,6 +38,9 @@ class _Strat:
 class _Engine:
     """Stub engine: run() returns an object with an equity_curve whose level
     encodes the param so train-search has a clear winner."""
+    def clone(self):
+        return self  # stateless stub — safe to reuse across the grid threads
+
     def run(self, strategy, codes, start, end):
         level = 1.0 + 0.1 * getattr(strategy, "p", 1)
         curve = pd.Series([100.0, 100.0 * level], index=[start, end])
