@@ -27,10 +27,6 @@ STOP_LOSS_REASON_PREFIX = "止损"
 emits it; protections identify stop-loss exits by it (plus strategy_name
 'risk_exit'). Changing the wording here keeps producer and consumer in sync."""
 
-_ATR_STOP_HARD_FLOOR = -0.20
-"""Widest a single-stock stop may ever be, even for a very high-vol name — caps
-the ATR-adaptive stop so it can't grow unbounded. Last-resort safety backstop."""
-
 
 @dataclass
 class RiskConfig:
@@ -38,7 +34,13 @@ class RiskConfig:
 
     max_position_pct: float = 0.10  # Max 10% per stock
     max_industry_pct: float = 0.30  # Max 30% per industry
-    stop_loss_pct: float = -0.08  # -8% stop loss per stock
+    stop_loss_pct: float = -0.15
+    """Absolute per-stock stop FLOOR — the widest a single-stock stop may ever
+    be. ATR (atr_stop_k>0) is the primary stop and tightens on top of this; a
+    stop can never be wider than this floor, so it's the last-resort backstop
+    even when ATR is off or its data is missing. (No longer a flat one-size
+    -8% line — the 5y sweep showed flat -8% was the worst; ATR + floor replaced
+    it.)"""
     portfolio_stop_loss_pct: float = -0.15  # -15% portfolio drawdown stop
     max_daily_trades: int = 20
     # (ST/*ST filtering is NOT here — it lives in agent/universe.py by stock
@@ -57,15 +59,13 @@ class RiskConfig:
     """Exit a holding when its owning entry-strategy emits a SELL on the
     latest bar (structure-based exit, coherent with why we bought)."""
     atr_stop_k: float = 2.0
-    """ATR-adaptive stop multiplier. Default 2.0 — a 5y backtest sweep showed
-    ATR k=2 (volatility-adaptive) beats the flat -8% across trend + mean-
-    reversion strategies (sharpe -0.96 vs -1.24). 0 disables it → the fixed
-    stop_loss_pct governs. When >0, the per-stock stop becomes
-    -k·(ATR(atr_stop_n)/price) instead of the flat stop_loss_pct, so volatile
-    names get a wider stop and calm names a tighter one. Capped at
-    _ATR_STOP_HARD_FLOOR so a high-vol name can't get an unbounded stop. The
-    caller injects a per-code ATR/price ratio (volatility, dimensionless →
-    adjust-agnostic) into check_exits."""
+    """ATR-adaptive stop multiplier — the PRIMARY per-stock stop. Default 2.0:
+    a 5y sweep showed ATR k=2 beats a flat line across trend + mean-reversion
+    strategies (sharpe -0.96 vs -1.24). When >0 the stop is -k·(ATR/price),
+    tightened for calm names and widened for volatile ones, but never wider
+    than the stop_loss_pct floor (max(floor, -k·ratio)). 0 disables ATR → the
+    stop_loss_pct floor alone governs. The caller injects a per-code ATR/price
+    ratio (volatility, dimensionless → adjust-agnostic) into check_exits."""
     atr_stop_n: int = 14
     """Lookback (trading days) for the ATR behind atr_stop_k."""
 
@@ -158,21 +158,6 @@ class RiskManager:
         return ((total_value - peak_value) / peak_value
                 <= self.config.portfolio_stop_loss_pct)
 
-    def check_stop_loss(self, portfolio: Portfolio) -> list[Signal]:
-        """Check positions against stop-loss rules. Returns sell signals for positions to close."""
-        signals = []
-        for code, pos in portfolio.positions.items():
-            if pos.pnl_pct <= self.config.stop_loss_pct:
-                signals.append(
-                    Signal(
-                        stock_code=code,
-                        direction=Direction.SELL,
-                        strength=1.0,
-                        reason=f"Stop loss triggered: {pos.pnl_pct:.1%} <= {self.config.stop_loss_pct:.1%}",
-                    )
-                )
-        return signals
-
     def check_exits(
         self,
         portfolio: Portfolio,
@@ -216,17 +201,17 @@ class RiskManager:
         cfg = self.config
         signals: list[Signal] = []
         for code, pos in portfolio.positions.items():
-            # 1. Stop-loss — highest priority, always on. ATR-adaptive when
-            #    atr_stop_k>0 (per-name stop scales with volatility, capped by
-            #    the hard floor); otherwise the flat stop_loss_pct.
+            # 1. Stop-loss — highest priority, always on. ATR (atr_stop_k>0) is
+            #    the primary stop, floored at stop_loss_pct: a stop is never
+            #    wider than the floor, so the floor is the absolute backstop
+            #    when ATR is off or its ratio is missing.
             stop_pct = cfg.stop_loss_pct
-            atr_driven = False
             ar = atr_ratios.get(code)
             if cfg.atr_stop_k > 0 and ar is not None and ar > 0:
-                stop_pct = max(_ATR_STOP_HARD_FLOOR, -cfg.atr_stop_k * ar)
-                atr_driven = True
+                stop_pct = max(cfg.stop_loss_pct, -cfg.atr_stop_k * ar)
+            atr_driven = stop_pct != cfg.stop_loss_pct
             if pos.pnl_pct <= stop_pct:
-                tag = f" (ATR×{cfg.atr_stop_k:g})" if atr_driven else ""
+                tag = f" (ATR×{cfg.atr_stop_k:g})" if atr_driven else " (地板)"
                 signals.append(Signal(
                     stock_code=code, direction=Direction.SELL, strength=1.0,
                     reason=f"{STOP_LOSS_REASON_PREFIX} {pos.pnl_pct:.1%} ≤ {stop_pct:.1%}{tag}"))
