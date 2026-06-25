@@ -262,7 +262,7 @@ const saving = ref(false);
 const saveMsg = ref("");
 const saveErr = ref(false);
 const form = reactive({
-  stop_loss_pct: -8, portfolio_stop_loss_pct: -15,
+  stop_loss_pct: -15, portfolio_stop_loss_pct: -30,
   take_profit_activate_pct: 15, take_profit_trail_pct: 10,
   strategy_exit_enabled: true, atr_stop_k: 0, atr_stop_n: 14,
 });
