@@ -56,13 +56,16 @@ class RiskConfig:
     strategy_exit_enabled: bool = True
     """Exit a holding when its owning entry-strategy emits a SELL on the
     latest bar (structure-based exit, coherent with why we bought)."""
-    atr_stop_k: float = 0.0
-    """ATR-adaptive stop multiplier. 0 disables it → the fixed stop_loss_pct
-    governs. When >0, the per-stock stop becomes -k·(ATR(atr_stop_n)/price)
-    instead of the flat stop_loss_pct, so volatile names get a wider stop and
-    calm names a tighter one. Capped at _ATR_STOP_HARD_FLOOR so a high-vol name
-    can't get an unbounded stop. The caller injects a per-code ATR/price ratio
-    (volatility, dimensionless → adjust-agnostic) into check_exits."""
+    atr_stop_k: float = 2.0
+    """ATR-adaptive stop multiplier. Default 2.0 — a 5y backtest sweep showed
+    ATR k=2 (volatility-adaptive) beats the flat -8% across trend + mean-
+    reversion strategies (sharpe -0.96 vs -1.24). 0 disables it → the fixed
+    stop_loss_pct governs. When >0, the per-stock stop becomes
+    -k·(ATR(atr_stop_n)/price) instead of the flat stop_loss_pct, so volatile
+    names get a wider stop and calm names a tighter one. Capped at
+    _ATR_STOP_HARD_FLOOR so a high-vol name can't get an unbounded stop. The
+    caller injects a per-code ATR/price ratio (volatility, dimensionless →
+    adjust-agnostic) into check_exits."""
     atr_stop_n: int = 14
     """Lookback (trading days) for the ATR behind atr_stop_k."""
 

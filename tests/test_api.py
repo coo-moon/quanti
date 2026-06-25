@@ -179,7 +179,7 @@ class TestRiskControlConfig:
         r = await client.get("/api/config/risk-control")
         assert r.status_code == 200
         assert r.json()["stop_loss_pct"] == -0.08  # RiskConfig default
-        assert r.json()["atr_stop_k"] == 0.0
+        assert r.json()["atr_stop_k"] == 2.0  # ATR-adaptive on by default
 
     @pytest.mark.asyncio
     async def test_post_persists_and_audit_reflects(self, client):
