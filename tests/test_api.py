@@ -128,7 +128,7 @@ class TestRiskAuditEndpoint:
         d = r.json()
         assert d["account"] == "paper"
         assert d["exits"]["stop_loss"]["threshold"] == -0.15  # stop floor
-        assert d["exits"]["portfolio_circuit_breaker"]["threshold"] == -0.15
+        assert d["exits"]["portfolio_circuit_breaker"]["threshold"] == -0.30
         chans = {c["channel"]: c for c in d["channel_parity"]}
         assert len(chans) == 3
         # P0-1: live QMT now matches backtest/paper on the overlays it can run.

@@ -41,7 +41,7 @@ class RiskConfig:
     even when ATR is off or its data is missing. (No longer a flat one-size
     -8% line — the 5y sweep showed flat -8% was the worst; ATR + floor replaced
     it.)"""
-    portfolio_stop_loss_pct: float = -0.15  # -15% portfolio drawdown stop
+    portfolio_stop_loss_pct: float = -0.30  # -30% portfolio drawdown circuit breaker
     max_daily_trades: int = 20
     # (ST/*ST filtering is NOT here — it lives in agent/universe.py by stock
     # NAME. A code-prefix blocklist here was dead config: never read, and ST is
