@@ -887,6 +887,41 @@ async def get_portfolio(request: Request):
     return request.app.state.broker.snapshot_portfolio()
 
 
+@router.get("/agent/live-status")
+async def live_status(request: Request):
+    """Live status card: intraday-guard daemon state + per-holding stop price
+    (买入价/当前价/止损价). Stop price is computed server-side from the risk
+    config + ATR ratios: avg_cost·(1+max(floor, -k·ATRratio))."""
+    from quanti.execution.exits import compute_atr_ratios
+    from quanti.utils.market import in_trading_session
+
+    st = request.app.state
+    broker = st.broker
+    snap = broker.snapshot_portfolio()
+    positions = snap.get("positions", [])
+    risk = getattr(broker, "_risk", None)
+    atr_n = risk.config.atr_stop_n if risk else 14
+    ratios = (compute_atr_ratios(st.provider, [{"code": p["code"]} for p in positions],
+                                 atr_n) if positions else {})
+    out = []
+    for p in positions:
+        info = (risk.stop_info(p["avg_cost"], ratios.get(p["code"])) if risk
+                else {"stop_pct": 0.0, "stop_price": 0.0, "atr_driven": False})
+        out.append({
+            "code": p["code"], "name": p.get("name", p["code"]),
+            "quantity": p.get("quantity", 0),
+            "avg_cost": p["avg_cost"], "current_price": p["current_price"],
+            "pnl_pct": p.get("pnl_pct", 0.0), **info,
+        })
+    connected = broker.is_connected() if hasattr(broker, "is_connected") else None
+    return {
+        "is_live": st.account == "live",
+        "guard": {**st.agent.guard_status(), "connected": connected,
+                  "in_session": in_trading_session(None, st.provider)},
+        "positions": out,
+    }
+
+
 @router.post("/portfolio/reset")
 async def reset_portfolio(request: Request, initial_cash: float = 1_000_000.0):
     request.app.state.db.reset_portfolio(initial_cash)

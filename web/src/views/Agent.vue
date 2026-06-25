@@ -250,6 +250,54 @@
       </details>
     </div>
 
+    <!-- Live status: intraday guard + per-holding stop price -->
+    <div class="card" v-if="liveStatus">
+      <div class="card-header">
+        <h2>实盘状态</h2>
+        <div class="muted">
+          守护
+          <span :class="liveStatus.guard.running ? 'ok' : 'bad'">{{
+            liveStatus.guard.running ? "运行中"
+              : (liveStatus.guard.enabled ? "已启用·未运行" : "未启用")
+          }}</span>
+          <span v-if="liveStatus.guard.enabled"> · 每 {{ liveStatus.guard.interval_sec }}s</span>
+          · 数据源
+          <span :class="liveStatus.guard.connected ? 'ok' : 'bad'">{{
+            liveStatus.guard.connected === null ? "—"
+              : (liveStatus.guard.connected ? "已连通" : "未连通")
+          }}</span>
+          · 交易时段 {{ liveStatus.guard.in_session ? "是" : "否" }}
+          <span v-if="!liveStatus.is_live" class="asof">· 模拟盘(paper)</span>
+        </div>
+      </div>
+      <div class="table-wrap" v-if="liveStatus.positions.length > 0">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>代码</th><th>名称</th><th>数量</th>
+              <th>买入价</th><th>当前价</th><th>强制止损价</th><th>距止损</th><th>盈亏 %</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="p in liveStatus.positions" :key="p.code">
+              <td>{{ p.code }}</td>
+              <td>{{ p.name }}</td>
+              <td>{{ p.quantity }}</td>
+              <td>{{ p.avg_cost.toFixed(2) }}</td>
+              <td>{{ p.current_price.toFixed(2) }}</td>
+              <td>
+                {{ p.stop_price.toFixed(2) }}
+                <span class="asof">{{ p.atr_driven ? "ATR" : "地板" }}</span>
+              </td>
+              <td :class="stopDistance(p) <= 0.03 ? 'bad' : ''">{{ formatPct(stopDistance(p)) }}</td>
+              <td :class="p.pnl_pct >= 0 ? 'up' : 'down'">{{ formatPct(p.pnl_pct) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-else class="empty">暂无持仓</div>
+    </div>
+
     <!-- Portfolio + positions -->
     <div class="card">
       <div class="card-header">
@@ -535,6 +583,7 @@ import {
   fetchOrders,
   fetchPendingOrders,
   fetchPortfolio,
+  fetchLiveStatus,
   fetchScreeners,
   fetchStrategies,
   manualOrder,
@@ -556,6 +605,7 @@ import {
   type OrderRecord,
   type PendingOrderDetail,
   type Portfolio,
+  type LiveStatus,
   type ScreenerInfo,
   type StrategyInfo,
 } from "../api/client";
@@ -686,6 +736,11 @@ function applyPreset(mode: AgentMode) {
 }
 
 const portfolio = ref<Portfolio | null>(null);
+const liveStatus = ref<LiveStatus | null>(null);
+function stopDistance(p: { current_price: number; stop_price: number }): number {
+  if (!p.current_price) return 0;
+  return (p.current_price - p.stop_price) / p.current_price;  // headroom to stop
+}
 const agent = ref<AgentStatus | null>(null);
 const decisions = ref<DecisionRecord[]>([]);
 const strategies = ref<StrategyInfo[]>([]);
@@ -989,7 +1044,7 @@ function kindClass(kind: string) {
 // Does NOT touch goalDraft/advParams, so the background timer never overwrites
 // the parameters the user is editing.
 async function loadStatus() {
-  const [p, a, d, str, scr, pend, ord] = await Promise.all([
+  const [p, a, d, str, scr, pend, ord, live] = await Promise.all([
     fetchPortfolio(),
     fetchAgentStatus(),
     fetchAgentDecisions(50),
@@ -997,6 +1052,7 @@ async function loadStatus() {
     fetchScreeners(),
     fetchPendingOrders(),
     fetchOrders(200),
+    fetchLiveStatus().catch(() => null),
   ]);
   portfolio.value = p.data;
   agent.value = a.data;
@@ -1005,6 +1061,7 @@ async function loadStatus() {
   screeners.value = scr.data;
   pendingOrders.value = pend.data;
   orders.value = ord.data;
+  liveStatus.value = live?.data ?? null;
 }
 
 // Loads the editable goal form FROM the server. Call only on mount and right
@@ -1196,6 +1253,14 @@ onUnmounted(() => {
 }
 .down {
   color: #16a34a;
+}
+/* status / health (traffic-light: green=ok, red=bad) — distinct from the
+   price 涨红跌绿 above. Used for guard状态 / 数据源连通 / 距止损危险. */
+.ok {
+  color: #16a34a;
+}
+.bad {
+  color: #c0392b;
 }
 .muted-card {
   opacity: 0.7;

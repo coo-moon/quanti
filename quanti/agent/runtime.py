@@ -99,6 +99,7 @@ class AgentRuntime:
         tick_interval_sec: int = 60 * 60 * 4,  # 4h between cycles by default
         decision_retention_days: int = 90,
         selector_reselect_interval_sec: int = 60 * 60 * 24,  # 24h
+        intraday_guard_sec: int = 0,  # >0: fast live fills/exits guard cadence
     ) -> None:
         self._db = db
         self._provider = provider
@@ -108,6 +109,7 @@ class AgentRuntime:
         self._tick_interval = tick_interval_sec
         self._decision_retention_days = decision_retention_days
         self._reselect_interval = selector_reselect_interval_sec
+        self._intraday_guard_sec = intraday_guard_sec
         # Selector cache: (timestamp, strategy_name, evaluations). The
         # Selector runs at most once per `_reselect_interval`. In between we
         # reuse the cached pick — saves running a 6-strategy backtest sweep
@@ -119,6 +121,10 @@ class AgentRuntime:
         # _cached_tradable_universe for details.
         self._universe_cache: tuple[date, tuple, list[str]] | None = None
         self._thread: threading.Thread | None = None
+        self._guard_thread: threading.Thread | None = None
+        # Serializes broker mutations between the full tick and the intraday
+        # guard thread (RLock: the in-cycle cache-miss recursion re-enters).
+        self._broker_lock = threading.RLock()
         self._stop_flag = threading.Event()
         self._status = AgentStatus()
         self._lock = threading.Lock()
@@ -134,6 +140,11 @@ class AgentRuntime:
         self._thread = threading.Thread(
             target=self._loop, name="quanti-agent", daemon=True)
         self._thread.start()
+        if self._intraday_guard_sec > 0 and (
+                self._guard_thread is None or not self._guard_thread.is_alive()):
+            self._guard_thread = threading.Thread(
+                target=self._guard_loop, name="quanti-intraday-guard", daemon=True)
+            self._guard_thread.start()
         with self._lock:
             self._status.enabled = True
             self._status.running = True
@@ -165,10 +176,60 @@ class AgentRuntime:
         self._stop_flag.set()
         with self._lock:
             self._status.running = False
-        try:
-            self._thread.join(timeout=2)
-        except Exception:
-            pass
+        for th in (self._thread, self._guard_thread):
+            if th is not None:
+                try:
+                    th.join(timeout=2)
+                except Exception:
+                    pass
+
+    def guard_status(self) -> dict:
+        """Intraday-guard daemon state for the live status card."""
+        return {
+            "enabled": self._intraday_guard_sec > 0,
+            "interval_sec": self._intraday_guard_sec,
+            "running": bool(self._guard_thread and self._guard_thread.is_alive()),
+        }
+
+    def _guard_loop(self) -> None:
+        """Fast intraday guard (live only): every `intraday_guard_sec`, reconcile
+        venue fills + run exits + the portfolio circuit breaker — so async fills
+        and stop-losses are caught in ~1 min instead of waiting for the 4h full
+        tick. Idles outside trading sessions / when the venue isn't connected, so
+        marks always ride xtdata realtime quotes via the bridge, never stale data."""
+        while not self._stop_flag.is_set():
+            if self._stop_flag.wait(self._intraday_guard_sec):
+                return
+            try:
+                self._intraday_guard()
+            except Exception as e:  # noqa: BLE001 - a guard hiccup can't kill the loop
+                logger.warning("intraday guard cycle failed: %s", e)
+
+    def _intraday_guard(self) -> None:
+        from quanti.utils.market import in_trading_session
+        if not in_trading_session(datetime.now(), self._provider):
+            return
+        # Only act when the live venue is actually connected — exits/marks must
+        # ride xtdata realtime quotes via the bridge, never stale/mock data.
+        is_conn = getattr(self._broker, "is_connected", None)
+        if callable(is_conn) and not is_conn():
+            return
+        with self._broker_lock:  # never overlap the full tick's broker mutations
+            try:
+                self._broker.try_fill_pending_orders()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("guard fill reconcile failed: %s", e)
+            try:
+                if self._broker.enforce_portfolio_stop():
+                    self._db.log_decision("cycle_halt", "盘中组合熔断:已清仓并暂停 agent")
+                    self.stop()
+                    return
+            except Exception as e:  # noqa: BLE001
+                logger.warning("guard portfolio-stop failed: %s", e)
+            try:
+                self._broker.check_exits()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("guard check_exits failed: %s", e)
 
     def restart(self) -> None:
         """Reschedule cleanly: stop the running loop thread (joining it) then
@@ -658,6 +719,12 @@ class AgentRuntime:
 
     # ----------------------------------------------------- the actual cycle
     def _run_one_cycle(self) -> dict:
+        # Serialize with the intraday guard thread — both mutate broker state
+        # (fills / exits / portfolio stop), so they must never run concurrently.
+        with self._broker_lock:
+            return self._run_cycle_body()
+
+    def _run_cycle_body(self) -> dict:
         ts = datetime.now().isoformat()
         goal = load_goal(self._db)
 

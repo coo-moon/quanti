@@ -107,6 +107,24 @@ def test_is_connected_false_when_bridge_down(env):
     assert QmtBroker(db, provider, client=DeadBridge()).is_connected() is False
 
 
+def test_live_latest_price_never_falls_back_to_tushare(env):
+    """require_live: with no realtime (xtdata-via-bridge) quote, price is 0.0
+    (→ market order downstream), NEVER the stale tushare daily close. Paper/dev
+    may use the daily close as a stand-in."""
+    db, provider = env
+
+    class _NoQuote(InProcBridge):
+        def get(self, path, params=None):
+            if path == "/data/quote":
+                return {"last": 0.0}            # realtime quote unavailable
+            return super().get(path, params)
+
+    assert QmtBroker(db, provider, client=_NoQuote(),
+                     require_live=True)._latest_price("000001") == 0.0
+    assert QmtBroker(db, provider, client=_NoQuote()
+                     )._latest_price("000001") > 0   # paper: tushare close OK
+
+
 def test_require_live_treats_mock_bridge_as_not_connected(env):
     """G1: with require_live, a bridge in mock mode (xtquant absent) must read
     as NOT connected and refuse to submit — else mock 'fills' would be mirrored
