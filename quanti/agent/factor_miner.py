@@ -18,6 +18,7 @@ from quanti.factors.cross_sectional import DEFAULT_FACTORS, _merge_fundamentals
 from quanti.factors.evaluation import factor_ic
 from quanti.factors.library import evaluate_series
 from quanti.factors.parser import FactorParseError, parse_expr
+from quanti.utils.parallel import thread_map
 
 logger = logging.getLogger(__name__)
 
@@ -111,48 +112,61 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
         return []
 
     candidates = parse_llm_factors(text)
-    # Accepted factors' as-of cross-sections, for redundancy checks.
-    accepted_xs: list[dict] = []
-    results: list[MineResult] = []
-    for name, expr_str in candidates:
+
+    # Parallel: score each candidate's IC + as-of cross-section. Read-only
+    # (provider/DB is thread-safe), so one thread per candidate. ponytail:
+    # thread_map. The accept/redundancy gate below stays sequential (order-
+    # dependent vs already-accepted factors).
+    def _score(nm_ex: tuple[str, str]):
+        name, expr_str = nm_ex
         try:
             expr = parse_expr(expr_str)
         except FactorParseError as e:
             logger.info("dropping unparseable factor %s: %s", name, e)
-            continue
-        train_ic = factor_ic(expr, provider, codes, train_start, train_end,
-                             fwd_days=fwd_days, with_fundamentals=with_fund)
-        oos_ic = factor_ic(expr, provider, codes, oos_start, end,
-                           fwd_days=fwd_days, with_fundamentals=with_fund)
-        reason, accepted, xs = _gate(expr, provider, codes, end, train_ic, oos_ic,
-                                    accepted_xs, oos_ic_threshold, min_train_ic,
-                                    redundancy_max, with_fundamentals=with_fund)
+            return None
+        try:
+            train_ic = factor_ic(expr, provider, codes, train_start, train_end,
+                                 fwd_days=fwd_days, with_fundamentals=with_fund)
+            oos_ic = factor_ic(expr, provider, codes, oos_start, end,
+                               fwd_days=fwd_days, with_fundamentals=with_fund)
+            xs = _cross_section(expr, provider, codes, end, with_fundamentals=with_fund)
+        except Exception as e:  # noqa: BLE001 - one factor's eval error can't kill the batch
+            logger.info("factor eval failed for %s: %s", name, e)
+            return None
+        return (name, expr_str, train_ic, oos_ic, xs)
+
+    scored = [r for r in thread_map(_score, candidates) if r is not None]
+
+    # Sequential gate (redundancy depends on prior accepted) + persist.
+    accepted_xs: list[dict] = []
+    results: list[MineResult] = []
+    for name, expr_str, train_ic, oos_ic, xs in scored:
+        reason, accepted = _gate(train_ic, oos_ic, xs, accepted_xs,
+                                 oos_ic_threshold, min_train_ic, redundancy_max)
         if accepted:
-            accepted_xs.append(xs if xs is not None else _cross_section(
-                expr, provider, codes, end, with_fundamentals=with_fund))
+            accepted_xs.append(xs)
         db.save_generated_factor(name, expr_str, train_ic, oos_ic, accepted)
         results.append(MineResult(name, expr_str, train_ic, oos_ic, accepted, reason))
     return results
 
 
-def _gate(expr, provider, codes, end, train_ic, oos_ic, accepted_xs,
-          oos_ic_threshold, min_train_ic, redundancy_max,
-          with_fundamentals=False) -> tuple[str, bool, dict | None]:
+def _gate(train_ic, oos_ic, xs, accepted_xs,
+          oos_ic_threshold, min_train_ic, redundancy_max) -> tuple[str, bool]:
+    """Pure accept/reject given precomputed IC + cross-section `xs`. Redundancy
+    is order-dependent (compared against already-accepted xs), so this runs
+    sequentially even when the IC scoring that feeds it was parallelized."""
     if np.isnan(train_ic) or abs(train_ic) < min_train_ic:
-        return f"train_ic {train_ic:.3f} below {min_train_ic}", False, None
+        return f"train_ic {train_ic:.3f} below {min_train_ic}", False
     if np.isnan(oos_ic) or oos_ic < oos_ic_threshold:
-        return f"oos_ic {oos_ic:.3f} below {oos_ic_threshold}", False, None
-    if not accepted_xs:
-        return f"accepted (oos_ic={oos_ic:.3f})", True, None
-    xs = _cross_section(expr, provider, codes, end, with_fundamentals=with_fundamentals)
+        return f"oos_ic {oos_ic:.3f} below {oos_ic_threshold}", False
     for prev in accepted_xs:
         common = [c for c in xs if c in prev]
         if len(common) >= 5:
             a = pd.Series([xs[c] for c in common]).rank()
             b = pd.Series([prev[c] for c in common]).rank()
             if a.std() and b.std() and abs(np.corrcoef(a, b)[0, 1]) >= redundancy_max:
-                return f"redundant (|corr|>={redundancy_max})", False, None
-    return f"accepted (oos_ic={oos_ic:.3f})", True, xs
+                return f"redundant (|corr|>={redundancy_max})", False
+    return f"accepted (oos_ic={oos_ic:.3f})", True
 
 
 def rescore_generated_factors(db, provider, codes: list[str], end: date, *,
@@ -171,21 +185,28 @@ def rescore_generated_factors(db, provider, codes: list[str], end: date, *,
     oos_start = end - timedelta(days=oos_days)
     train_end = oos_start - timedelta(days=fwd_days * 2 + 3)
     train_start = train_end - timedelta(days=train_days)
-    results: list[MineResult] = []
-    for row in db.list_generated_factors():
+    # Each factor is independent (redundancy skipped), so one thread per factor;
+    # factor_ic is read-only and save_generated_factor commits under the DB lock.
+    # ponytail: thread_map.
+    def _rescore(row) -> "MineResult | None":
         name, expr_str = row["name"], row["expr_str"]
         try:
             expr = parse_expr(expr_str)
         except FactorParseError:
-            continue
-        train_ic = factor_ic(expr, provider, codes, train_start, train_end,
-                             fwd_days=fwd_days, with_fundamentals=with_fund)
-        oos_ic = factor_ic(expr, provider, codes, oos_start, end,
-                           fwd_days=fwd_days, with_fundamentals=with_fund)
-        accepted = (not np.isnan(train_ic) and abs(train_ic) >= min_train_ic
-                    and not np.isnan(oos_ic) and oos_ic >= oos_ic_threshold)
-        db.save_generated_factor(name, expr_str, train_ic, oos_ic, accepted,
-                                 enabled=row["enabled"])
-        results.append(MineResult(name, expr_str, train_ic, oos_ic, accepted,
-                                   "rescored"))
-    return results
+            return None
+        try:
+            train_ic = factor_ic(expr, provider, codes, train_start, train_end,
+                                 fwd_days=fwd_days, with_fundamentals=with_fund)
+            oos_ic = factor_ic(expr, provider, codes, oos_start, end,
+                               fwd_days=fwd_days, with_fundamentals=with_fund)
+            accepted = (not np.isnan(train_ic) and abs(train_ic) >= min_train_ic
+                        and not np.isnan(oos_ic) and oos_ic >= oos_ic_threshold)
+            db.save_generated_factor(name, expr_str, train_ic, oos_ic, accepted,
+                                     enabled=row["enabled"])
+        except Exception as e:  # noqa: BLE001 - one factor's eval error can't kill the batch
+            logger.info("rescore failed for %s: %s", name, e)
+            return None
+        return MineResult(name, expr_str, train_ic, oos_ic, accepted, "rescored")
+
+    return [r for r in thread_map(_rescore, db.list_generated_factors())
+            if r is not None]

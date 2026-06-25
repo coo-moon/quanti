@@ -37,6 +37,7 @@ from quanti.data.provider import DataProvider
 from quanti.risk.manager import RiskConfig, RiskManager
 from quanti.risk.protections import ProtectionManager
 from quanti.strategy.base import BaseStrategy
+from quanti.utils.parallel import thread_map
 from quanti.strategy.loader import StrategyLoader
 
 logger = logging.getLogger(__name__)
@@ -131,7 +132,6 @@ class StrategySelector:
                                 risk_manager=RiskManager(RiskConfig()),
                                 protection_manager=ProtectionManager())
 
-        results: list[StrategyEvaluation] = []
         # Cap universe so each Selector cycle stays bounded. Default raised
         # from 50 → 100 in 2026-05 (P4): 50 was statistically too thin for
         # walk-forward to discriminate strategies — many fold splits ended
@@ -139,12 +139,18 @@ class StrategySelector:
         # ranking real signal. Override via goal.params["selector_max_universe"].
         max_universe = int(params.get("selector_max_universe", 100))
         capped = codes[:max(20, max_universe)]
-        for strat in candidates:
+
+        # One thread per strategy. Each clones the engine (its own RiskManager +
+        # per-run caches) so concurrent run()s don't race; the shared provider /
+        # DB is thread-safe (RLock'd connection). ponytail: thread_map, not a
+        # hand-rolled pool.
+        def _eval(strat: BaseStrategy) -> StrategyEvaluation:
             try:
+                eng = engine.clone()
                 # In-sample baseline (always computed, cheap).
                 strat.init(goal.params or {})
-                is_bt = engine.run(strategy=strat, codes=capped,
-                                   start=is_start, end=end)
+                is_bt = eng.run(strategy=strat, codes=capped,
+                                start=is_start, end=end)
                 m = is_bt.metrics or {}
                 ev = StrategyEvaluation(
                     strategy_name=strat.name,
@@ -154,7 +160,6 @@ class StrategySelector:
                     total_trades=len(is_bt.trades),
                     score=0.0,
                 )
-
                 if wf_enabled:
                     # Fresh instance per fold via factory. `copy.copy` is
                     # enough because BaseStrategy state is cleared in init().
@@ -165,7 +170,7 @@ class StrategySelector:
                         inst.init(dict(_cfg))
                         return inst
                     wf = run_walk_forward(
-                        engine, factory, capped, end,
+                        eng, factory, capped, end,
                         n_folds=n_folds, warmup_days=warmup_days,
                         test_days=test_days,
                     )
@@ -175,15 +180,16 @@ class StrategySelector:
                     ev.oos_consistency = wf.oos_consistency
                     ev.n_folds = len(wf.folds)
                     ev.oos_trades = wf.total_trades_oos
-
                 ev.score = self._score(ev, goal)
-                results.append(ev)
+                return ev
             except Exception as e:
                 logger.warning(f"Selector backtest failed for {strat.name}: {e}")
-                results.append(StrategyEvaluation(
+                return StrategyEvaluation(
                     strategy_name=strat.name, annual_return=0,
                     max_drawdown=0, sharpe=0, total_trades=0, score=-999,
-                ))
+                )
+
+        results = thread_map(_eval, candidates)
         results.sort(key=lambda r: r.score, reverse=True)
         return results
 

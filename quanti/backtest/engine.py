@@ -103,6 +103,24 @@ class BacktestEngine:
         # estimate vol point-in-time without re-querying the provider.
         self._all_bars: dict[str, list[BarData]] = {}
 
+    def clone(self) -> "BacktestEngine":
+        """A fresh engine with the same config but its OWN per-run caches AND
+        OWN RiskManager / ProtectionManager instances. run() mutates
+        self._all_bars / self._adv20 and the risk manager's daily counters, so
+        threads must each clone() rather than share one engine. Provider /
+        commission / slippage / sizer are stateless (or thread-safe) and reused.
+        """
+        return BacktestEngine(
+            provider=self._provider,
+            initial_cash=self._initial_cash,
+            commission=self._commission,
+            slippage=self._slippage,
+            risk_manager=RiskManager(self._risk.config) if self._risk else None,
+            protection_manager=(ProtectionManager(self._protections.config)
+                                 if self._protections else None),
+            sizer=self._sizer,
+        )
+
     def run(
         self,
         strategy: BaseStrategy,
