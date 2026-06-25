@@ -21,7 +21,7 @@
 
       <div v-if="!editing" class="stats-row">
         <div class="stat-card">
-          <span class="stat-label">单标的止损线</span>
+          <span class="stat-label">止损地板(绝对兜底)</span>
           <span class="stat-value neg">{{ pct(data.exits.stop_loss.threshold) }}</span>
         </div>
         <div class="stat-card">
@@ -54,7 +54,7 @@
 
       <form v-else class="card edit-form" @submit.prevent="save">
         <div class="form-grid">
-          <label>单标的止损线 (%)
+          <label>止损地板 (%,绝对兜底)
             <input type="number" step="0.5" v-model.number="form.stop_loss_pct" />
           </label>
           <label>组合回撤熔断 (%)
@@ -78,7 +78,7 @@
           </label>
         </div>
         <p class="form-hint">
-          止损 / 熔断为负百分比(如 -8)。ATR k&gt;0 时,单标的止损改用 -k×(ATR/价),替代固定止损线;改动即时生效,无需重启。
+          止损地板 / 熔断为负百分比(如 -15)。ATR k&gt;0 时单标的止损用 -k×(ATR/价)为主、地板兜底(止损永不宽于地板);k=0 则只用地板。改动即时生效,无需重启。
         </p>
         <div class="form-actions">
           <span v-if="saveMsg" class="save-msg" :class="saveErr ? 'err' : 'ok'">{{ saveMsg }}</span>

@@ -75,18 +75,6 @@ class TestRiskManager:
         allowed, _ = rm.check(signal, portfolio)
         assert allowed is True
 
-    def test_stop_loss_check(self, config):
-        config.stop_loss_pct = -0.08
-        rm = RiskManager(config)
-        portfolio = Portfolio(
-            cash=100_000.0,
-            positions={
-                "000001": Position("000001", 1000, 10.0, 9.0),  # -10% loss
-            },
-        )
-        stop_signals = rm.check_stop_loss(portfolio)
-        assert len(stop_signals) == 1
-        assert stop_signals[0].direction == Direction.SELL
 
 
 class TestCheckExits:
@@ -152,28 +140,29 @@ class TestCheckExits:
         assert len(sells) == 1 and "止损" in sells[0].reason
         assert "ATR" in sells[0].reason  # tagged as ATR-driven
 
-    def test_atr_disabled_falls_back_to_fixed(self):
-        # Same -6% loss but k=0 → fixed -8% governs → no exit.
+    def test_atr_disabled_falls_back_to_floor(self):
+        # k=0 → only the stop_loss_pct floor (-8%) governs; -6% holds.
         rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=0.0))
         assert rm.check_exits(self._pf(10.0, 9.4), atr_ratios={"X": 0.04}) == []
 
-    def test_atr_stop_wider_for_volatile_name(self):
-        # ratio 0.10, k=1 → stop -10%: a -9% loss holds (fixed -8% would exit)…
-        rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=1.0))
+    def test_atr_stop_wider_for_volatile_name_within_floor(self):
+        # Wide floor (-20%), ratio 0.10, k=1 → stop -10%: a -9% loss holds…
+        rm = RiskManager(RiskConfig(stop_loss_pct=-0.20, atr_stop_k=1.0))
         assert rm.check_exits(self._pf(10.0, 9.1), atr_ratios={"X": 0.10}) == []
         # …but a -11% loss exits.
         assert len(rm.check_exits(self._pf(10.0, 8.9),
                                   atr_ratios={"X": 0.10})) == 1
 
-    def test_atr_stop_capped_at_hard_floor(self):
-        # ratio 0.5, k=1 → -50% but clamped to -20%: -15% holds, -21% exits.
-        rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=1.0))
-        assert rm.check_exits(self._pf(10.0, 8.5), atr_ratios={"X": 0.5}) == []
-        assert len(rm.check_exits(self._pf(10.0, 7.9),
-                                  atr_ratios={"X": 0.5})) == 1
+    def test_atr_stop_capped_at_floor(self):
+        # ratio 0.5, k=1 → -50% but floored at stop_loss_pct -15%: a stop is
+        # never wider than the floor. -14% holds, -16% exits.
+        rm = RiskManager(RiskConfig(stop_loss_pct=-0.15, atr_stop_k=1.0))
+        assert rm.check_exits(self._pf(10.0, 8.6), atr_ratios={"X": 0.5}) == []
+        exits = rm.check_exits(self._pf(10.0, 8.4), atr_ratios={"X": 0.5})
+        assert len(exits) == 1 and "地板" in exits[0].reason
 
-    def test_atr_armed_but_missing_ratio_uses_fixed(self):
-        # k>0 but no ratio for the code → fixed stop_loss_pct still applies.
+    def test_atr_armed_but_missing_ratio_uses_floor(self):
+        # k>0 but no ratio for the code → the stop_loss_pct floor still applies.
         rm = RiskManager(RiskConfig(stop_loss_pct=-0.08, atr_stop_k=2.0))
         assert len(rm.check_exits(self._pf(10.0, 9.0), atr_ratios={})) == 1
         assert rm.check_exits(self._pf(10.0, 9.4), atr_ratios={}) == []

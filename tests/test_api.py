@@ -127,7 +127,7 @@ class TestRiskAuditEndpoint:
         assert r.status_code == 200
         d = r.json()
         assert d["account"] == "paper"
-        assert d["exits"]["stop_loss"]["threshold"] == -0.08
+        assert d["exits"]["stop_loss"]["threshold"] == -0.15  # stop floor
         assert d["exits"]["portfolio_circuit_breaker"]["threshold"] == -0.15
         chans = {c["channel"]: c for c in d["channel_parity"]}
         assert len(chans) == 3
@@ -178,7 +178,7 @@ class TestRiskControlConfig:
     async def test_get_defaults(self, client):
         r = await client.get("/api/config/risk-control")
         assert r.status_code == 200
-        assert r.json()["stop_loss_pct"] == -0.08  # RiskConfig default
+        assert r.json()["stop_loss_pct"] == -0.15  # absolute stop floor default
         assert r.json()["atr_stop_k"] == 2.0  # ATR-adaptive on by default
 
     @pytest.mark.asyncio
@@ -203,7 +203,7 @@ class TestRiskControlConfig:
     async def test_edit_takes_effect_live_no_restart(self, client, app):
         broker = app.state.broker
         broker._sync_risk_config()
-        assert broker._risk.config.stop_loss_pct == -0.08  # default before edit
+        assert broker._risk.config.stop_loss_pct == -0.15  # default before edit
         await client.post("/api/config/risk-control", json=self._FULL)
         broker._sync_risk_config()  # what check_exits/enforce do each cycle
         assert broker._risk.config.stop_loss_pct == -0.05
