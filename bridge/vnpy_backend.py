@@ -105,8 +105,11 @@ class VnpyBackend:
 
     @staticmethod
     def available() -> bool:
-        """True only where vnpy + a QMT gateway are importable (the QMT box)."""
-        return _VNPY_OK and _XT_OK
+        """True only where vnpy + QMT gateway + xtdata are all importable (the
+        QMT box). xtdata is required too: without it positions()/quote() can't
+        mark to realtime and would silently fall back to cost basis (stops never
+        fire), so we degrade to mock — which reads as NOT connected (G1)."""
+        return _VNPY_OK and _XT_OK and _XTDATA_OK
 
     def __init__(self, setting: dict, gateway_name: str = GATEWAY_NAME) -> None:
         self._setting = setting or {}

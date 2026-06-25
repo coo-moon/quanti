@@ -389,11 +389,12 @@ def cmd_agent(args):
     from quanti.agent.goal import RiskTolerance, load_goal, save_goal
     from quanti.agent.runtime import AgentRuntime
     from quanti.data.provider import DataProvider
-    from quanti.execution.paper_broker import PaperBroker
+    from quanti.execution.factory import make_broker
 
     db = _open_db()
     provider = DataProvider(db)
-    broker = PaperBroker(db, provider, initial_cash=args.cash)
+    # account from env QUANTI_ACCOUNT: live → QmtBroker(require_live), else paper.
+    broker = make_broker(db, provider, initial_cash=args.cash, fill_mode="immediate")
     agent = AgentRuntime(db, provider, broker)
 
     if args.action == "tick":

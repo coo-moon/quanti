@@ -33,7 +33,7 @@ from quanti.agent.runtime import AgentRuntime
 from quanti.backtest.engine import BacktestEngine
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
-from quanti.execution.paper_broker import PaperBroker
+from quanti.execution.factory import make_broker
 from quanti.models import Direction, Signal
 from quanti.screener.loader import ScreenerLoader
 from quanti.strategy.loader import StrategyLoader
@@ -49,18 +49,29 @@ SERVER_VERSION = "0.2.0"
 class QuantiContext:
     """Bundle of long-lived objects the MCP tools work against."""
 
-    def __init__(self, db_path: str = "data/paper.db",
+    def __init__(self, db_path: str | None = None,
                  strategies_dir: str = "strategies",
                  screeners_dir: str = "screeners",
                  initial_cash: float = 1_000_000.0,
                  market_db_path: str = "data/market.db") -> None:
-        self.db = Database(db_path, market_db_path=market_db_path)
+        # account (QUANTI_ACCOUNT) is the single source of truth for BOTH the
+        # trading DB and the broker, so `quanti mcp` can't run a live broker
+        # against the paper DB (or vice-versa). Matches api/app.py wiring.
+        import os
+        account = os.environ.get("QUANTI_ACCOUNT", "paper")
+        self.db = Database(db_path or f"data/{account}.db",
+                           market_db_path=market_db_path)
         self.db.initialize()
         self.provider = DataProvider(self.db)
         self.strategies_dir = strategies_dir
         self.screeners_dir = screeners_dir
-        self.broker = PaperBroker(self.db, self.provider, initial_cash=initial_cash,
-                                  strategies_dir=strategies_dir)
+        # immediate fills: MCP place_order is a one-shot tool call that expects
+        # the fill reflected synchronously (same as `quanti agent tick`). Live
+        # (QmtBroker) ignores fill_mode.
+        self.broker = make_broker(self.db, self.provider, account=account,
+                                  initial_cash=initial_cash,
+                                  strategies_dir=strategies_dir,
+                                  fill_mode="immediate")
         self.agent = AgentRuntime(
             self.db, self.provider, self.broker,
             strategies_dir=strategies_dir, screeners_dir=screeners_dir,
@@ -449,13 +460,14 @@ def _format_tool_result(payload: Any) -> dict:
     return {"content": [{"type": "text", "text": text}]}
 
 
-def serve_stdio(db_path: str = "data/quanti.db") -> None:
-    """Main stdio loop. One JSON message per line in/out."""
+def serve_stdio(db_path: str | None = None) -> None:
+    """Main stdio loop. One JSON message per line in/out. db_path defaults to
+    the QUANTI_ACCOUNT-derived path (data/{account}.db) inside QuantiContext."""
     ctx = QuantiContext(db_path=db_path)
     logging.basicConfig(level=logging.WARNING,
                         format="%(asctime)s [%(levelname)s] %(message)s",
                         stream=sys.stderr)
-    logger.info(f"Quanti MCP server starting (db={db_path})")
+    logger.info("Quanti MCP server starting")
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -510,8 +522,9 @@ def serve_stdio(db_path: str = "data/quanti.db") -> None:
 
 
 def main() -> None:
-    db_path = "data/quanti.db"
-    serve_stdio(db_path=db_path)
+    # db / broker both derive from QUANTI_ACCOUNT (default paper) — same as
+    # `quanti serve`. No hardcoded legacy data/quanti.db.
+    serve_stdio()
 
 
 if __name__ == "__main__":

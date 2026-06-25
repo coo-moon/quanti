@@ -354,10 +354,14 @@ class QmtBroker:
             last = float(q.get("last", 0) or 0)
             if last > 0:
                 return last
-        except Exception:  # noqa: BLE001 - fall back to stored close
+        except Exception:  # noqa: BLE001 - fall back below
             pass
-        # RAW (不复权) close — this prices a live order, so it must be the real
-        # tradable price, not the back-adjusted (hfq) series.
+        # Live must price on the realtime (xtdata-via-bridge) quote ONLY — never
+        # stale tushare daily. No realtime quote → 0.0; downstream prices it as a
+        # market order (real execution), not a stale limit.
+        if self._require_live:
+            return 0.0
+        # Paper/dev: RAW (不复权) close is a fine stand-in tradable price.
         bars = self._provider.get_daily_bars(
             code, date(2000, 1, 1), date.today(), adjust="none")
         return float(bars[-1].close) if bars else 0.0

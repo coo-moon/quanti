@@ -259,6 +259,32 @@ export interface Portfolio {
   snapshot_date: string;
 }
 
+export interface LiveStopPosition {
+  code: string;
+  name: string;
+  quantity: number;
+  avg_cost: number;
+  current_price: number;
+  pnl_pct: number;
+  stop_price: number;
+  stop_pct: number;
+  atr_driven: boolean;
+}
+
+export interface LiveStatus {
+  is_live: boolean;
+  guard: {
+    enabled: boolean;
+    interval_sec: number;
+    running: boolean;
+    connected: boolean | null;
+    in_session: boolean;
+  };
+  positions: LiveStopPosition[];
+}
+
+export const fetchLiveStatus = () => api.get<LiveStatus>("/agent/live-status");
+
 export interface OrderRecord {
   order_id: string;
   code: string;

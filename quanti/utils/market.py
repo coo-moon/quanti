@@ -90,6 +90,15 @@ def is_trading_day(d: date, provider: Optional[DataProvider] = None) -> bool:
     return d.weekday() < 5
 
 
+def in_trading_session(now: datetime | None = None,
+                       provider: Optional[DataProvider] = None) -> bool:
+    """Calendar-aware trading-session check: `now` (Beijing) is inside a
+    morning/afternoon session AND it's a real trading day. Gates the live
+    intraday guard so it idles outside market hours and on holidays."""
+    dt = _to_beijing(now)
+    return is_market_open(dt) and is_trading_day(dt.date(), provider)
+
+
 def next_trading_day(after: date,
                      provider: Optional[DataProvider] = None) -> date:
     """First trading day strictly after `after`."""

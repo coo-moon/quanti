@@ -14,7 +14,7 @@ from quanti.agent.runtime import AgentRuntime
 from quanti.data.background_sync import BackgroundQuoteSyncer
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
-from quanti.execution.paper_broker import PaperBroker
+from quanti.execution.factory import make_broker
 
 # Resolve web/dist relative to project root
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -41,17 +41,21 @@ def create_app(
         db = Database(f"data/{account}.db", market_db_path="data/market.db")
         db.initialize()
     provider = provider or DataProvider(db)
-    # Production fill mode is "pending" — signals queue and fill at the
-    # next trading bar's open. See docs/plans/2026-06-01-order-lifecycle.md.
-    # Backtest engine + unit tests keep using the "immediate" default of
-    # PaperBroker so their assertions on synchronous fills still hold.
-    broker = PaperBroker(db=db, provider=provider, initial_cash=initial_cash,
-                         fill_mode="pending",
+    # Broker per account: live → QmtBroker(require_live) over qmt-bridge, else
+    # PaperBroker. Production paper fill mode is "pending" — signals queue and
+    # fill at the next trading bar's open (docs/plans/2026-06-01-order-lifecycle).
+    # Backtest engine + unit tests keep PaperBroker's "immediate" default.
+    broker = make_broker(db, provider, account=account,
+                         initial_cash=initial_cash, fill_mode="pending",
                          strategies_dir=strategies_dir or "strategies")
+    # Live runs a fast intraday guard (reconcile fills + exits + circuit breaker
+    # on a ~1min cadence, riding xtdata realtime quotes via the bridge); paper
+    # has nothing to gain intraday (next-open fills, daily-close marks) → off.
     agent = AgentRuntime(
         db=db, provider=provider, broker=broker,
         strategies_dir=strategies_dir or "strategies",
-        screeners_dir=screeners_dir or "screeners")
+        screeners_dir=screeners_dir or "screeners",
+        intraday_guard_sec=60 if account == "live" else 0)
     # Independent daemon that keeps daily_quotes fresh, decoupled from the
     # agent's 4h tick. Auto-starts by default so cold-start users don't
     # have to know about it; tests pass autostart_background_sync=False

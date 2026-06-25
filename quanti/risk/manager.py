@@ -158,6 +158,26 @@ class RiskManager:
         return ((total_value - peak_value) / peak_value
                 <= self.config.portfolio_stop_loss_pct)
 
+    def _effective_stop_pct(self, atr_ratio: float | None) -> tuple[float, bool]:
+        """The stop threshold (a negative pnl%) and whether ATR drives it. ATR
+        (atr_stop_k>0) tightens on top of the stop_loss_pct floor:
+        max(floor, -k·ratio). Single source for check_exits + stop_info."""
+        cfg = self.config
+        stop_pct = cfg.stop_loss_pct
+        if cfg.atr_stop_k > 0 and atr_ratio is not None and atr_ratio > 0:
+            stop_pct = max(cfg.stop_loss_pct, -cfg.atr_stop_k * atr_ratio)
+        return stop_pct, stop_pct != cfg.stop_loss_pct
+
+    def stop_info(self, avg_cost: float, atr_ratio: float | None = None) -> dict:
+        """The price a holding would stop out at: avg_cost·(1+stop_pct). For the
+        live status card. `atr_ratio` = ATR(atr_stop_n)/price for the code."""
+        stop_pct, atr_driven = self._effective_stop_pct(atr_ratio)
+        return {
+            "stop_pct": stop_pct,
+            "stop_price": round(avg_cost * (1 + stop_pct), 3) if avg_cost > 0 else 0.0,
+            "atr_driven": atr_driven,
+        }
+
     def check_exits(
         self,
         portfolio: Portfolio,
@@ -205,11 +225,7 @@ class RiskManager:
             #    the primary stop, floored at stop_loss_pct: a stop is never
             #    wider than the floor, so the floor is the absolute backstop
             #    when ATR is off or its ratio is missing.
-            stop_pct = cfg.stop_loss_pct
-            ar = atr_ratios.get(code)
-            if cfg.atr_stop_k > 0 and ar is not None and ar > 0:
-                stop_pct = max(cfg.stop_loss_pct, -cfg.atr_stop_k * ar)
-            atr_driven = stop_pct != cfg.stop_loss_pct
+            stop_pct, atr_driven = self._effective_stop_pct(atr_ratios.get(code))
             if pos.pnl_pct <= stop_pct:
                 tag = f" (ATR×{cfg.atr_stop_k:g})" if atr_driven else " (地板)"
                 signals.append(Signal(
