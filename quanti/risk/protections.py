@@ -58,6 +58,19 @@ class ProtectionConfig:
     cg_max_avg_corr: float = 0.75   # avg pairwise corr >= this → lock new BUYs
     cg_min_holdings: int = 5        # fewer holdings → fail-open (not a concentration risk)
 
+    # UnlockGuard (opt-in, default OFF): block a BUY on a name with a large
+    # share-unlock (限售解禁) within the horizon — supply shocks are a documented
+    # A-share left-tail driver. Per-code (uses the `code` arg), unlike the global
+    # guards. Risk overlay, never alpha. Fed by the share_unlocks table, which is
+    # ONLY populated by calling AkShareAdapter.sync_share_unlocks — an empty
+    # table (no fetch run yet) → fail-open. Default OFF so an unverified akshare
+    # column/unit can't bite production until someone runs+verifies the fetch and
+    # enables this. The pct denominator (流通股 vs 总股本) is whatever akshare's
+    # column exposes — verify live before trusting the absolute threshold.
+    unlock_guard_enabled: bool = False
+    ug_horizon_days: int = 30        # look this many days ahead for unlocks
+    ug_min_float_pct: float = 0.05   # unlock 占比 >= this fraction → block buy
+
 
 @dataclass
 class ProtectionContext:
@@ -74,6 +87,9 @@ class ProtectionContext:
     # names; only populated when correlation_guard_enabled. Empty → guard
     # fail-opens (no concentration signal available).
     holdings_returns: dict[str, list[float]] = field(default_factory=dict)
+    # { code → max float-fraction unlocking within ug_horizon_days }; only
+    # populated when unlock_guard_enabled. Empty / code absent → fail-open.
+    upcoming_unlocks: dict[str, float] = field(default_factory=dict)
 
 
 class ProtectionManager:
@@ -84,13 +100,13 @@ class ProtectionManager:
 
     def check_entry(self, ctx: ProtectionContext,
                     code: str | None = None) -> tuple[bool, str]:
-        """Return (allowed, reason). allowed=False blocks a BUY. `code` is
-        unused in v1 (both protections are global); reserved for v2 per-pair
-        cooldown."""
+        """Return (allowed, reason). allowed=False blocks a BUY. `code` is used
+        only by the per-code UnlockGuard; the other guards are global."""
         if not self.config.enabled:
             return True, ""
         for reason in (self._stoploss_guard(ctx), self._max_drawdown(ctx),
-                       self._correlation_guard(ctx)):
+                       self._correlation_guard(ctx),
+                       self._unlock_guard(ctx, code)):
             if reason:
                 return False, reason
         return True, ""
@@ -182,4 +198,16 @@ class ProtectionManager:
         if avg >= cfg.cg_max_avg_corr:
             return (f"CorrelationGuard 锁定: {arr.shape[0]}只持仓近{n}日平均两两相关 "
                     f"{avg:.2f}≥{cfg.cg_max_avg_corr}(组合已是单一相关下注,暂停新买)")
+        return None
+
+    def _unlock_guard(self, ctx: ProtectionContext, code: str | None) -> str | None:
+        """Block a BUY on `code` if it has a large share-unlock within the
+        horizon. Per-code; fail-open when off, code missing, or no unlock data."""
+        cfg = self.config
+        if not cfg.unlock_guard_enabled or not code:
+            return None
+        pct = ctx.upcoming_unlocks.get(code)
+        if pct is not None and pct >= cfg.ug_min_float_pct:
+            return (f"UnlockGuard 锁定 {code}: 近{cfg.ug_horizon_days}日解禁占比 "
+                    f"{pct:.1%}≥{cfg.ug_min_float_pct:.0%}(供给冲击左尾,暂停新买)")
         return None

@@ -519,6 +519,60 @@ class AkShareAdapter:
                     period.isoformat(), ann.isoformat(), n)
         return n
 
+    def sync_share_unlocks(self, start: date, end: date) -> int:
+        """限售解禁 forward calendar via akshare, stored as a RISK-overlay table
+        (UnlockGuard), never as alpha. Keyed on free_date (法定解禁日, reliable).
+
+        NOTE — needs ONE live verification before UnlockGuard is enabled:
+        akshare's 限售解禁明细 column names AND the %-of-float UNIT drift across
+        versions. This maps columns defensively and ASSUMES the pct column is in
+        PERCENT (5.0 → stored 0.05 fraction). Until the table is populated the
+        guard fail-opens, and UnlockGuard defaults OFF — so a wrong unit/column
+        can't touch production until someone verifies + enables. Degrades to 0
+        (logged) on any endpoint/column drift."""
+        date_cols = ("解禁时间", "解禁日期", "free_date")
+        code_cols = ("股票代码", "代码", "code")
+        pct_cols = ("占总股本比例", "实际解禁数量占总股本比例",
+                    "占流通股本比例", "解禁数量占总股本比例")
+        try:
+            df = ak.stock_restricted_release_detail_em(
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"))
+        except Exception as e:  # noqa: BLE001 - upstream/columns drift → skip
+            logger.info("stock_restricted_release_detail_em unavailable: %s", e)
+            return 0
+        if df is None or df.empty:
+            return 0
+        dcol = next((c for c in date_cols if c in df.columns), None)
+        ccol = next((c for c in code_cols if c in df.columns), None)
+        pcol = next((c for c in pct_cols if c in df.columns), None)
+        if dcol is None or ccol is None:
+            logger.info("share-unlock columns drift; got %s", list(df.columns))
+            return 0
+        rows = []
+        for _, r in df.iterrows():
+            code = str(r.get(ccol, "") or "").strip()
+            fd = self._parse_ak_date(r.get(dcol))
+            if not code or fd is None:
+                continue
+            pct = None
+            if pcol is not None:
+                v = r.get(pcol)
+                # akshare returns string sentinels ('-', '--', '') for missing
+                # pct; pd.isna doesn't catch those, so coerce defensively — one
+                # bad cell must not kill the whole batch (the "degrades to 0"
+                # promise). Unparseable → NULL → guard skips it.
+                if v is not None and not pd.isna(v):
+                    try:
+                        pct = float(v) / 100.0  # ASSUME percent → fraction (verify live)
+                    except (TypeError, ValueError):
+                        pct = None
+            rows.append({"code": code, "free_date": fd, "float_pct": pct})
+        n = self._db.save_share_unlocks(rows)
+        logger.info("share_unlocks %s~%s: %d rows via akshare 限售解禁明细",
+                    start.isoformat(), end.isoformat(), n)
+        return n
+
     @staticmethod
     def report_periods(years: int) -> list[date]:
         """Quarterly report-period ends within the last `years`, up to today."""

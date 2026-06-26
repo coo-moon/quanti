@@ -54,12 +54,18 @@ def build_db_context(db: Database, provider: DataProvider,
             if rets:
                 holdings_returns[code] = rets
 
+    # Upcoming share-unlocks (one query) — only when the unlock guard is on.
+    upcoming_unlocks: dict[str, float] = {}
+    if config.unlock_guard_enabled:
+        upcoming_unlocks = db.get_upcoming_unlocks(today, config.ug_horizon_days)
+
     return ProtectionContext(
         today=today,
         stop_loss_exit_dates=sl_dates,
         equity_series=equity,
         trading_days_between=_trading_days_between,
         holdings_returns=holdings_returns,
+        upcoming_unlocks=upcoming_unlocks,
     )
 
 
