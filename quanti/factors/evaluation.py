@@ -4,11 +4,16 @@ IC measures whether a factor's value at t predicts the forward return t→t+N.
 It is a research metric computed on history (the future is known there), so it
 legitimately uses forward returns; the factor itself remains ②-look-ahead-safe.
 rank-IC = Pearson correlation of cross-sectional ranks (Spearman), computed
-with pandas/numpy (no scipy)."""
+with pandas/numpy (no scipy).
+
+`factor_ic` returns the mean IC. `factor_ic_stats` additionally returns a
+Newey-West (HAC) t-stat + sample size so the factor-mining gate can run a
+proper multiple-testing correction instead of accepting on raw IC."""
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 import numpy as np
@@ -35,14 +40,14 @@ def rank_ic(factor_vals: dict[str, float], fwd_rets: dict[str, float],
     return float(np.corrcoef(f, r)[0, 1])
 
 
-def factor_ic(expr: Expr, provider, codes: list[str], start: date, end: date,
-              *, fwd_days: int = 5, lookback_days: int = 200,
-              min_names: int = 5, with_fundamentals: bool = False) -> float:
-    """Mean cross-sectional rank-IC over the trading dates in [start, end].
+def _ic_series(expr: Expr, provider, codes: list[str], start: date, end: date,
+               *, fwd_days: int, lookback_days: int, min_names: int,
+               with_fundamentals: bool) -> list[float]:
+    """Per-date cross-sectional rank-IC list over the trading dates in
+    [start, end] — the shared core of `factor_ic` and `factor_ic_stats`.
 
     For each code, evaluate the factor series (② batch) and the forward return
-    series once, then assemble each date's cross-section. NaN if no scorable
-    dates.
+    series once, then assemble each date's cross-section.
 
     `with_fundamentals=True` merges point-in-time pe/pb/roe/... onto each code's
     bars (via cross_sectional._merge_fundamentals) so fundamental factor
@@ -71,7 +76,7 @@ def factor_ic(expr: Expr, provider, codes: list[str], start: date, end: date,
         fwd_by_code[code] = fwd
 
     if not fac_by_code:
-        return float("nan")
+        return []
 
     all_dates = sorted({d for s in fac_by_code.values() for d in s.index
                         if start <= d <= end})
@@ -82,4 +87,74 @@ def factor_ic(expr: Expr, provider, codes: list[str], start: date, end: date,
         ic = rank_ic(fvals, rvals, min_names=min_names)
         if not np.isnan(ic):
             ics.append(ic)
+    return ics
+
+
+def factor_ic(expr: Expr, provider, codes: list[str], start: date, end: date,
+              *, fwd_days: int = 5, lookback_days: int = 200,
+              min_names: int = 5, with_fundamentals: bool = False) -> float:
+    """Mean cross-sectional rank-IC over [start, end]. NaN if no scorable dates."""
+    ics = _ic_series(expr, provider, codes, start, end, fwd_days=fwd_days,
+                     lookback_days=lookback_days, min_names=min_names,
+                     with_fundamentals=with_fundamentals)
     return float(np.mean(ics)) if ics else float("nan")
+
+
+@dataclass
+class ICStats:
+    """OOS IC summary for significance testing. `t_stat` is the IC information
+    ratio with a Newey-West (Bartlett) HAC correction for the autocorrelation
+    induced by overlapping `fwd_days` forward-return windows; `n` = number of
+    scorable cross-section dates. NaN t_stat / n=0 means "not testable"."""
+    mean_ic: float
+    t_stat: float
+    n: int
+
+
+def factor_ic_stats(expr: Expr, provider, codes: list[str], start: date,
+                    end: date, *, fwd_days: int = 5, lookback_days: int = 200,
+                    min_names: int = 5, with_fundamentals: bool = False,
+                    nw_lag: int | None = None) -> ICStats:
+    """Mean IC + HAC t-stat + sample size, for multiple-testing-aware gating.
+
+    Same one-pass heavy computation as `factor_ic`, plus the t-stat, so the
+    miner can get a p-value without a second evaluation. The Newey-West lag
+    defaults to `fwd_days - 1` (the overlap length of the forward-return
+    windows) — without it the daily IC series' autocorrelation inflates the
+    t-stat and manufactures significance."""
+    ics = _ic_series(expr, provider, codes, start, end, fwd_days=fwd_days,
+                     lookback_days=lookback_days, min_names=min_names,
+                     with_fundamentals=with_fundamentals)
+    if not ics:
+        return ICStats(float("nan"), float("nan"), 0)
+    lag = nw_lag if nw_lag is not None else max(0, fwd_days - 1)
+    return ICStats(float(np.mean(ics)), _nw_tstat(ics, lag), len(ics))
+
+
+def _nw_tstat(ics: list[float], lag: int) -> float:
+    """t-stat of mean(ics) using a Newey-West Bartlett-kernel HAC variance.
+
+    lag=0 reduces to the iid t = mean·√n / sd. With lag>0 it adds the
+    Bartlett-weighted autocovariances so overlapping forward-return windows
+    don't understate the standard error (Lo 2002 applied to the IC series)."""
+    n = len(ics)
+    if n < 2:
+        return float("nan")
+    x = np.asarray(ics, dtype=float)
+    xc = x - x.mean()
+    g0 = float(xc @ xc) / n                       # variance (population)
+    # A (near-)constant series is untestable. Use a real tolerance, not >0:
+    # float noise leaves g0 ~1e-36 for a constant series, which would otherwise
+    # produce a spurious astronomical t-stat (p≈0) and FALSELY pass the gate.
+    # Real rank-IC series have variance >> 1e-12.
+    if g0 <= 1e-12:
+        return float("nan")
+    s = g0
+    L = max(0, min(lag, n - 1))
+    for k in range(1, L + 1):
+        gk = float(xc[k:] @ xc[:-k]) / n          # autocovariance at lag k
+        s += 2.0 * (1.0 - k / (L + 1)) * gk        # Bartlett weight
+    if s <= 0:
+        return float("nan")
+    se = float(np.sqrt(s / n))                    # SE of the mean
+    return float(x.mean() / se) if se > 0 else float("nan")
