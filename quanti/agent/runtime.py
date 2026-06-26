@@ -126,6 +126,8 @@ class AgentRuntime:
         self._prev_sizer = None  # broker's sizer before equal-weight install
         self._candidate_source_logged: date | None = None  # daily dedup for the
         # no-screener "candidate_source" beta-exposure decision log
+        self._attribution_logged: date | None = None  # daily dedup for the
+        # observe-only "pool_vs_passive" active-vs-passive guardrail log
         self._thread: threading.Thread | None = None
         self._guard_thread: threading.Thread | None = None
         # Serializes broker mutations between the full tick and the intraday
@@ -892,6 +894,27 @@ class AgentRuntime:
                     f"放宽 no_screener_take 纳中小盘在小盘行情更强、微盘崩盘尾部更大——"
                     f"是 regime 押注、非免费优化。",
                     details={"no_screener_take": take, "universe": len(universe)})
+
+        # Observe-only active-vs-passive guardrail: once/day, compare the
+        # account's realized return vs equal-weighting the candidate pool over
+        # the same window — surfaces quanti's own finding (active loses to
+        # passive equal-weight) as a live signal. Never changes a trade.
+        today_av = date.today()
+        if self._attribution_logged != today_av:
+            try:
+                from quanti.agent.attribution import active_vs_passive
+                av = active_vs_passive(self._db, self._provider, candidates)
+                if av is not None:
+                    self._attribution_logged = today_av
+                    verdict = "跑输被动" if av["lagging"] else "跑赢/持平被动"
+                    self._db.log_decision(
+                        "pool_vs_passive",
+                        f"主动 vs 池内等权({av['days']}日):账户 {av['active']:+.2%} "
+                        f"vs 等权 {av['passive']:+.2%}(差 {av['gap']:+.2%}, "
+                        f"{av['n_names']}只)→ {verdict}",
+                        details=av)
+            except Exception as e:  # noqa: BLE001 - observability never breaks a tick
+                logger.warning("active_vs_passive attribution skipped: %s", e)
 
         # Clear any equal-weight sizer left over from a prior ensemble cycle;
         # the ensemble path re-installs it if equal_weight is still on. Without
