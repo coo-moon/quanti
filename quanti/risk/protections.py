@@ -18,9 +18,11 @@ stays locked K trading days, and continued distress extends it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Callable
+
+import numpy as np
 
 
 @dataclass
@@ -45,6 +47,17 @@ class ProtectionConfig:
     md_lock_days: int = 10
     md_min_points: int = 5  # fewer equity points in window → fail-open
 
+    # CorrelationGuard (opt-in, default OFF — it changes live BUY behavior): when
+    # the held book is already a highly-correlated single bet, lock new BUYs so
+    # the agent doesn't pile more into the same exposure. Preventive only — never
+    # forces a sell (the -15% breaker + ATR stops own the sell side). Targets the
+    # known failure mode: an "equal-weight" book that is really one small-cap beta
+    # with a fat left tail. Point-in-time on today's holdings (no K-lock history).
+    correlation_guard_enabled: bool = False
+    cg_lookback_days: int = 20      # trailing daily returns per holding
+    cg_max_avg_corr: float = 0.75   # avg pairwise corr >= this → lock new BUYs
+    cg_min_holdings: int = 5        # fewer holdings → fail-open (not a concentration risk)
+
 
 @dataclass
 class ProtectionContext:
@@ -57,6 +70,10 @@ class ProtectionContext:
     stop_loss_exit_dates: list[date]
     equity_series: list[tuple[date, float]]
     trading_days_between: Callable[[date, date], int]
+    # { code → trailing daily returns (chronological) } for currently-held
+    # names; only populated when correlation_guard_enabled. Empty → guard
+    # fail-opens (no concentration signal available).
+    holdings_returns: dict[str, list[float]] = field(default_factory=dict)
 
 
 class ProtectionManager:
@@ -72,7 +89,8 @@ class ProtectionManager:
         cooldown."""
         if not self.config.enabled:
             return True, ""
-        for reason in (self._stoploss_guard(ctx), self._max_drawdown(ctx)):
+        for reason in (self._stoploss_guard(ctx), self._max_drawdown(ctx),
+                       self._correlation_guard(ctx)):
             if reason:
                 return False, reason
         return True, ""
@@ -131,4 +149,37 @@ class ProtectionManager:
         if ctx.trading_days_between(latest_trigger, ctx.today) <= K:
             return (f"MaxDrawdown 锁定: 近{W}交易日净值回撤≤{thr:.0%} "
                     f"(最近触发 {latest_trigger.isoformat()}, 锁{K}交易日)")
+        return None
+
+    def _correlation_guard(self, ctx: ProtectionContext) -> str | None:
+        """Lock new BUYs when the held book's average pairwise return-correlation
+        is too high — it's already effectively one bet. Fail-open on too few
+        holdings or too little aligned history."""
+        cfg = self.config
+        if not cfg.correlation_guard_enabled:
+            return None
+        # Trailing returns per holding, trimmed to the lookback, kept only if
+        # they have >= 2 points.
+        series = [r[-cfg.cg_lookback_days:] for r in ctx.holdings_returns.values()
+                  if r and len(r) >= 2]
+        if len(series) < cfg.cg_min_holdings:
+            return None
+        n = min(len(s) for s in series)
+        if n < 2:
+            return None
+        arr = np.asarray([s[-n:] for s in series], dtype=float)  # (k, n)
+        # Drop holdings with zero variance over the window (corrcoef → NaN row).
+        arr = arr[arr.std(axis=1) > 0]
+        if arr.shape[0] < cfg.cg_min_holdings:
+            return None
+        cm = np.corrcoef(arr)
+        iu = np.triu_indices(cm.shape[0], k=1)
+        vals = cm[iu]
+        vals = vals[~np.isnan(vals)]
+        if vals.size == 0:
+            return None
+        avg = float(np.mean(vals))
+        if avg >= cfg.cg_max_avg_corr:
+            return (f"CorrelationGuard 锁定: {arr.shape[0]}只持仓近{n}日平均两两相关 "
+                    f"{avg:.2f}≥{cfg.cg_max_avg_corr}(组合已是单一相关下注,暂停新买)")
         return None

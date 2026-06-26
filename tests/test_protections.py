@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import numpy as np
+
 from quanti.risk.protections import (
     ProtectionConfig, ProtectionContext, ProtectionManager,
 )
@@ -132,6 +134,62 @@ def test_check_entry_code_param_ignored():
     ctx = _ctx(_d(3), sl_dates=[_d(1), _d(2), _d(3)])  # StoplossGuard locks
     assert mgr.check_entry(ctx, code="000001") == mgr.check_entry(ctx)
     assert mgr.check_entry(ctx, code="000001")[0] is False
+
+
+# ---- CorrelationGuard -------------------------------------------------
+
+def _cg_cfg(**kw):
+    base = dict(correlation_guard_enabled=True, cg_lookback_days=20,
+                cg_max_avg_corr=0.75, cg_min_holdings=5,
+                stoploss_guard_enabled=False, max_drawdown_enabled=False)
+    base.update(kw)
+    return ProtectionConfig(**base)
+
+
+def _cg_ctx(holdings_returns):
+    return ProtectionContext(
+        today=_d(30), stop_loss_exit_dates=[], equity_series=[],
+        trading_days_between=_consecutive_td, holdings_returns=holdings_returns)
+
+
+def test_correlation_guard_locks_when_book_is_one_bet():
+    rng = np.random.default_rng(1)
+    factor = rng.normal(0, 0.02, 25)
+    # 5 holdings = the same factor + tiny idiosyncratic noise → avg corr ~1.
+    hr = {f"c{i}": (factor + rng.normal(0, 0.001, 25)).tolist() for i in range(5)}
+    allowed, reason = ProtectionManager(_cg_cfg()).check_entry(_cg_ctx(hr))
+    assert allowed is False
+    assert "CorrelationGuard" in reason
+
+
+def test_correlation_guard_allows_diversified_book():
+    rng = np.random.default_rng(2)
+    hr = {f"c{i}": rng.normal(0, 0.02, 40).tolist() for i in range(6)}  # independent
+    assert ProtectionManager(_cg_cfg()).check_entry(_cg_ctx(hr))[0] is True
+
+
+def test_correlation_guard_fail_open_below_min_holdings():
+    rng = np.random.default_rng(3)
+    factor = rng.normal(0, 0.02, 25).tolist()
+    hr = {f"c{i}": factor for i in range(3)}  # corr=1 but only 3 < min 5
+    assert ProtectionManager(_cg_cfg()).check_entry(_cg_ctx(hr))[0] is True
+
+
+def test_correlation_guard_off_by_default():
+    rng = np.random.default_rng(4)
+    factor = rng.normal(0, 0.02, 25).tolist()
+    hr = {f"c{i}": factor for i in range(6)}  # identical → corr 1
+    # Default config has correlation_guard_enabled=False → never locks on it.
+    assert ProtectionManager(ProtectionConfig()).check_entry(_cg_ctx(hr))[0] is True
+
+
+def test_correlation_guard_drops_zero_variance_then_fail_open():
+    rng = np.random.default_rng(5)
+    factor = rng.normal(0, 0.02, 25).tolist()
+    hr = {f"c{i}": factor for i in range(3)}          # 3 correlated...
+    hr.update({f"flat{i}": [0.0] * 25 for i in range(3)})  # ...+3 flat (dropped)
+    # After dropping zero-variance holdings only 3 remain (< min 5) → fail-open.
+    assert ProtectionManager(_cg_cfg()).check_entry(_cg_ctx(hr))[0] is True
 
 
 # ---- Live context builder ---------------------------------------------

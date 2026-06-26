@@ -239,9 +239,22 @@ class BacktestEngine:
                             and _bt_td(t.date, current_date) <= sg_span]
                 eq = sorted(equity_values.items())[-md_span:]
                 eq.append((current_date, portfolio.total_value))
+                # Trailing returns per held name for the correlation guard
+                # (only when enabled) — point-in-time via _recent_bars_asof.
+                h_rets: dict[str, list[float]] = {}
+                if cfg.correlation_guard_enabled:
+                    for hcode in portfolio.positions:
+                        bars = self._recent_bars_asof(
+                            hcode, current_date)[-(cfg.cg_lookback_days + 1):]
+                        cl = [float(b.close) for b in bars if b.close]
+                        rets = [cl[i] / cl[i - 1] - 1
+                                for i in range(1, len(cl)) if cl[i - 1] > 0]
+                        if rets:
+                            h_rets[hcode] = rets
                 ctx = ProtectionContext(
                     today=current_date, stop_loss_exit_dates=sl_dates,
-                    equity_series=eq, trading_days_between=_bt_td)
+                    equity_series=eq, trading_days_between=_bt_td,
+                    holdings_returns=h_rets)
                 allowed, _reason = self._protections.check_entry(ctx)
                 buy_locked = not allowed
 
