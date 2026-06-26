@@ -39,11 +39,27 @@ def build_db_context(db: Database, provider: DataProvider,
     def _trading_days_between(a: date, b: date) -> int:
         return count_trading_days_between(a, b, provider)
 
+    # Trailing daily returns per held name — only when the correlation guard is
+    # on (else skip the per-position fetches entirely).
+    holdings_returns: dict[str, list[float]] = {}
+    if config.correlation_guard_enabled:
+        cg_start = today - timedelta(days=config.cg_lookback_days * 2 + 14)
+        for pos in db.list_positions():
+            code = pos["code"]
+            df = provider.get_daily_df(code, cg_start, today)
+            if df is None or len(df) < 2:
+                continue
+            closes = df.sort_values("date")["close"].astype(float)
+            rets = closes.pct_change().dropna().tolist()
+            if rets:
+                holdings_returns[code] = rets
+
     return ProtectionContext(
         today=today,
         stop_loss_exit_dates=sl_dates,
         equity_series=equity,
         trading_days_between=_trading_days_between,
+        holdings_returns=holdings_returns,
     )
 
 
