@@ -471,6 +471,11 @@
         <h2>最近策略评估</h2>
         <div class="muted">选定:<b>{{ displayStrategy(agent.last_strategy) }}</b></div>
       </div>
+      <p class="muted" style="margin-top:0">
+        数字为<b>样本外</b>(walk-forward,真实可信);标
+        <span class="count-badge">样本内</span>
+        的行无样本外数据,回退到样本内/已调优值,会显著偏乐观。
+      </p>
       <div class="table-wrap">
         <table class="data-table">
         <thead>
@@ -489,11 +494,12 @@
               <b v-if="e.strategy_name === agent.last_strategy">{{ displayStrategy(e.strategy_name) }}</b>
               <span v-else>{{ displayStrategy(e.strategy_name) }}</span>
               <span v-if="tunedNames.has(e.strategy_name)" class="count-badge">已调优</span>
+              <span v-if="!e.n_folds" class="count-badge">样本内</span>
             </td>
-            <td :class="e.annual_return >= 0 ? 'up' : 'down'">{{ formatPct(e.annual_return) }}</td>
-            <td class="down">{{ formatPct(e.max_drawdown) }}</td>
-            <td>{{ e.sharpe.toFixed(2) }}</td>
-            <td>{{ e.total_trades }}</td>
+            <td :class="oosOr(e, 'annual_return') >= 0 ? 'up' : 'down'">{{ formatPct(oosOr(e, 'annual_return')) }}</td>
+            <td class="down">{{ formatPct(oosOr(e, 'max_drawdown')) }}</td>
+            <td>{{ oosOr(e, 'sharpe').toFixed(2) }}</td>
+            <td>{{ e.n_folds ? e.oos_trades : e.total_trades }}</td>
             <td>{{ e.score.toFixed(3) }}</td>
           </tr>
         </tbody>
@@ -890,6 +896,13 @@ function formatMoney(n: number) {
 function formatPct(n: number) {
   if (!isFinite(n)) return "-";
   return (n * 100).toFixed(2) + "%";
+}
+// Show the out-of-sample metric (real, walk-forward) when available, else fall
+// back to the in-sample one. The selector scores on OOS, so the card should
+// too — IS numbers are tuned/single-window and read far too optimistic.
+function oosOr(e: any, base: "annual_return" | "max_drawdown" | "sharpe"): number {
+  const v = e?.n_folds ? e["oos_" + base] : e?.[base];
+  return typeof v === "number" ? v : 0;
 }
 function formatTs(ts: string) {
   return ts.replace("T", " ").slice(0, 19);

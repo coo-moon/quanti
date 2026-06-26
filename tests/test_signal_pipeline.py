@@ -213,6 +213,49 @@ class TestRuntimeEnsemble:
         assert len(ensemble_decisions) >= 1
         assert result["strategy"] == "ensemble"
 
+    def test_equal_weight_installs_fixed_sizer_and_caps_holdings(self, ensemble_db):
+        """equal_weight + max_holdings: the ensemble path caps the book to N
+        names, installs a FixedSizer(1/N) on the broker, forces signal
+        strength to 1.0, and — when 1/N exceeds the per-stock risk cap —
+        logs an `equal_weight_capped` warning instead of failing silently."""
+        from quanti.agent.goal import save_goal
+        from quanti.risk.sizer import FixedSizer, VolTargetSizer
+
+        provider = DataProvider(ensemble_db)
+        # Construct with a non-default sizer to prove it's restored on reset.
+        original = VolTargetSizer()
+        broker = PaperBroker(ensemble_db, provider, initial_cash=1_000_000,
+                             sizer=original)
+        agent = AgentRuntime(ensemble_db, provider, broker,
+                             strategies_dir="strategies",
+                             screeners_dir="screeners")
+        goal = Goal(
+            target_annual_return=0.20,
+            params={"ensemble_enabled": True, "top_k_strategies": 3,
+                    "signal_threshold": 0.0, "factor_blend": 0.5,
+                    "equal_weight": True, "max_holdings": 1,
+                    "wf_enabled": True, "wf_n_folds": 2,
+                    "wf_warmup_days": 60, "wf_test_days": 14})
+        save_goal(ensemble_db, goal)
+
+        signals, name, _ev = agent._ensemble_path(
+            goal=goal, candidates=["000001", "000002"])
+
+        assert name == "ensemble"
+        assert len(signals) <= 1                       # max_holdings cap
+        assert isinstance(broker._sizer, FixedSizer)   # equal-weight installed
+        assert agent._equal_weight_active is True
+        if signals:
+            assert signals[0].strength == 1.0          # conviction overridden
+        # N=1 → target 100% >> 10% cap → must warn, not silently idle cash.
+        capped = ensemble_db.list_decisions(limit=20, kind="equal_weight_capped")
+        assert len(capped) >= 1
+
+        # Switching equal_weight off restores the construction-time sizer.
+        agent._set_cycle_sizer(None)
+        assert broker._sizer is original
+        assert agent._equal_weight_active is False
+
     def test_legacy_path_unchanged_when_ensemble_disabled(self, ensemble_db):
         """With ensemble_enabled=False (default), runtime should NOT log
         strategy_ensemble — it should go through pick_best like before."""

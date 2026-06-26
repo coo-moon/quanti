@@ -46,7 +46,7 @@ from quanti.models import Direction, Signal
 logger = logging.getLogger(__name__)
 
 # Default to a fast/cheap model. Override via goal.params["llm_model"].
-DEFAULT_MODEL = "claude-sonnet-4-5"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 
 SYSTEM_PROMPT = """You are a quantitative trading assistant for A-share stocks. \
 You are working WITH a rule-based pipeline that has already done the heavy lifting: \

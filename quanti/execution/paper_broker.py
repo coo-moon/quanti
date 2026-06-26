@@ -105,6 +105,13 @@ class PaperBroker:
         # Idempotent — only writes if no row exists.
         self._db.ensure_portfolio(initial_cash)
 
+    def set_sizer(self, sizer: Sizer | None) -> None:
+        """Swap the position sizer at runtime (None → legacy cash%/risk-cap).
+
+        Lets the agent runtime toggle equal-weight sizing per goal without
+        rebuilding the broker."""
+        self._sizer = sizer
+
     def _entry_allowed(self, signal: Signal,
                        portfolio) -> tuple[bool, str, str]:
         """Risk caps + protections gate for an entry, via the shared helper.

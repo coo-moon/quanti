@@ -229,6 +229,12 @@ export interface AgentStatus {
     sharpe: number;
     total_trades: number;
     score: number;
+    // Walk-forward (out-of-sample) metrics; n_folds === 0 means no WF data.
+    oos_annual_return?: number;
+    oos_max_drawdown?: number;
+    oos_sharpe?: number;
+    n_folds?: number;
+    oos_trades?: number;
   }>;
   total_value: number;
   pnl_pct: number;
