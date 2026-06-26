@@ -272,3 +272,8 @@ class TestRuntimeEnsemble:
             limit=20, kind="strategy_ensemble")
         assert len(ensemble_decisions) == 0
         assert result["strategy"] != "ensemble"
+        # No screener configured → ADV-fallback fires and logs the large-cap
+        # beta exposure exactly once (observability for the silent default).
+        src = ensemble_db.list_decisions(limit=20, kind="candidate_source")
+        assert len(src) == 1
+        assert src[0]["details"]["no_screener_take"] == 100

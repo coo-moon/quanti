@@ -124,6 +124,8 @@ class AgentRuntime:
         # on the broker, so _set_cycle_sizer only resets a sizer it owns.
         self._equal_weight_active = False
         self._prev_sizer = None  # broker's sizer before equal-weight install
+        self._candidate_source_logged: date | None = None  # daily dedup for the
+        # no-screener "candidate_source" beta-exposure decision log
         self._thread: threading.Thread | None = None
         self._guard_thread: threading.Thread | None = None
         # Serializes broker mutations between the full tick and the intraday
@@ -552,6 +554,17 @@ class AgentRuntime:
         per_strategy, weights = collect_signals_per_strategy(
             prepared, candidates, self._provider)
 
+        # Cross-section is the `candidates` set (ADV-top-N), NOT the full
+        # market — and this is deliberately left as-is. Validation (2026-06-26,
+        # scripts/factor_breadth_validate.py, 5y+OOS) recomputed the panel over
+        # a wide ADV-1000 pool and re-ranked the same candidates: 84% of picks
+        # were identical and the return gap was inside the noise floor (Sharpe
+        # SE ≈ ±0.7 at n=24 months). Since production also blends the panel
+        # only 50% with strategy votes (factor_blend), widening the z-score
+        # reference set is a ~0-impact change that adds per-tick cost for no
+        # measurable benefit. (Separately, the whole factor layer loses to
+        # plain pool equal-weight OOS — there's no within-pool alpha to sharpen
+        # here regardless.) Don't "fix" this without re-running that script.
         panel = compute_factor_panel(
             self._provider, self._db, candidates,
             config=FactorConfig(industry_neutralize=industry_neutral),
@@ -856,6 +869,29 @@ class AgentRuntime:
             take = int(params_local.get("no_screener_take", 100))
             from quanti.agent.universe import sort_by_adv20
             candidates = sort_by_adv20(self._provider, universe)[:take]
+            # Observability for the silent beta this fallback fixes: top-N by
+            # liquidity == a large-cap book. Regime-split validation
+            # (2026-06-26, scripts/breadth_regime.py) shows breadth is a
+            # regime-dependent BETA CHOICE, not a free optimization — the
+            # ADV100/300/1000 ranking flips by regime:
+            #   micro-cap crash (2024-01): ADV100 -14% vs ADV1000 -31% (large
+            #     caps protect hard);  large-cap recovery (24-07~): ADV100 +43%
+            #     vs ADV1000 +36%;  small-cap regime (21~23): ADV1000 -19% vs
+            #     ADV100 -27%;  full 5y: ~tied (ADV1000 -2.5% / -53% DD vs
+            #     ADV100 -3.2% / -58% DD).
+            # Keep the large-cap default: it's the tail-protective posture and
+            # this system's edge is drawdown control, not alpha. But log it
+            # once/day so the operator sees the beta they're running and can
+            # widen via no_screener_take if they want small-cap exposure.
+            today = date.today()
+            if self._candidate_source_logged != today:
+                self._candidate_source_logged = today
+                self._db.log_decision(
+                    "candidate_source",
+                    f"无 screener:取 ADV 前 {take} 只 = 大盘 beta(防御:微盘踩踏回撤更小)。"
+                    f"放宽 no_screener_take 纳中小盘在小盘行情更强、微盘崩盘尾部更大——"
+                    f"是 regime 押注、非免费优化。",
+                    details={"no_screener_take": take, "universe": len(universe)})
 
         # Clear any equal-weight sizer left over from a prior ensemble cycle;
         # the ensemble path re-installs it if equal_weight is still on. Without
