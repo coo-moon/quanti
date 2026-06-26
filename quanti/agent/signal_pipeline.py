@@ -52,11 +52,13 @@ class FusedCandidate:
     dominant_strategy: str = ""  # argmax(weight×strength); owns the exit
     industry: str = ""
 
-    def to_signal(self, reason: str = "") -> Signal:
+    def to_signal(self, reason: str = "", strength: float | None = None) -> Signal:
         """Materialize into a Signal that PaperBroker can ingest.
 
-        `strength` is set to `final_score` so the broker's sizer (whether
-        FixedSizer or VolTargetSizer) can scale further by conviction.
+        `strength` defaults to `final_score` so the broker's sizer (whether
+        FixedSizer or VolTargetSizer) can scale further by conviction. Pass an
+        explicit `strength` (e.g. 1.0) for equal-weight mode, where every name
+        should deploy the same target weight regardless of conviction.
         """
         contrib = ",".join(self.contributing_strategies)
         sent_str = f" sent={self.sentiment_score:+.2f}" if self.sentiment_score else ""
@@ -64,8 +66,8 @@ class FusedCandidate:
                          f"factor={self.factor_score:+.2f}{sent_str} "
                          f"final={self.final_score:.2f}")
         return Signal(stock_code=self.code, direction=Direction.BUY,
-                      strength=self.final_score, reason=msg,
-                      entry_strategy=self.dominant_strategy)
+                      strength=self.final_score if strength is None else strength,
+                      reason=msg, entry_strategy=self.dominant_strategy)
 
 
 def _sigmoid(x: float, k: float = 1.0) -> float:
@@ -242,10 +244,15 @@ def collect_signals_per_strategy(
     per_strategy: dict[str, list[Signal]] = {}
     weights: dict[str, float] = {}
 
+    # Fetch each code's bars ONCE — strategies share the same history window,
+    # so re-reading per strategy was K× redundant DB/provider work per tick.
+    bars_by_code = {code: provider.get_daily_bars(code, start, end)
+                    for code in candidates}
+
     for strat, weight in strategies_with_weights:
         latest: dict[tuple[str, str], tuple[date, Signal]] = {}
         for code in candidates:
-            bars = provider.get_daily_bars(code, start, end)
+            bars = bars_by_code[code]
             for bar in bars:
                 if bar.date < recent_cutoff:
                     strat.on_bar(bar)

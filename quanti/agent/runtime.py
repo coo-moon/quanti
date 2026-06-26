@@ -120,6 +120,10 @@ class AgentRuntime:
         # list and reuse for ticks within the same trading day. See
         # _cached_tradable_universe for details.
         self._universe_cache: tuple[date, tuple, list[str]] | None = None
+        # True while we (the runtime) have installed an equal-weight FixedSizer
+        # on the broker, so _set_cycle_sizer only resets a sizer it owns.
+        self._equal_weight_active = False
+        self._prev_sizer = None  # broker's sizer before equal-weight install
         self._thread: threading.Thread | None = None
         self._guard_thread: threading.Thread | None = None
         # Serializes broker mutations between the full tick and the intraday
@@ -569,6 +573,15 @@ class AgentRuntime:
             fused = industry_cap(fused, n_per_industry=n_per_industry)
         fused = filter_by_threshold(fused, threshold=threshold)
 
+        # Breadth cap: keep only the top-N by final_score. Lets the user run a
+        # deliberately diversified book (e.g. 20 equal-weight names) instead of
+        # the emergent ~9-10 the 10% per-name cap allows by default. 0 = off.
+        # Note: this caps NEW buys only; held names that fall out of top-N are
+        # not rotated out (exits stay stop/strategy-driven) — by design.
+        max_holdings = int(params.get("max_holdings", 0))
+        if max_holdings > 0:
+            fused = fused[:max_holdings]
+
         contributing = sorted({s for c in fused for s in c.contributing_strategies})
         self._db.log_decision(
             "strategy_ensemble",
@@ -631,8 +644,59 @@ class AgentRuntime:
         """Rule-driven ensemble: candidates → signals (no LLM)."""
         fused, evaluations, _weights = self._compute_fused_candidates(
             goal, candidates)
-        signals = [c.to_signal() for c in fused]
+        params = goal.params or {}
+        equal_weight = bool(params.get("equal_weight", False)) and bool(fused)
+        if not equal_weight:
+            self._set_cycle_sizer(None)
+            return [c.to_signal() for c in fused], "ensemble", evaluations
+
+        # Passive equal-weight book: each held name targets the SAME weight via
+        # a FixedSizer, so capital isn't front-loaded into the top ranks.
+        weight_per_name = 1.0 / len(fused)
+        if not self._set_cycle_sizer(weight_per_name):
+            # Broker has no equal-weight sizer (e.g. live QmtBroker sizes via
+            # cash%/risk-cap). Fall back to conviction-weighted sizing rather
+            # than forcing strength=1.0 onto a sizer that ignores it.
+            return [c.to_signal() for c in fused], "ensemble", evaluations
+
+        # Per-name target is min(1/N, max_position_pct): the RiskManager
+        # single-stock cap still binds. For N < ~10 that cap wins and the book
+        # under-invests to N×cap — log it loudly rather than silently leaving
+        # cash idle (data-integrity: never relax a risk cap behind the user).
+        cap = getattr(getattr(self._broker, "_risk", None), "config", None)
+        cap_pct = float(getattr(cap, "max_position_pct", 0.0) or 0.0)
+        if cap_pct and weight_per_name > cap_pct:
+            self._db.log_decision(
+                "equal_weight_capped",
+                f"等权 {len(fused)} 只:目标 {weight_per_name:.1%}/只 超过单票风控上限 "
+                f"{cap_pct:.1%},按上限建仓,组合仅约 {len(fused) * cap_pct:.0%} 仓位、"
+                f"其余留现金。要全仓等权请用 N≥{int(round(1 / cap_pct))} 只。")
+        signals = [c.to_signal(strength=1.0) for c in fused]
         return signals, "ensemble", evaluations
+
+    def _set_cycle_sizer(self, weight_per_name: float | None) -> bool:
+        """Install (or clear) an equal-weight FixedSizer on the broker for this
+        cycle. Returns True iff an equal-weight sizer is now active.
+
+        On install we snapshot the broker's prior sizer and restore it on
+        reset, so a sizer injected at broker construction survives an
+        equal-weight toggle. No-op returning False on brokers without a sizer
+        slot (e.g. QmtBroker, which sizes via cash%/risk-cap and ignores
+        Sizer)."""
+        setter = getattr(self._broker, "set_sizer", None)
+        if setter is None:
+            return False
+        if weight_per_name is not None:
+            from quanti.risk.sizer import FixedSizer
+            if not self._equal_weight_active:
+                self._prev_sizer = getattr(self._broker, "_sizer", None)
+            setter(FixedSizer(max_pct=min(1.0, weight_per_name)))
+            self._equal_weight_active = True
+            return True
+        if self._equal_weight_active:
+            setter(self._prev_sizer)
+            self._equal_weight_active = False
+        return False
 
     def _build_llm_client(self, params: dict):
         """Construct an LLM client per goal.params['llm_provider'].
@@ -662,6 +726,7 @@ class AgentRuntime:
         for this tick. The next tick will retry.
         """
         from quanti.agent.llm_runtime import (
+            DEFAULT_MODEL,
             LLMConfig,
             run_llm_decision,
         )
@@ -677,7 +742,7 @@ class AgentRuntime:
 
         params = goal.params or {}
         cfg = LLMConfig(
-            model=str(params.get("llm_model", "claude-sonnet-4-5")),
+            model=str(params.get("llm_model", DEFAULT_MODEL)),
             max_tokens=int(params.get("llm_max_tokens", 4096)),
             max_tool_iterations=int(params.get("llm_max_iterations", 5)),
             max_candidates_in_context=int(params.get("llm_max_candidates", 20)),
@@ -791,6 +856,11 @@ class AgentRuntime:
             take = int(params_local.get("no_screener_take", 100))
             from quanti.agent.universe import sort_by_adv20
             candidates = sort_by_adv20(self._provider, universe)[:take]
+
+        # Clear any equal-weight sizer left over from a prior ensemble cycle;
+        # the ensemble path re-installs it if equal_weight is still on. Without
+        # this, switching to single/LLM mode would keep sizing equal-weight.
+        self._set_cycle_sizer(None)
 
         # Decide path among three options:
         #   * "llm":      ensemble candidates → Claude judgment (P3).
