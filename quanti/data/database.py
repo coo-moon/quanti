@@ -486,7 +486,12 @@ class Database:
                 name=excluded.name,
                 exchange=excluded.exchange,
                 list_date=excluded.list_date,
-                industry=excluded.industry,
+                -- keep an existing industry when the incoming row carries none:
+                -- the default tushare roster passes industry='' for every code,
+                -- which would otherwise wipe a backfilled industry on each sync
+                -- and silently turn factor industry-neutralization back into a
+                -- no-op. A real (non-empty) industry still overwrites.
+                industry=COALESCE(NULLIF(excluded.industry, ''), stocks.industry),
                 delist_date=COALESCE(excluded.delist_date, stocks.delist_date)
             """,
             (

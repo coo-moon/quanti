@@ -34,6 +34,21 @@ class TestStockStorage:
         stocks = db.list_stocks()
         assert len(stocks) == 2
 
+    def test_empty_industry_does_not_clobber_existing(self, db):
+        """A re-sync that carries no industry (e.g. the default tushare roster
+        passes industry='') must NOT wipe a backfilled industry — otherwise
+        factor industry-neutralization silently reverts to a no-op."""
+        db.upsert_stock("000001", "平安银行", "SZ", date(1991, 4, 3), "银行")
+        db.upsert_stock("000001", "平安银行", "SZ", date(1991, 4, 3), "")
+        assert db.get_stock("000001").industry == "银行"
+
+    def test_nonempty_industry_still_overwrites(self, db):
+        """A real (non-empty) industry update still wins — the guard only
+        protects against empty clobbering, not legitimate reclassification."""
+        db.upsert_stock("000001", "平安银行", "SZ", date(1991, 4, 3), "银行")
+        db.upsert_stock("000001", "平安银行", "SZ", date(1991, 4, 3), "综合金融")
+        assert db.get_stock("000001").industry == "综合金融"
+
 
 class TestDailyQuoteStorage:
     def test_save_and_get_daily_quotes(self, db):

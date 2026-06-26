@@ -200,7 +200,8 @@ class TushareAdapter:
         for status in ("L", "D", "P"):
             df = self._retry(
                 pro.stock_basic, list_status=status,
-                fields="ts_code,name,list_date,delist_date", _patient=patient)
+                fields="ts_code,name,industry,list_date,delist_date",
+                _patient=patient)
             if df is None or df.empty:
                 continue
             for _, row in df.iterrows():
@@ -209,10 +210,15 @@ class TushareAdapter:
                 if list_date is None:
                     continue  # list_date is NOT NULL in schema; skip junk rows
                 delist_date = self._parse_ts_date(row.get("delist_date"))
+                # stock_basic carries an `industry` field even on low tiers; keep
+                # it so factor industry-neutralization isn't a no-op. Delisted (D)
+                # rows often have a blank industry — upsert_stock's COALESCE then
+                # preserves any industry already on the row.
+                industry = str(row.get("industry") or "")
                 try:
                     self._db.upsert_stock(
                         code, str(row["name"]), exchange, list_date,
-                        industry="", delist_date=delist_date)
+                        industry=industry, delist_date=delist_date)
                     count += 1
                 except Exception as e:  # noqa: BLE001 - one bad row shouldn't abort
                     logger.warning("save %s failed: %s", code, e)
