@@ -23,13 +23,30 @@ class TestAShareCommission:
         # 过户费 = 10 * 1000 * 0.00001 = 0.1
         assert cost == pytest.approx(5.1)
 
-    def test_sell_commission(self):
+    def test_sell_commission_current_rate(self):
         comm = AShareCommission()
+        # No date → current (post-2023-08-28) 万5 stamp.
         cost = comm.calculate(price=10.0, quantity=1000, direction=Direction.SELL)
-        # 佣金 = max(5, 2.5) = 5.0
-        # 印花税 = 10 * 1000 * 0.001 = 10.0
-        # 过户费 = 0.1
-        assert cost == pytest.approx(15.1)
+        # 佣金 max(5, 2.5)=5.0 + 印花税 10*1000*0.0005=5.0 + 过户费 0.1
+        assert cost == pytest.approx(10.1)
+
+    def test_sell_stamp_duty_is_date_aware(self):
+        from datetime import date
+        comm = AShareCommission()
+        # Before the 2023-08-28 halving: 千1 stamp → total 15.1.
+        pre = comm.calculate(10.0, 1000, Direction.SELL, trade_date=date(2023, 8, 27))
+        assert pre == pytest.approx(15.1)
+        # On/after: 万5 stamp → total 10.1.
+        post = comm.calculate(10.0, 1000, Direction.SELL, trade_date=date(2023, 8, 28))
+        assert post == pytest.approx(10.1)
+        # Buys never carry stamp duty, regardless of date.
+        assert comm.calculate(10.0, 1000, Direction.BUY,
+                              trade_date=date(2023, 8, 27)) == pytest.approx(5.1)
+
+    def test_min_commission_floor_on_tiny_trade(self):
+        comm = AShareCommission()
+        # 佣金 raw = 1*100*0.00025 = 0.025 → floored to 5.0; +过户费 0.001
+        assert comm.calculate(1.0, 100, Direction.BUY) == pytest.approx(5.001)
 
 
 class TestMetrics:

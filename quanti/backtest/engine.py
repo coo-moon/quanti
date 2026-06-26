@@ -526,7 +526,8 @@ class BacktestEngine:
         price = bar.open * (1 - slip_frac)
 
         revenue = price * quantity
-        commission = self._commission.calculate(price, quantity, Direction.SELL)
+        commission = self._commission.calculate(price, quantity, Direction.SELL,
+                                                trade_date=current_date)
         net_revenue = revenue - commission
 
         portfolio.cash += net_revenue
