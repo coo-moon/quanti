@@ -20,6 +20,7 @@ from quanti.data.provider import DataProvider
 from quanti.factors.cross_sectional import (
     DEFAULT_FACTORS,
     FactorConfig,
+    _industry_demean,
     compute_factor_panel,
     factor_momentum_3m,
     factor_momentum_6m,
@@ -83,6 +84,41 @@ class TestSingleFactors:
         for name, fn in DEFAULT_FACTORS.items():
             v = fn(df)
             assert np.isnan(v), f"{name} did not return NaN on short history"
+
+
+class TestIndustryDemean:
+    """`_industry_demean` is a no-op for years because every stock's industry
+    was blank in the DB; these pin both halves of its contract so a re-blanked
+    `stocks.industry` can't silently revert it to doing nothing."""
+
+    def test_demeans_within_industry(self):
+        """Same-industry stocks get the group mean subtracted; an
+        unknown-industry / singleton stock passes through untouched."""
+        panel = pd.DataFrame(
+            {"f": [1.0, 3.0, 5.0, 7.0]},
+            index=["bank_a", "bank_b", "tech_solo", "no_ind"],
+        )
+        panel["industry"] = ["银行", "银行", "科技", ""]
+        out = _industry_demean(panel, "f")
+        # 银行 mean = 2.0 → demeaned to ±1.0
+        assert out["bank_a"] == pytest.approx(-1.0)
+        assert out["bank_b"] == pytest.approx(1.0)
+        # singleton industry and empty industry are passed through unchanged
+        assert out["tech_solo"] == pytest.approx(5.0)
+        assert out["no_ind"] == pytest.approx(7.0)
+
+    def test_all_blank_industry_is_graceful_noop(self):
+        """The exact pre-backfill state: every industry empty → return the
+        column unchanged rather than crash or zero it out."""
+        panel = pd.DataFrame({"f": [1.0, 3.0, 5.0]}, index=["a", "b", "c"])
+        panel["industry"] = ["", "", ""]
+        out = _industry_demean(panel, "f")
+        assert list(out) == [1.0, 3.0, 5.0]
+
+    def test_missing_industry_column_is_noop(self):
+        panel = pd.DataFrame({"f": [1.0, 3.0]}, index=["a", "b"])
+        out = _industry_demean(panel, "f")
+        assert list(out) == [1.0, 3.0]
 
 
 # -------- pipeline integration tests -----------------------------------

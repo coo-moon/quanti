@@ -24,15 +24,16 @@ class FakePro:
     def stock_basic(self, list_status, fields):
         if list_status == "L":
             return pd.DataFrame([
-                {"ts_code": "000001.SZ", "name": "平安银行",
+                {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行",
                  "list_date": "19910403", "delist_date": None},
             ])
         if list_status == "D":
-            return pd.DataFrame([
-                {"ts_code": "600001.SH", "name": "邯郸钢铁",
+            return pd.DataFrame([   # delisted rows often have a blank industry
+                {"ts_code": "600001.SH", "name": "邯郸钢铁", "industry": "",
                  "list_date": "19980122", "delist_date": "20100824"},
             ])
-        return pd.DataFrame(columns=["ts_code", "name", "list_date", "delist_date"])
+        return pd.DataFrame(
+            columns=["ts_code", "name", "industry", "list_date", "delist_date"])
 
     def trade_cal(self, exchange, is_open):
         return pd.DataFrame([{"cal_date": "20240102"}, {"cal_date": "20240103"}])
@@ -121,6 +122,7 @@ def test_sync_stock_list_includes_delisted(db):
     listed = db.get_stock("000001")
     delisted = db.get_stock("600001")
     assert listed is not None and listed.delist_date is None
+    assert listed.industry == "银行"   # stock_basic industry is carried through
     assert delisted is not None and delisted.delist_date == date(2010, 8, 24)
     assert delisted.exchange == "SH"
 
