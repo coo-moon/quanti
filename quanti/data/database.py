@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -313,6 +313,18 @@ class Database:
                 roe REAL, net_profit REAL, revenue REAL,
                 netprofit_yoy REAL, revenue_yoy REAL,
                 PRIMARY KEY (code, end_date, report_type)
+            );
+
+            -- Share-unlock (限售解禁) forward calendar: a scheduled future
+            -- supply shock keyed by free_date (法定解禁日, reliable — unlike
+            -- akshare announcement dates). Used as a RISK overlay (UnlockGuard),
+            -- never as an alpha signal.
+            CREATE TABLE IF NOT EXISTS {m}share_unlocks (
+                code TEXT NOT NULL,
+                free_date TEXT NOT NULL,
+                float_pct REAL,
+                fetched_at TEXT,
+                PRIMARY KEY (code, free_date)
             );
 
             CREATE INDEX IF NOT EXISTS {m}idx_daily_quotes_code
@@ -792,6 +804,42 @@ class Database:
             recs)
         self.conn.commit()
         return len(recs)
+
+    def save_share_unlocks(self, rows) -> int:
+        """Upsert share-unlock calendar rows: iterable of dicts with keys
+        `code`, `free_date` (date|ISO str), `float_pct` (fraction of float, e.g.
+        0.05 = 5%; may be None)."""
+        now = datetime.now().isoformat()
+        recs = []
+        for r in rows:
+            code = str(r.get("code", "") or "").strip()
+            fd = self._iso_date(r["free_date"]) if r.get("free_date") else None
+            if not code or not fd:
+                continue
+            pct = r.get("float_pct")
+            try:
+                pct = None if pct is None else float(pct)
+            except (TypeError, ValueError):
+                pct = None
+            recs.append((code, fd, pct, now))
+        if not recs:
+            return 0
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO share_unlocks "
+            "(code, free_date, float_pct, fetched_at) VALUES (?, ?, ?, ?)", recs)
+        self.conn.commit()
+        return len(recs)
+
+    def get_upcoming_unlocks(self, as_of: date, horizon_days: int) -> dict[str, float]:
+        """{ code → max float_pct } for unlocks dated in (as_of, as_of+horizon].
+        Strictly after as_of (an unlock today is already priced). Codes with a
+        NULL float_pct are skipped (can't size the risk)."""
+        end = (as_of + timedelta(days=horizon_days)).isoformat()
+        rows = self.conn.execute(
+            "SELECT code, MAX(float_pct) FROM share_unlocks "
+            "WHERE free_date > ? AND free_date <= ? AND float_pct IS NOT NULL "
+            "GROUP BY code", (as_of.isoformat(), end)).fetchall()
+        return {r[0]: float(r[1]) for r in rows if r[1] is not None}
 
     def has_fundamentals(self) -> bool:
         """True if any daily_basic or financials rows exist — lets the factor

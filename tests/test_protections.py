@@ -192,6 +192,42 @@ def test_correlation_guard_drops_zero_variance_then_fail_open():
     assert ProtectionManager(_cg_cfg()).check_entry(_cg_ctx(hr))[0] is True
 
 
+# ---- UnlockGuard ------------------------------------------------------
+
+def _ug_cfg(**kw):
+    base = dict(unlock_guard_enabled=True, ug_horizon_days=30,
+                ug_min_float_pct=0.05, stoploss_guard_enabled=False,
+                max_drawdown_enabled=False)
+    base.update(kw)
+    return ProtectionConfig(**base)
+
+
+def _ug_ctx(upcoming_unlocks):
+    return ProtectionContext(
+        today=_d(0), stop_loss_exit_dates=[], equity_series=[],
+        trading_days_between=_consecutive_td, upcoming_unlocks=upcoming_unlocks)
+
+
+def test_unlock_guard_blocks_large_near_term_unlock():
+    ctx = _ug_ctx({"600519": 0.08})   # 8% of float >= 5% threshold
+    allowed, reason = ProtectionManager(_ug_cfg()).check_entry(ctx, code="600519")
+    assert allowed is False
+    assert "UnlockGuard" in reason and "600519" in reason
+
+
+def test_unlock_guard_allows_small_unlock_and_other_codes():
+    mgr = ProtectionManager(_ug_cfg())
+    ctx = _ug_ctx({"600519": 0.02})   # 2% < 5% threshold
+    assert mgr.check_entry(ctx, code="600519")[0] is True   # below threshold
+    assert mgr.check_entry(ctx, code="000001")[0] is True   # not in the unlock map
+    assert mgr.check_entry(ctx, code=None)[0] is True        # no code → skip
+
+
+def test_unlock_guard_off_by_default():
+    ctx = _ug_ctx({"600519": 0.50})   # huge unlock, but guard off by default
+    assert ProtectionManager(ProtectionConfig()).check_entry(ctx, code="600519")[0] is True
+
+
 # ---- Live context builder ---------------------------------------------
 
 def test_build_db_context_from_database(tmp_path):
