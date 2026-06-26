@@ -170,6 +170,44 @@ class Database:
         self._conn = _LockedConnection(self._raw_conn, self._db_lock)
         self._create_tables()
         self._migrate()
+        self._drop_shadow_tables()
+
+    # Shared/market tables — MUST live in the attached `market.*` schema, never
+    # in the account (main) DB. A copy in main shadows the attached one (SQLite
+    # resolves unqualified names to main first) → silent empty/stale reads
+    # ("数据没了"). Keep in sync with the `{m}`-prefixed CREATEs in _create_tables.
+    _SHARED_TABLES = ("stocks", "daily_quotes", "daily_basic", "financials",
+                      "trade_calendar", "stock_pools", "pool_stocks",
+                      "sync_jobs", "news_sentiment", "share_unlocks")
+
+    def _drop_shadow_tables(self) -> None:
+        """Guard against the recurring shadow-table masking bug: when a market
+        DB is attached, drop EMPTY shared-table copies sitting in the account DB
+        (zero data loss — they only mask market.*), and LOUDLY flag non-empty
+        ones for manual cleanup rather than silently deleting possible user data
+        (e.g. account-created pools). No-op in single-file mode (no attach)."""
+        if not self._market_db_path:
+            return
+        for t in self._SHARED_TABLES:
+            in_main = self.conn.execute(
+                "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=?",
+                (t,)).fetchone()
+            if not in_main:
+                continue  # no shadow in the account DB — fine
+            n = self.conn.execute(f"SELECT COUNT(*) FROM main.{t}").fetchone()[0]
+            if n == 0:
+                self.conn.execute(f"DROP TABLE main.{t}")
+                logger.warning(
+                    "dropped empty shadow table account-db.%s — it was masking "
+                    "the attached market.%s (unqualified reads were seeing 0 rows)",
+                    t, t)
+            else:
+                logger.error(
+                    "NON-EMPTY shadow table account-db.%s (%d rows) is masking "
+                    "market.%s — unqualified reads see the stale account copy, "
+                    "not market. Back up, then DROP TABLE %s in the account DB.",
+                    t, n, t, t)
+        self.conn.commit()
 
     def _migrate(self) -> None:
         """Idempotent additive migrations for DBs created before a column
