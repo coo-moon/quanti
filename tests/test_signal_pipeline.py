@@ -213,41 +213,43 @@ class TestRuntimeEnsemble:
         assert len(ensemble_decisions) >= 1
         assert result["strategy"] == "ensemble"
 
-    def test_equal_weight_installs_fixed_sizer_and_caps_holdings(self, ensemble_db):
-        """equal_weight + max_holdings: the ensemble path caps the book to N
-        names, installs a FixedSizer(1/N) on the broker, forces signal
-        strength to 1.0, and — when 1/N exceeds the per-stock risk cap —
-        logs an `equal_weight_capped` warning instead of failing silently."""
-        from quanti.agent.goal import save_goal
+    def test_equal_weight_installs_fixed_sizer_and_restores(self, ensemble_db, monkeypatch):
+        """equal_weight wiring: the ensemble path installs a FixedSizer(1/N),
+        forces signal strength to 1.0, logs `equal_weight_capped` when 1/N
+        exceeds the per-stock risk cap, and restores the construction-time sizer
+        on reset. Deterministic: the flaky selector/strategy/factor stack is
+        mocked out (it produced today-relative synthetic data, so whether it
+        yields candidates depended on the run date) — here we pin the equal-
+        weight LOGIC on a fixed 2-candidate fusion."""
         from quanti.risk.sizer import FixedSizer, VolTargetSizer
 
         provider = DataProvider(ensemble_db)
-        # Construct with a non-default sizer to prove it's restored on reset.
-        original = VolTargetSizer()
+        original = VolTargetSizer()   # non-default sizer → must be restored on reset
         broker = PaperBroker(ensemble_db, provider, initial_cash=1_000_000,
                              sizer=original)
         agent = AgentRuntime(ensemble_db, provider, broker,
                              strategies_dir="strategies",
                              screeners_dir="screeners")
-        goal = Goal(
-            target_annual_return=0.20,
-            params={"ensemble_enabled": True, "top_k_strategies": 3,
-                    "signal_threshold": 0.0, "factor_blend": 0.5,
-                    "equal_weight": True, "max_holdings": 1,
-                    "wf_enabled": True, "wf_n_folds": 2,
-                    "wf_warmup_days": 60, "wf_test_days": 14})
-        save_goal(ensemble_db, goal)
+        # Two deterministic fused candidates → 1/N = 0.5 (> the 10% per-stock cap).
+        fused = [FusedCandidate(code="000001", strategy_score=0.8, factor_score=0.1,
+                                final_score=0.8, dominant_strategy="s"),
+                 FusedCandidate(code="000002", strategy_score=0.6, factor_score=0.0,
+                                final_score=0.6, dominant_strategy="s")]
+        monkeypatch.setattr(agent, "_compute_fused_candidates",
+                            lambda goal, candidates: (fused, [], {}))
+        goal = Goal(target_annual_return=0.20,
+                    params={"ensemble_enabled": True, "equal_weight": True})
 
         signals, name, _ev = agent._ensemble_path(
             goal=goal, candidates=["000001", "000002"])
 
         assert name == "ensemble"
-        assert len(signals) <= 1                       # max_holdings cap
-        assert isinstance(broker._sizer, FixedSizer)   # equal-weight installed
+        assert isinstance(broker._sizer, FixedSizer)        # equal-weight installed
+        assert broker._sizer._max_pct == pytest.approx(0.5)  # 1/N
         assert agent._equal_weight_active is True
-        if signals:
-            assert signals[0].strength == 1.0          # conviction overridden
-        # N=1 → target 100% >> 10% cap → must warn, not silently idle cash.
+        assert len(signals) == 2
+        assert all(s.strength == 1.0 for s in signals)       # conviction overridden
+        # 1/N = 0.5 >> 10% cap → must warn, not silently idle cash.
         capped = ensemble_db.list_decisions(limit=20, kind="equal_weight_capped")
         assert len(capped) >= 1
 
