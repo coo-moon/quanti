@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -42,6 +44,21 @@ def test_arithmetic_and_scalar_wrapping():
     assert list(expr2.evaluate(ctx)) == [20.0, 10.0]
     expr3 = -Close()                   # unary neg
     assert list(expr3.evaluate(ctx)) == [-10.0, -20.0]
+
+
+def test_log_of_nonpositive_is_nan_not_neg_inf_and_no_warning():
+    # log(<=0) is undefined → NaN, NOT -inf, and must NOT emit a
+    # "divide by zero encountered in log" RuntimeWarning (which would also
+    # inject -inf that corrupts downstream rolling stats / z-scores / IC).
+    ctx = _ctx([10.0, 0.0, -5.0, 20.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")     # any RuntimeWarning → test fails
+        s = Log(Close()).evaluate(ctx)
+    assert np.isclose(s.iloc[0], np.log(10.0))
+    assert np.isnan(s.iloc[1])             # log(0) → NaN, not -inf
+    assert np.isnan(s.iloc[2])             # log(-5) → NaN
+    assert np.isclose(s.iloc[3], np.log(20.0))
+    assert not np.isinf(s).any()
 
 
 def test_divide_by_zero_is_nan_not_inf():

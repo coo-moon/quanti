@@ -169,4 +169,10 @@ class Log(Expr):
         self.expr = expr
 
     def evaluate(self, ctx: EvalContext) -> pd.Series:
-        return np.log(self.expr.evaluate(ctx))
+        # log is undefined for x <= 0 → NaN, NOT -inf. A 0/negative input (e.g.
+        # a 0-close suspended bar in Log(close/Ref(close,1)), or an LLM-mined
+        # Log(volume) on a 0-volume day) would otherwise emit a "divide by zero
+        # in log" RuntimeWarning AND inject -inf that silently corrupts every
+        # downstream rolling stat / z-score / IC. Mask to NaN (properly excluded).
+        s = self.expr.evaluate(ctx)
+        return np.log(s.where(s > 0))
