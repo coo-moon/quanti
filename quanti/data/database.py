@@ -254,6 +254,9 @@ class Database:
             ("risk_config", "drift_trim_enabled", "INTEGER DEFAULT 0"),
             ("risk_config", "drift_trim_to_pct", "REAL DEFAULT 0.10"),
             ("risk_config", "drift_trim_band", "REAL DEFAULT 0.25"),
+            # Score-gated rotation (换仓) config — opt-in, default off.
+            ("risk_config", "rotation_enabled", "INTEGER DEFAULT 0"),
+            ("risk_config", "rotation_margin", "REAL DEFAULT 0.15"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -537,6 +540,15 @@ class Database:
                 accepted INTEGER NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
+            );
+
+            -- Latest cycle's fused candidate scores (replace-all each cycle).
+            -- Surfaces a holding's / pending order's current final_score in the
+            -- UI; a code absent here is no longer a candidate (UI shows "—").
+            CREATE TABLE IF NOT EXISTS candidate_scores (
+                code TEXT PRIMARY KEY,
+                final_score REAL NOT NULL,
+                as_of TEXT NOT NULL
             );
             """
         )
@@ -1595,7 +1607,8 @@ class Database:
             "SELECT stop_loss_pct, portfolio_stop_loss_pct, "
             "take_profit_activate_pct, take_profit_trail_pct, "
             "strategy_exit_enabled, atr_stop_k, atr_stop_n, "
-            "drift_trim_enabled, drift_trim_to_pct, drift_trim_band "
+            "drift_trim_enabled, drift_trim_to_pct, drift_trim_band, "
+            "rotation_enabled, rotation_margin "
             "FROM risk_config WHERE id=1"
         ).fetchone()
         if row is None:
@@ -1607,6 +1620,7 @@ class Database:
             "atr_stop_k": row[5], "atr_stop_n": int(row[6]),
             "drift_trim_enabled": bool(row[7]),
             "drift_trim_to_pct": row[8], "drift_trim_band": row[9],
+            "rotation_enabled": bool(row[10]), "rotation_margin": row[11],
         }
 
     def upsert_risk_config(self, cfg: dict) -> None:
@@ -1620,8 +1634,9 @@ class Database:
                 id, stop_loss_pct, portfolio_stop_loss_pct,
                 take_profit_activate_pct, take_profit_trail_pct,
                 strategy_exit_enabled, atr_stop_k, atr_stop_n,
-                drift_trim_enabled, drift_trim_to_pct, drift_trim_band, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                drift_trim_enabled, drift_trim_to_pct, drift_trim_band,
+                rotation_enabled, rotation_margin, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 stop_loss_pct=excluded.stop_loss_pct,
                 portfolio_stop_loss_pct=excluded.portfolio_stop_loss_pct,
@@ -1633,6 +1648,8 @@ class Database:
                 drift_trim_enabled=excluded.drift_trim_enabled,
                 drift_trim_to_pct=excluded.drift_trim_to_pct,
                 drift_trim_band=excluded.drift_trim_band,
+                rotation_enabled=excluded.rotation_enabled,
+                rotation_margin=excluded.rotation_margin,
                 updated_at=excluded.updated_at
             """,
             (cfg["stop_loss_pct"], cfg["portfolio_stop_loss_pct"],
@@ -1641,6 +1658,8 @@ class Database:
              int(cfg["atr_stop_n"]),
              int(bool(cfg.get("drift_trim_enabled", False))),
              cfg.get("drift_trim_to_pct", 0.10), cfg.get("drift_trim_band", 0.25),
+             int(bool(cfg.get("rotation_enabled", False))),
+             cfg.get("rotation_margin", 0.15),
              now),
         )
         self.conn.commit()
@@ -1776,6 +1795,27 @@ class Database:
             (code, as_of, float(score), reason, int(n_news), model,
              datetime.now().isoformat()),
         )
+        self.conn.commit()
+
+    # ----- candidate scores (latest cycle's fused final_score) ----------
+    def get_candidate_scores(self) -> dict[str, float]:
+        """{code: final_score} from the most-recent cycle's fused candidates.
+        Empty when never written. A code absent here is not a current candidate
+        (the UI shows "—"; rotation treats it as score 0 = weakest)."""
+        rows = self.conn.execute(
+            "SELECT code, final_score FROM candidate_scores").fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def replace_candidate_scores(self, scores: dict[str, float],
+                                 as_of: str) -> None:
+        """Replace the whole candidate-score set with this cycle's fused scores.
+        Replace-all (not upsert) so a code that dropped out of the candidate set
+        disappears — matching rotation's "absent = score 0 = weakest"."""
+        self.conn.execute("DELETE FROM candidate_scores")
+        self.conn.executemany(
+            "INSERT INTO candidate_scores (code, final_score, as_of) "
+            "VALUES (?, ?, ?)",
+            [(c, float(s), as_of) for c, s in scores.items()])
         self.conn.commit()
 
     # ----- generated factors --------------------------------------------

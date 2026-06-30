@@ -812,6 +812,9 @@ class RiskControlBody(BaseModel):
     drift_trim_enabled: bool = False
     drift_trim_to_pct: float = 0.10
     drift_trim_band: float = 0.25
+    # Score-gated rotation (换仓) — opt-in, default off.
+    rotation_enabled: bool = False
+    rotation_margin: float = 0.15
 
 
 def _risk_config_dict(db) -> dict:
@@ -829,6 +832,8 @@ def _risk_config_dict(db) -> dict:
         "drift_trim_enabled": cfg.drift_trim_enabled,
         "drift_trim_to_pct": cfg.drift_trim_to_pct,
         "drift_trim_band": cfg.drift_trim_band,
+        "rotation_enabled": cfg.rotation_enabled,
+        "rotation_margin": cfg.rotation_margin,
     }
 
 
@@ -859,6 +864,8 @@ async def set_risk_control(body: RiskControlBody, request: Request):
         errs.append("削峰目标权重 drift_trim_to_pct 必须在 (0, 1]")
     if body.drift_trim_band < 0:
         errs.append("削峰带 drift_trim_band 必须 ≥ 0")
+    if not (0 < body.rotation_margin <= 1):
+        errs.append("换仓分数门 rotation_margin 必须在 (0, 1]")
     if errs:
         raise HTTPException(status_code=422, detail="; ".join(errs))
     request.app.state.db.upsert_risk_config(body.model_dump())
@@ -896,7 +903,14 @@ async def set_goal_endpoint(body: GoalBody, request: Request):
 
 @router.get("/portfolio")
 async def get_portfolio(request: Request):
-    return request.app.state.broker.snapshot_portfolio()
+    snap = request.app.state.broker.snapshot_portfolio()
+    # Annotate each holding with its current fused candidate score (None when
+    # the name is no longer a candidate → UI shows "—"; that's also when
+    # rotation treats it as the weakest).
+    scores = request.app.state.db.get_candidate_scores()
+    for p in snap.get("positions", []):
+        p["score"] = scores.get(p.get("code"))
+    return snap
 
 
 @router.get("/agent/live-status")
@@ -960,7 +974,11 @@ async def list_pending_orders(request: Request):
     """Pending orders enriched with their fill timeline (queued time,
     expected fill date, whether the bar is available, TTL). Drives the
     Agent page's 待成交订单 detail."""
-    return request.app.state.broker.pending_orders_detail()
+    orders = request.app.state.broker.pending_orders_detail()
+    scores = request.app.state.db.get_candidate_scores()
+    for o in orders:
+        o["score"] = scores.get(o.get("code"))
+    return orders
 
 
 @router.get("/trades")

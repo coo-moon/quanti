@@ -21,6 +21,7 @@ from quanti.agent.signal_pipeline import (
     filter_by_threshold,
     fuse_buy_signals,
     industry_cap,
+    select_rotation_sells,
 )
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
@@ -240,7 +241,7 @@ class TestRuntimeEnsemble:
         goal = Goal(target_annual_return=0.20,
                     params={"ensemble_enabled": True, "equal_weight": True})
 
-        signals, name, _ev = agent._ensemble_path(
+        signals, name, _ev, _fused = agent._ensemble_path(
             goal=goal, candidates=["000001", "000002"])
 
         assert name == "ensemble"
@@ -279,3 +280,67 @@ class TestRuntimeEnsemble:
         src = ensemble_db.list_decisions(limit=20, kind="candidate_source")
         assert len(src) == 1
         assert src[0]["details"]["no_screener_take"] == 100
+# -------------------- select_rotation_sells -------------------------------
+
+def _rot(intended, scores, held, cash, total, *, margin=0.15,
+         max_pos=0.20, max_rot=1):
+    """Thin wrapper with the test's defaults; held = {code: market_value}."""
+    return select_rotation_sells(
+        intended, scores, held, cash, total,
+        margin=margin, max_position_pct=max_pos, max_rotations=max_rot)
+
+
+def test_rotation_noop_when_cash_available():
+    """Spare cash for a full-size position → no rotation (buy normally)."""
+    sells = _rot(["NEW"], {"NEW": 0.9, "OLD": 0.3}, {"OLD": 5_000},
+                 cash=5_000, total=10_000)  # 5000 >= 20%×10000=2000
+    assert sells == []
+
+
+def test_rotation_swaps_weakest_when_full():
+    """Book full, NEW beats weakest OLD by ≥ margin → sell the weakest one."""
+    sells = _rot(["NEW"],
+                 {"NEW": 0.9, "A": 0.8, "B": 0.4},
+                 {"A": 5_000, "B": 5_000},
+                 cash=0, total=10_000)
+    assert len(sells) == 1
+    assert sells[0].stock_code == "B"          # weakest incumbent
+    assert sells[0].direction == Direction.SELL
+    assert sells[0].strength == 1.0
+
+
+def test_rotation_displaces_non_candidate_holding():
+    """A holding not scored this cycle counts as 0 → any candidate ≥ margin
+    displaces it."""
+    sells = _rot(["NEW"], {"NEW": 0.16}, {"STALE": 4_000},
+                 cash=0, total=10_000)
+    assert [s.stock_code for s in sells] == ["STALE"]
+
+
+def test_rotation_respects_margin():
+    """NEW only 0.10 above the weakest → below the 0.15 gate → no swap."""
+    sells = _rot(["NEW"], {"NEW": 0.50, "OLD": 0.40}, {"OLD": 4_000},
+                 cash=0, total=10_000)
+    assert sells == []
+
+
+def test_rotation_caps_per_cycle():
+    """Two qualifying entrants but max_rotations=1 → only one swap."""
+    sells = _rot(["N1", "N2"],
+                 {"N1": 0.95, "N2": 0.9, "A": 0.2, "B": 0.1},
+                 {"A": 5_000, "B": 5_000},
+                 cash=0, total=10_000, max_rot=1)
+    assert len(sells) == 1 and sells[0].stock_code == "B"
+
+
+def test_rotation_never_sells_an_intended_buy():
+    """A held name we're also buying (add-on) is never a rotation target."""
+    sells = _rot(["HELD", "NEW"],
+                 {"HELD": 0.9, "NEW": 0.85, "WEAK": 0.1},
+                 {"HELD": 5_000, "WEAK": 5_000},
+                 cash=0, total=10_000)
+    assert [s.stock_code for s in sells] == ["WEAK"]
+
+
+def test_rotation_empty_when_no_holdings():
+    assert _rot(["NEW"], {"NEW": 0.9}, {}, cash=0, total=10_000) == []

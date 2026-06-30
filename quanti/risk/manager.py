@@ -101,6 +101,20 @@ class RiskConfig:
     Davis-Norman's cube-root law: even a small per-trade cost needs a band
     several % wide before trimming pays. A tight band bleeds cost to churn."""
 
+    # --- Score-gated rotation (换仓) — opt-in, default OFF ---
+    rotation_enabled: bool = False
+    """When the book is too full to fund a new buy from cash, sell the weakest
+    holding to free room for a clearly-stronger fresh candidate. Only fires in
+    the scored paths (ensemble / LLM) and at most ONCE per cycle (churn guard).
+    OFF by default: quanti's research says churn bleeds cost and passive
+    equal-weight wins — chasing relative attractiveness was not a reliable OOS
+    edge, so this is a safety valve for "good name shows up but I'm full", not a
+    return enhancer."""
+    rotation_margin: float = 0.15
+    """Min final_score (∈[0,1]) advantage a newcomer must have over the weakest
+    holding to displace it. Higher = stricter / less churn. A holding that isn't
+    a candidate this cycle scores 0, so any candidate ≥ margin can displace it."""
+
 
 def risk_config_from_dict(overrides: dict) -> RiskConfig:
     """Build a RiskConfig from a (partial) dict of runtime overrides — fields

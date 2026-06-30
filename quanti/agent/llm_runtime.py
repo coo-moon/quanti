@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from quanti.agent.goal import Goal
-from quanti.agent.signal_pipeline import FusedCandidate
+from quanti.agent.signal_pipeline import FusedCandidate, select_rotation_sells
 from quanti.data.database import Database
 from quanti.execution.base import Broker
 from quanti.models import Direction, Signal
@@ -635,6 +635,40 @@ def build_context_message(
 
 # ------------------------------------------------------- orchestrator entry
 
+def _rotation_sells_if_enabled(
+    db: Database, broker: Broker,
+    candidates: list[FusedCandidate], valid_orders: list[dict],
+) -> list[Signal]:
+    """SELLs that free a slot for a stronger LLM pick when the book is full.
+
+    Opt-in via RiskConfig.rotation_enabled (read live from the DB). The LLM's
+    chosen buys are scored by their candidate final_score; the weakest holding
+    is swapped out iff a pick beats it by rotation_margin. Returns [] when
+    disabled or nothing qualifies. Never raises — rotation is a convenience,
+    not a safety mechanism.
+    """
+    try:
+        from quanti.risk.manager import risk_config_from_dict
+        rc = risk_config_from_dict(db.get_risk_config())
+        if not rc.rotation_enabled or not valid_orders:
+            return []
+        score_by_code = {c.code: c.final_score for c in candidates}
+        # LLM picks, strongest first by candidate score.
+        buy_codes = sorted((o["code"] for o in valid_orders),
+                           key=lambda c: score_by_code.get(c, 0.0), reverse=True)
+        pf = broker.snapshot_portfolio()
+        held_mv = {p["code"]: float(p.get("market_value", 0.0) or 0.0)
+                   for p in pf.get("positions", [])}
+        return select_rotation_sells(
+            buy_codes, score_by_code, held_mv,
+            float(pf.get("cash", 0.0) or 0.0),
+            float(pf.get("total_value", 0.0) or 0.0),
+            margin=rc.rotation_margin, max_position_pct=rc.max_position_pct)
+    except Exception as e:  # noqa: BLE001 - rotation must never break a tick
+        logger.warning(f"rotation skipped: {e}")
+        return []
+
+
 def run_llm_decision(
     *,
     db: Database,
@@ -763,6 +797,22 @@ def run_llm_decision(
 
     # Exits first (stop-loss / strategy / take-profit), then LLM buys.
     sl_count = broker.check_exits()
+
+    # Score-gated rotation (换仓, opt-in): if the book is full, free the weakest
+    # holding so a clearly-stronger LLM pick can be funded. The LLM's picks are
+    # a subset of `candidates`, so their final_score still applies. Runs after
+    # check_exits (post-exit cash/positions) and before the buys, so the freed
+    # cash funds them.
+    rot_sells = _rotation_sells_if_enabled(db, broker, candidates, valid_orders)
+    if rot_sells:
+        broker.execute_signals(rot_sells, strategy_name="rotation")
+        db.log_decision(
+            "rotation",
+            f"换仓 释放 {len(rot_sells)} 个弱仓为更强候选腾位: "
+            + ", ".join(s.stock_code for s in rot_sells),
+            details={"sells": [{"code": s.stock_code, "reason": s.reason}
+                               for s in rot_sells]})
+
     result = broker.execute_signals(signals, strategy_name="llm")
     snapshot = broker.snapshot_portfolio()
 
