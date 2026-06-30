@@ -36,6 +36,7 @@ from quanti.agent.signal_pipeline import (
     filter_by_threshold,
     fuse_buy_signals,
     industry_cap,
+    select_rotation_sells,
 )
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
@@ -591,8 +592,9 @@ class AgentRuntime:
         # Breadth cap: keep only the top-N by final_score. Lets the user run a
         # deliberately diversified book (e.g. 20 equal-weight names) instead of
         # the emergent ~9-10 the 10% per-name cap allows by default. 0 = off.
-        # Note: this caps NEW buys only; held names that fall out of top-N are
-        # not rotated out (exits stay stop/strategy-driven) — by design.
+        # Note: this caps NEW buys only; the breadth cap itself never sells a
+        # held name that fell out of top-N. Freeing a full book for a stronger
+        # name is the (opt-in) score-gated rotation's job — see _maybe_rotate.
         max_holdings = int(params.get("max_holdings", 0))
         if max_holdings > 0:
             fused = fused[:max_holdings]
@@ -608,6 +610,12 @@ class AgentRuntime:
                 "contributing": contributing,
                 "industry_neutral": industry_neutral,
             })
+        # Persist this cycle's fused scores so the UI can show a holding's /
+        # order's current candidate score. Replace-all (skip on empty so a
+        # transient no-candidate cycle doesn't wipe the last known scores).
+        if fused:
+            self._db.replace_candidate_scores(
+                {c.code: c.final_score for c in fused}, date.today().isoformat())
         return fused, evaluations, weights
 
     def _compute_sentiment(self, goal: Goal, panel, max_codes: int):
@@ -655,15 +663,19 @@ class AgentRuntime:
         return scores or None
 
     def _ensemble_path(self, goal: Goal, candidates: list[str],
-                       ) -> tuple[list[Signal], str, list[dict]]:
-        """Rule-driven ensemble: candidates → signals (no LLM)."""
+                       ) -> tuple[list[Signal], str, list[dict], list]:
+        """Rule-driven ensemble: candidates → signals (no LLM).
+
+        Returns the FusedCandidate list too (4th element) so the cycle can run
+        score-gated rotation against it — single-strategy paths return [] there.
+        """
         fused, evaluations, _weights = self._compute_fused_candidates(
             goal, candidates)
         params = goal.params or {}
         equal_weight = bool(params.get("equal_weight", False)) and bool(fused)
         if not equal_weight:
             self._set_cycle_sizer(None)
-            return [c.to_signal() for c in fused], "ensemble", evaluations
+            return [c.to_signal() for c in fused], "ensemble", evaluations, fused
 
         # Passive equal-weight book: each held name targets the SAME weight via
         # a FixedSizer, so capital isn't front-loaded into the top ranks.
@@ -672,7 +684,7 @@ class AgentRuntime:
             # Broker has no equal-weight sizer (e.g. live QmtBroker sizes via
             # cash%/risk-cap). Fall back to conviction-weighted sizing rather
             # than forcing strength=1.0 onto a sizer that ignores it.
-            return [c.to_signal() for c in fused], "ensemble", evaluations
+            return [c.to_signal() for c in fused], "ensemble", evaluations, fused
 
         # Per-name target is min(1/N, max_position_pct): the RiskManager
         # single-stock cap still binds. For N < ~10 that cap wins and the book
@@ -687,7 +699,40 @@ class AgentRuntime:
                 f"{cap_pct:.1%},按上限建仓,组合仅约 {len(fused) * cap_pct:.0%} 仓位、"
                 f"其余留现金。要全仓等权请用 N≥{int(round(1 / cap_pct))} 只。")
         signals = [c.to_signal(strength=1.0) for c in fused]
-        return signals, "ensemble", evaluations
+        return signals, "ensemble", evaluations, fused
+
+    def _maybe_rotate(self, fused: list, intended_buys: list[str]) -> None:
+        """Score-gated rotation (换仓): when the book is full, sell the weakest
+        holding to free room for a clearly-stronger fresh candidate. Opt-in via
+        RiskConfig.rotation_enabled (read live from the DB); no-op otherwise.
+
+        Shared by the ensemble path here and the LLM path
+        (`llm_runtime.run_llm_decision`). The emitted SELLs go through the same
+        broker path as exits, so cash frees before the buys fill.
+        """
+        from quanti.risk.manager import risk_config_from_dict
+        rc = risk_config_from_dict(self._db.get_risk_config())
+        if not rc.rotation_enabled:
+            return
+        snap = self._broker.snapshot_portfolio()
+        held_mv = {p["code"]: float(p.get("market_value", 0.0) or 0.0)
+                   for p in snap.get("positions", [])}
+        score_by_code = {c.code: c.final_score for c in fused}
+        sells = select_rotation_sells(
+            intended_buys, score_by_code, held_mv,
+            float(snap.get("cash", 0.0) or 0.0),
+            float(snap.get("total_value", 0.0) or 0.0),
+            margin=rc.rotation_margin, max_position_pct=rc.max_position_pct)
+        if not sells:
+            return
+        self._broker.execute_signals(sells, strategy_name="rotation")
+        self._db.log_decision(
+            "rotation",
+            f"换仓 释放 {len(sells)} 个弱仓为更强候选腾位: "
+            + ", ".join(s.stock_code for s in sells),
+            details={"sells": [{"code": s.stock_code, "reason": s.reason}
+                               for s in sells],
+                     "margin": rc.rotation_margin})
 
     def _set_cycle_sizer(self, weight_per_name: float | None) -> bool:
         """Install (or clear) an equal-weight FixedSizer on the broker for this
@@ -949,9 +994,10 @@ class AgentRuntime:
         evaluations: list[dict] = []
         signals: list[Signal] = []
         strategy_name: str = ""
+        fused: list = []  # FusedCandidate list; non-empty only in ensemble mode
 
         if ensemble_enabled:
-            signals, strategy_name, evaluations = self._ensemble_path(
+            signals, strategy_name, evaluations, fused = self._ensemble_path(
                 goal, candidates)
             if signals is None:
                 summary = "ensemble 模式未能产出信号"
@@ -1028,6 +1074,14 @@ class AgentRuntime:
         # Risk exits first (stop-loss / strategy / take-profit) so we free
         # cash before new buys.
         sl_count = self._broker.check_exits()
+
+        # Score-gated rotation (换仓, opt-in): if the book is full, free the
+        # weakest holding so a clearly-stronger fresh candidate can be funded.
+        # Runs AFTER check_exits so it sees the post-exit cash/positions and
+        # won't target a name already exiting. Only the scored ensemble path
+        # populates `fused`.
+        if fused:
+            self._maybe_rotate(fused, [c.code for c in fused])
 
         # Execute
         result = self._broker.execute_signals(signals, strategy_name=strategy_name)

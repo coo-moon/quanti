@@ -220,6 +220,66 @@ def filter_by_threshold(
     return [c for c in candidates if c.final_score >= threshold]
 
 
+def select_rotation_sells(
+    intended_buys: list[str],
+    score_by_code: dict[str, float],
+    held_market_value: dict[str, float],
+    cash: float,
+    total_value: float,
+    *,
+    margin: float,
+    max_position_pct: float,
+    max_rotations: int = 1,
+    exclude: set[str] | None = None,
+) -> list[Signal]:
+    """Free a slot for a stronger candidate when the book is full (换仓).
+
+    The buy pipeline only ADDS positions; it never sells a held name just
+    because a better one showed up. Once nearly fully invested, a superior fresh
+    candidate can't be funded and sits blocked. This computes the SELLs that fix
+    that:
+
+      * Only acts when the book is "full" — cash can't fund even one new
+        full-size position (cash < total_value × max_position_pct). With spare
+        cash the normal buy path deploys the candidate without selling anything.
+      * Pairs the strongest fresh candidate (in `intended_buys` but not held)
+        with the weakest holding and swaps iff
+        score(candidate) − score(holding) ≥ margin.
+      * A holding absent from `score_by_code` (no longer a candidate this cycle)
+        scores 0 — the natural first rotation target.
+      * Capped at `max_rotations` swaps per call (churn guard).
+
+    `intended_buys` MUST be ordered strongest-first. The returned SELLs ride the
+    normal exit path, so cash frees before the buys fill — the same ordering the
+    system already relies on for stop-loss → buy. Pure function; returns [] when
+    nothing qualifies.
+    """
+    if total_value <= 0 or not held_market_value:
+        return []
+    # Book-full gate: spare cash for a fresh full-size position → no rotation
+    # needed (the normal buy path will deploy it without churning a holding).
+    if cash >= total_value * max_position_pct:
+        return []
+    # Never sell a name we're about to (add to a) buy.
+    exclude = (exclude or set()) | set(intended_buys)
+    incumbents = sorted(
+        (c for c in held_market_value if c not in exclude),
+        key=lambda c: score_by_code.get(c, 0.0))
+    entrants = [c for c in intended_buys if c not in held_market_value]
+    sells: list[Signal] = []
+    for cand in entrants:
+        if len(sells) >= max_rotations or len(sells) >= len(incumbents):
+            break
+        weak = incumbents[len(sells)]
+        cs, ws = score_by_code.get(cand, 0.0), score_by_code.get(weak, 0.0)
+        if cs - ws < margin:
+            break  # entrants desc, incumbents asc → no later pair can pass
+        sells.append(Signal(
+            stock_code=weak, direction=Direction.SELL, strength=1.0,
+            reason=f"换仓 卖弱仓{ws:.2f}→{cand}({cs:.2f}) 差{cs - ws:+.2f}≥{margin:.2f}"))
+    return sells
+
+
 # ---------------------------------------------------------- runtime helper
 
 def collect_signals_per_strategy(

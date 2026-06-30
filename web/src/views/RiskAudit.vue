@@ -88,12 +88,23 @@
             <input type="number" step="5" min="0"
                    v-model.number="form.drift_trim_band" />
           </label>
+          <label class="chk">
+            <input type="checkbox" v-model="form.rotation_enabled" />
+            启用分数门换仓(满仓时卖最弱仓换更强候选)
+          </label>
+          <label v-if="form.rotation_enabled">换仓分数门 (新候选需高出多少,0–1)
+            <input type="number" step="0.05" min="0.01" max="1"
+                   v-model.number="form.rotation_margin" />
+          </label>
         </div>
         <p class="form-hint">
           止损地板 / 熔断为负百分比(如 -15)。ATR k&gt;0 时单标的止损用 -k×(ATR/价)为主、地板兜底(止损永不宽于地板);k=0 则只用地板。改动即时生效,无需重启。
         </p>
         <p v-if="form.drift_trim_enabled" class="form-hint">
           削峰=纯控集中度、单边只削不补:某票权重涨过 目标×(1+带)(默认 10%×1.25=12.5%)就部分卖回 10%。带要宽——往返成本约万10,削太勤会亏手续费。仅在某票占比失控时开。
+        </p>
+        <p v-if="form.rotation_enabled" class="form-hint">
+          换仓=只在「仓位满、现金买不起新票」时触发:把当前最弱持仓卖掉给更强的新候选腾位。分数门=新候选 final_score 需高出最弱持仓至少这么多才换(默认 0.15;不在本轮候选里的持仓记 0 分,故任意 ≥ 门的候选都能顶掉它)。每轮最多换 1 笔。仅 ensemble/LLM 模式生效。注意:研究表明追逐相对强弱并非稳定 alpha、换手有成本——这是「好票来了动不了」的安全阀,不是收益增强,默认关。
         </p>
         <div class="form-actions">
           <span v-if="saveMsg" class="save-msg" :class="saveErr ? 'err' : 'ok'">{{ saveMsg }}</span>
@@ -282,6 +293,8 @@ const form = reactive({
   strategy_exit_enabled: true, atr_stop_k: 0, atr_stop_n: 14,
   // 削峰减仓(占比以 % 显示;后端存分数)
   drift_trim_enabled: false, drift_trim_to_pct: 10, drift_trim_band: 25,
+  // 分数门换仓(margin 是 final_score 差值,0–1 原值,不按 % 换算)
+  rotation_enabled: false, rotation_margin: 0.15,
 });
 
 async function toggleEdit() {
@@ -302,6 +315,8 @@ async function toggleEdit() {
     form.drift_trim_enabled = c.drift_trim_enabled;
     form.drift_trim_to_pct = +(c.drift_trim_to_pct * 100).toFixed(2);
     form.drift_trim_band = +(c.drift_trim_band * 100).toFixed(2);
+    form.rotation_enabled = c.rotation_enabled;
+    form.rotation_margin = c.rotation_margin;
     editing.value = true;
   } catch (e: any) {
     err.value = e?.message || "读取风控配置失败";
@@ -324,6 +339,8 @@ async function save() {
       drift_trim_enabled: form.drift_trim_enabled,
       drift_trim_to_pct: form.drift_trim_to_pct / 100,
       drift_trim_band: form.drift_trim_band / 100,
+      rotation_enabled: form.rotation_enabled,
+      rotation_margin: form.rotation_margin,
     });
     editing.value = false;
     await load();

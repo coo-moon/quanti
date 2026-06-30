@@ -252,6 +252,7 @@ export interface PortfolioPosition {
   pnl: number;
   pnl_pct: number;
   buy_date: string | null;
+  score: number | null; // 当前融合候选分;null = 已掉出候选
 }
 
 export interface Portfolio {
@@ -320,6 +321,7 @@ export interface PendingOrderDetail {
   trading_days_pending: number | null;
   ttl_trading_days: number;
   entry_strategy?: string;
+  score: number | null; // 下单时的融合候选分;null = 已掉出候选
 }
 
 export interface DecisionRecord {
@@ -424,6 +426,8 @@ export interface RiskControl {
   drift_trim_enabled: boolean;
   drift_trim_to_pct: number;
   drift_trim_band: number;
+  rotation_enabled: boolean;
+  rotation_margin: number;
 }
 export const fetchRiskControl = () =>
   api.get<RiskControl>("/config/risk-control");

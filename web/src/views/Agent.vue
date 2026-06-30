@@ -324,6 +324,7 @@
             <th>市值</th>
             <th>盈亏</th>
             <th>盈亏 %</th>
+            <th>分数</th>
             <th></th>
           </tr>
         </thead>
@@ -339,6 +340,9 @@
             <td>{{ formatMoney(p.market_value) }}</td>
             <td :class="p.pnl >= 0 ? 'up' : 'down'">{{ formatMoney(p.pnl) }}</td>
             <td :class="p.pnl_pct >= 0 ? 'up' : 'down'">{{ formatPct(p.pnl_pct) }}</td>
+            <td :title="p.score == null ? '已掉出候选池(换仓视作最弱)' : ''">
+              {{ p.score == null ? "—" : p.score.toFixed(2) }}
+            </td>
             <td>
               <button class="btn-link" @click="sellOne(p.code)">卖出</button>
             </td>
@@ -367,6 +371,7 @@
             <th>预计成交日</th>
             <th>状态</th>
             <th>进场策略</th>
+            <th>分数</th>
             <th>理由</th>
           </tr>
         </thead>
@@ -389,6 +394,9 @@
               </span>
             </td>
             <td>{{ o.entry_strategy || "—" }}</td>
+            <td :title="o.score == null ? '已掉出候选池' : ''">
+              {{ o.score == null ? "—" : o.score.toFixed(2) }}
+            </td>
             <td class="reason-cell" :title="o.reason">{{ o.reason || "—" }}</td>
           </tr>
         </tbody>
