@@ -33,6 +33,7 @@ from quanti.agent.params import resolve_params
 from quanti.agent.selector import StrategySelector
 from quanti.agent.signal_pipeline import (
     collect_signals_per_strategy,
+    filter_affordable,
     filter_by_threshold,
     fuse_buy_signals,
     industry_cap,
@@ -588,9 +589,47 @@ class AgentRuntime:
             fused = industry_cap(fused, n_per_industry=n_per_industry)
         fused = filter_by_threshold(fused, threshold=threshold)
 
+        # Affordability: drop names whose one A股-lot (100 股) costs more than the
+        # single-stock cap room — they'd size to 0 lots and be rejected anyway,
+        # so feeding them to the LLM/ensemble is noise (the LLM, blind to the
+        # cash/lot constraint, kept re-picking unaffordable high-priced names).
+        # Read state directly — snapshot_portfolio() would persist a snapshot row.
+        risk_cfg = getattr(getattr(self._broker, "_risk", None), "config", None)
+        max_pos_pct = float(getattr(risk_cfg, "max_position_pct", 0.0) or 0.0)
+        state = self._db.get_portfolio_state()
+        if fused and max_pos_pct > 0 and state:
+            held_value = {
+                p["code"]: p["quantity"] * (p["current_price"] or p["avg_cost"])
+                for p in self._db.list_positions()}
+            total_value = state["cash"] + sum(held_value.values())
+            if total_value > 0:
+                end = date.today()
+
+                def _last_close(code: str) -> float:
+                    try:
+                        bars = self._provider.get_daily_bars(
+                            code, end - timedelta(days=10), end)
+                        return bars[-1].close if bars else 0.0
+                    except Exception:  # noqa: BLE001 - a bad code can't break the cycle
+                        return 0.0
+
+                fused, dropped = filter_affordable(
+                    fused, total_value, max_pos_pct, held_value, _last_close)
+                if dropped:
+                    self._db.log_decision(
+                        "affordability_filter",
+                        f"过滤 {len(dropped)} 只 1 手买不起的票(单票限额 "
+                        f"{max_pos_pct:.0%}×{total_value:,.0f}≈"
+                        f"{total_value * max_pos_pct:,.0f} 元): "
+                        f"{', '.join(dropped[:10])}"
+                        f"{'…' if len(dropped) > 10 else ''}",
+                        details={"dropped": dropped,
+                                 "max_position_pct": max_pos_pct,
+                                 "total_value": round(total_value, 2)})
+
         # Breadth cap: keep only the top-N by final_score. Lets the user run a
         # deliberately diversified book (e.g. 20 equal-weight names) instead of
-        # the emergent ~9-10 the 10% per-name cap allows by default. 0 = off.
+        # the emergent ~4-5 the 20% per-name cap allows by default. 0 = off.
         # Note: this caps NEW buys only; held names that fall out of top-N are
         # not rotated out (exits stay stop/strategy-driven) — by design.
         max_holdings = int(params.get("max_holdings", 0))
