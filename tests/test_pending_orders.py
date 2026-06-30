@@ -436,6 +436,21 @@ class TestPendingDetail:
         created = (datetime.now() - timedelta(days=1)).date()
         assert d["trading_days_pending"] == count_trading_days_between(created, today)
 
+    def test_detail_exposes_entry_strategy_not_decision_label(self, seeded_pending):
+        """The 进场策略 column must show the OWNING strategy (signal.entry_strategy
+        — the one an exit replays), NOT the execute-time strategy_name. They
+        differ in LLM/ensemble mode: strategy_name='llm' but entry_strategy is the
+        dominant strategy. Regression guard for the column once showing 'llm' for
+        every LLM buy."""
+        db, provider = seeded_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending")
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY, strength=0.5,
+                   reason="LLM: 测试", entry_strategy="supertrend"), "llm")
+        d = broker.pending_orders_detail()[0]
+        assert d["entry_strategy"] == "supertrend"  # owning strategy, not "llm"
+
 
 def test_snapshot_position_has_price_date(seeded_pending):
     """snapshot_portfolio marks each position to the latest bar and reports
