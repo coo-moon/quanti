@@ -12,7 +12,17 @@ from quanti.strategy.base import BaseStrategy
 
 
 class SuperTrendStrategy(BaseStrategy):
-    """Buy when price flips above the SuperTrend line, sell when it flips below."""
+    """Buy when price flips above the SuperTrend line, sell when it flips below.
+
+    Incremental by construction. SuperTrend's bands and direction are a causal
+    recursion — each bar depends only on the *previous* final band + the current
+    bar — so we carry that state per code and advance it ONE step per on_bar:
+    O(period) per bar, not the O(n²) of re-deriving the whole history every bar
+    (which the from-scratch version did, also growing memory without bound).
+    State only ever moves forward from past bars, so look-ahead stays impossible.
+    Signals are bit-for-bit identical to the from-scratch version — locked by
+    tests/test_supertrend_incremental.py's pairwise check against a naive oracle.
+    """
 
     name = "supertrend"
     name_zh = "超级趋势"
@@ -22,58 +32,70 @@ class SuperTrendStrategy(BaseStrategy):
     def init(self, config: dict) -> None:
         self.period = config.get("period", 10)
         self.multiplier = config.get("multiplier", 3.0)
-        self._highs: dict[str, list[float]] = {}
-        self._lows: dict[str, list[float]] = {}
-        self._closes: dict[str, list[float]] = {}
+        # Per-code running state: rolling TR window (for the SMA-ATR), the prior
+        # close (for TR + the band-lock condition), and the previous bar's final
+        # upper/lower band + direction.
+        self._state: dict[str, dict] = {}
 
     def on_bar(self, bar: BarData) -> list[Signal]:
-        highs = self._highs.setdefault(bar.code, [])
-        lows = self._lows.setdefault(bar.code, [])
-        closes = self._closes.setdefault(bar.code, [])
-        highs.append(bar.high)
-        lows.append(bar.low)
-        closes.append(bar.close)
+        st = self._state.get(bar.code)
+        if st is None:
+            st = {"i": 0, "tr": [], "prev_close": None,
+                  "fup": float("nan"), "flo": float("nan"), "dir": 1}
+            self._state[bar.code] = st
 
-        if len(closes) < self.period + 2:
-            return []
+        period, mult = self.period, self.multiplier
+        i = st["i"]
+        h, lo, c, pc = bar.high, bar.low, bar.close, st["prev_close"]
 
-        import numpy as np
+        # True range. First bar has no prior close → TR = high-low, matching the
+        # from-scratch version which seeded prev_close[0] = close[0] (the other
+        # two TR terms can't exceed high-low when close ∈ [low, high]).
+        tr = (h - lo) if pc is None else max(h - lo, abs(h - pc), abs(lo - pc))
+        st["tr"].append(tr)
+        if len(st["tr"]) > period:
+            st["tr"].pop(0)  # keep only the last `period` TRs
 
-        h, lo, c = (np.array(x, dtype=float) for x in (highs, lows, closes))
-        # ATR = simple rolling mean of true range.
-        # ponytail: SMA-ATR not Wilder — simpler, flip-equivalent for daily bars.
-        prev_c = np.concatenate(([c[0]], c[:-1]))
-        tr = np.maximum(h - lo, np.maximum(np.abs(h - prev_c), np.abs(lo - prev_c)))
-        atr = np.full(len(c), np.nan)
-        for i in range(self.period - 1, len(c)):
-            atr[i] = tr[i - self.period + 1 : i + 1].mean()
+        fup_prev, flo_prev, dir_prev = st["fup"], st["flo"], st["dir"]
+        signals: list[Signal] = []
 
-        hl2 = (h + lo) / 2.0
-        upper = hl2 + self.multiplier * atr
-        lower = hl2 - self.multiplier * atr
-
-        # Recompute final bands + direction from scratch each bar — deterministic,
-        # so there is no persisted cross-bar state and look-ahead is impossible.
-        f_up, f_lo = upper.copy(), lower.copy()
-        direction = np.ones(len(c))  # +1 long / -1 short
-        start = self.period - 1
-        for i in range(start + 1, len(c)):
-            f_up[i] = upper[i] if (upper[i] < f_up[i - 1] or c[i - 1] > f_up[i - 1]) else f_up[i - 1]
-            f_lo[i] = lower[i] if (lower[i] > f_lo[i - 1] or c[i - 1] < f_lo[i - 1]) else f_lo[i - 1]
-            if c[i] > f_up[i - 1]:
-                direction[i] = 1
-            elif c[i] < f_lo[i - 1]:
-                direction[i] = -1
+        if i < period - 1:
+            # ATR warm-up: bands undefined, direction holds the initial +1.
+            fup_i, flo_i, dir_i = float("nan"), float("nan"), 1
+        else:
+            atr = sum(st["tr"]) / period            # SMA of the last `period` TRs
+            hl2 = (h + lo) / 2.0
+            upper = hl2 + mult * atr
+            lower = hl2 - mult * atr
+            if i == period - 1:
+                # First ATR bar (start): seed the bands; direction still +1, no
+                # recursion yet (from-scratch starts its loop at start+1).
+                fup_i, flo_i, dir_i = upper, lower, 1
             else:
-                direction[i] = direction[i - 1]
+                # Band-lock recursion, exactly one step, off the previous finals.
+                fup_i = upper if (upper < fup_prev or pc > fup_prev) else fup_prev
+                flo_i = lower if (lower > flo_prev or pc < flo_prev) else flo_prev
+                if c > fup_prev:
+                    dir_i = 1
+                elif c < flo_prev:
+                    dir_i = -1
+                else:
+                    dir_i = dir_prev
+                # A flip is only meaningful once ≥ period+2 bars exist (i.e.
+                # i ≥ period+1); the from-scratch version returned [] below that.
+                if i >= period + 1:
+                    if dir_prev < 0 and dir_i > 0:
+                        signals.append(Signal(
+                            stock_code=bar.code, direction=Direction.BUY,
+                            strength=0.8,
+                            reason=f"SuperTrend 翻多 (ATR{period}×{mult})"))
+                    elif dir_prev > 0 and dir_i < 0:
+                        signals.append(Signal(
+                            stock_code=bar.code, direction=Direction.SELL,
+                            strength=0.8,
+                            reason=f"SuperTrend 翻空 (ATR{period}×{mult})"))
 
-        signals = []
-        if direction[-2] < 0 and direction[-1] > 0:
-            signals.append(Signal(
-                stock_code=bar.code, direction=Direction.BUY, strength=0.8,
-                reason=f"SuperTrend 翻多 (ATR{self.period}×{self.multiplier})"))
-        elif direction[-2] > 0 and direction[-1] < 0:
-            signals.append(Signal(
-                stock_code=bar.code, direction=Direction.SELL, strength=0.8,
-                reason=f"SuperTrend 翻空 (ATR{self.period}×{self.multiplier})"))
+        st["fup"], st["flo"], st["dir"] = fup_i, flo_i, dir_i
+        st["prev_close"] = c
+        st["i"] = i + 1
         return signals
