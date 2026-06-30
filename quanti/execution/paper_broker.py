@@ -484,9 +484,11 @@ class PaperBroker:
                 "direction": o["direction"],
                 "quantity": o["quantity"],
                 "reason": o.get("reason", "") or "",
-                # 进场策略 = 该挂单的 strategy_name(买单 = fusion 选的进场策略;
-                # 卖单挂单 = risk_exit / drift_trim)。UI「进场策略」列读它。
-                "entry_strategy": o.get("strategy_name", "") or "",
+                # 进场策略 = signal.entry_strategy(ensemble/LLM 路径记录的主导策略,
+                # 与离场重放 compute_strategy_exits 用的是同一字段)。不是 strategy_name
+                # —— LLM 模式 strategy_name="llm",entry_strategy 才是真正的归属策略
+                # (supertrend/turtle…);纯因子/sentiment 驱动则为空 → UI 显示「—」。
+                "entry_strategy": o.get("entry_strategy", "") or "",
                 "created_at": created_at,
                 "expected_fill_date": expected_fill_date,
                 "fill_price_basis": self._fill_basis,  # "open" → 次日开盘价
