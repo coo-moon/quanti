@@ -46,3 +46,20 @@ def test_stop_loss_exit_dates_filters_correctly(tmp_path):
 
     dates = db.stop_loss_exit_dates(since=today - timedelta(days=10))
     assert dates == [date(2026, 6, 18)]
+
+
+def test_pragmas_tuned_on_both_schemas(tmp_path):
+    # 性能 PRAGMA 是 per-database：ATTACH 的 market 库必须单独设，不能只设 main
+    # （回归守卫：曾经只 `PRAGMA journal_mode=WAL`，sync/cache/mmap 全是默认）。
+    db = Database(str(tmp_path / "acc.db"),
+                  market_db_path=str(tmp_path / "mkt.db"))
+    db.initialize()
+    try:
+        for schema in ("main", "market"):
+            c = db.conn
+            assert c.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0] == "wal"
+            assert c.execute(f"PRAGMA {schema}.synchronous").fetchone()[0] == 1       # NORMAL，WAL 下 crash-safe
+            assert c.execute(f"PRAGMA {schema}.cache_size").fetchone()[0] == -262144  # 256 MB
+            assert c.execute(f"PRAGMA {schema}.mmap_size").fetchone()[0] == 268435456  # 256 MB
+    finally:
+        db.close()

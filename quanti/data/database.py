@@ -161,16 +161,32 @@ class Database:
         """Create database and tables."""
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._raw_conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._raw_conn.execute("PRAGMA journal_mode=WAL")
+        self._tune_pragmas("main")
         if self._market_db_path:
             Path(self._market_db_path).parent.mkdir(parents=True, exist_ok=True)
             self._raw_conn.execute("ATTACH DATABASE ? AS market",
                                    (self._market_db_path,))
-            self._raw_conn.execute("PRAGMA market.journal_mode=WAL")
+            self._tune_pragmas("market")
         self._conn = _LockedConnection(self._raw_conn, self._db_lock)
         self._create_tables()
         self._migrate()
         self._drop_shadow_tables()
+
+    def _tune_pragmas(self, schema: str) -> None:
+        """Per-database PRAGMAs. journal_mode/synchronous/cache_size/mmap_size
+        are all per-schema, so the ATTACHed `market` DB needs its own set — not
+        just `main`. WAL + synchronous=NORMAL is crash-safe under WAL (the DB
+        can't corrupt; at most the last un-checkpointed commit is lost), and
+        drops the per-commit fsync that FULL forces. The 256MB page cache +
+        256MB mmap keep the 1.9GB market DB's hot working set resident so
+        full-market range scans stop hitting disk on every read. `schema` is an
+        internal literal ("main"/"market"), never user input — PRAGMA can't
+        bind params, so it's interpolated."""
+        c = self._raw_conn
+        c.execute(f"PRAGMA {schema}.journal_mode=WAL")
+        c.execute(f"PRAGMA {schema}.synchronous=NORMAL")
+        c.execute(f"PRAGMA {schema}.cache_size=-262144")   # 256 MB (negative = KiB cap)
+        c.execute(f"PRAGMA {schema}.mmap_size=268435456")  # 256 MB
 
     # Shared/market tables — MUST live in the attached `market.*` schema, never
     # in the account (main) DB. A copy in main shadows the attached one (SQLite
