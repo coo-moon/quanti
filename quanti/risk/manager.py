@@ -27,6 +27,13 @@ STOP_LOSS_REASON_PREFIX = "止损"
 emits it; protections identify stop-loss exits by it (plus strategy_name
 'risk_exit'). Changing the wording here keeps producer and consumer in sync."""
 
+STRATEGY_EXIT_REASON_PREFIX = "策略离场"
+"""Single source of truth for the strategy-exit reason prefix. `check_exits`
+emits ``{prefix}信号 (strategy)``. All risk exits share strategy_name
+'risk_exit', so the reason TEXT is the only thing distinguishing stop-loss vs
+strategy-exit vs take-profit — audit/UI match on this prefix (cf. the stop-loss
+LIKE query in database.py)."""
+
 DRIFT_TRIM_STRATEGY = "drift_trim"
 """strategy_name tag for concentration-trim (削峰) partial sells. The ONLY sell
 path that honors a sub-1.0 signal.strength — every other SELL (stop / TP /
@@ -207,7 +214,7 @@ class RiskManager:
         self,
         portfolio: Portfolio,
         peaks: dict[str, float] | None = None,
-        strategy_sell_codes: set[str] | None = None,
+        strategy_sell_codes: set[str] | dict[str, str] | None = None,
         atr_ratios: dict[str, float] | None = None,
     ) -> list[Signal]:
         """Decide which holdings to close. One SELL per code.
@@ -259,9 +266,15 @@ class RiskManager:
                 continue
             # 2. Strategy-coherent exit — the owning strategy flipped to SELL.
             if cfg.strategy_exit_enabled and code in strategy_sell_codes:
+                # dict input carries the owning strategy name → put it in the
+                # reason so the audit shows WHICH strategy said sell; a plain
+                # set (older callers / tests) degrades to no name.
+                src = (strategy_sell_codes.get(code) or ""
+                       if isinstance(strategy_sell_codes, dict) else "")
+                tag = f" ({src})" if src else ""
                 signals.append(Signal(
                     stock_code=code, direction=Direction.SELL, strength=1.0,
-                    reason="策略离场信号"))
+                    reason=f"{STRATEGY_EXIT_REASON_PREFIX}信号{tag}"))
                 continue
             # 3. Trailing take-profit — armed above activate, exit on retrace.
             if cfg.take_profit_activate_pct > 0 and pos.pnl_pct >= cfg.take_profit_activate_pct:

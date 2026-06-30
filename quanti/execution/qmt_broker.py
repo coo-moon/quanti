@@ -327,9 +327,14 @@ class QmtBroker:
             # PaperBroker enforces (paper_broker records on fill). reset_daily()
             # at session start + seeding the count from /trader/trades is phase-③.
             self._risk.record_trade(signal.direction)
+        venue_msg = res.get("msg", "")
+        # Audit: the decision reason (signal.reason — e.g. 策略离场信号) leads and
+        # is never clobbered by the venue message; venue text is appended for
+        # troubleshooting. Pre-fix a non-empty msg OVERWROTE signal.reason, so a
+        # filled exit's orders row lost which rule (止损/策略离场/止盈) fired.
         self._mirror_order(
             signal, strategy_name, status=status,
-            reason=res.get("msg", "") or signal.reason,
+            reason=" | ".join(p for p in (signal.reason, venue_msg) if p),
             venue_order_id=res.get("order_id", ""),
             filled_price=float(res.get("filled_price", 0) or 0),
             filled_quantity=int(res.get("filled_volume", 0) or 0),
@@ -341,7 +346,7 @@ class QmtBroker:
             code=signal.stock_code,
             details={"venue": "qmt", "venue_order_id": res.get("order_id", ""),
                      "status": res.get("status"), "strategy": strategy_name,
-                     "msg": res.get("msg", "")})
+                     "signal_reason": signal.reason, "msg": venue_msg})
         return accepted, status, (res.get("msg", "") or "")
 
     def _size_buy(self, signal: Signal, portfolio: Portfolio) -> tuple[int, float]:
@@ -490,6 +495,9 @@ class QmtBroker:
                 "name": stock.name if stock else o["code"],
                 "direction": o.get("direction", ""),
                 "quantity": o.get("volume", 0),
+                # venue 的挂单回报不带策略归属(mirror 的 entry_strategy 列被挪用
+                # 存 venue_order_id),pending 列表直读 venue,故留空 → UI 显示「—」。
+                "entry_strategy": "",
                 "reason": "", "created_at": o.get("created_at", ""),
                 "expected_fill_date": None, "fill_price_basis": "venue",
                 "bar_available": True, "trading_days_pending": None,

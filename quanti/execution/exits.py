@@ -76,13 +76,15 @@ def load_strategies(strategies_dir: str) -> dict:
 
 
 def compute_strategy_exits(provider, strategies: dict,
-                           positions: list[dict], db) -> set[str]:
+                           positions: list[dict], db) -> dict[str, str]:
     """Replay each holding's owning entry-strategy over its recent bars; return
-    codes whose latest bar emits a SELL. Replays with the strategy's ACTIVE
-    params (``resolve_params`` — tuned-if-accepted layered over goal params, the
-    same resolution the entry path uses), not bare class defaults, so the exit
-    matches how the position was opened. Never raises into the cycle."""
-    out: set[str] = set()
+    ``{code: owning-strategy-name}`` for holdings whose latest bar emits a SELL
+    (the name lets the exit audit show WHICH strategy said sell). Replays with
+    the strategy's ACTIVE params (``resolve_params`` — tuned-if-accepted layered
+    over goal params, the same resolution the entry path uses), not bare class
+    defaults, so the exit matches how the position was opened. Never raises into
+    the cycle."""
+    out: dict[str, str] = {}
     if not strategies:
         return out
     from quanti.agent.goal import load_goal
@@ -106,7 +108,7 @@ def compute_strategy_exits(provider, strategies: dict,
                 last_signals = strat.on_bar(bar) or []
             if any(s.direction == Direction.SELL
                    and s.stock_code == p["code"] for s in last_signals):
-                out.add(p["code"])
+                out[p["code"]] = name
         except Exception as e:  # noqa: BLE001 - one bad code can't stop exits
             logger.debug("strategy-exit replay skipped for %s/%s: %s",
                          p["code"], name, e)

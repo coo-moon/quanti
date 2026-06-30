@@ -275,6 +275,7 @@ export interface LiveStopPosition {
   stop_price: number;
   stop_pct: number;
   atr_driven: boolean;
+  entry_strategy: string;
 }
 
 export interface LiveStatus {
@@ -318,6 +319,7 @@ export interface PendingOrderDetail {
   bar_available: boolean;
   trading_days_pending: number | null;
   ttl_trading_days: number;
+  entry_strategy?: string;
 }
 
 export interface DecisionRecord {
