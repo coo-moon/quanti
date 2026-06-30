@@ -220,6 +220,43 @@ def filter_by_threshold(
     return [c for c in candidates if c.final_score >= threshold]
 
 
+def filter_affordable(
+    candidates: list[FusedCandidate],
+    total_value: float,
+    max_position_pct: float,
+    held_value: dict[str, float],
+    price_of,
+    lot_size: int = 100,
+    fee_headroom: float = 1.003,
+) -> tuple[list[FusedCandidate], list[str]]:
+    """Drop candidates whose one-lot cost exceeds the single-stock cap room.
+
+    A股 trades in 100-share lots, so a name whose one lot costs more than the
+    per-stock cap room (``total_value × max_position_pct − already-held``) sizes
+    to 0 lots and gets rejected anyway (``affordable_lots < 1``). Feeding it to
+    the LLM/ensemble is pure noise — worse, the LLM is blind to the cash/lot
+    constraint and kept re-picking unaffordable high-priced names. Room mirrors
+    RiskManager.max_additional_buy_value's single-stock term; industry room is
+    left to the actual sizing step.
+
+    ``price_of(code) -> latest close`` is injected so this stays pure and
+    unit-testable. A code priced ≤ 0 (no quote on disk) is KEPT and left for
+    downstream steps. ``fee_headroom`` pads the lot cost ~0.3% so a name that
+    only clears the cap before commission isn't passed through to be rejected
+    later. Returns ``(kept, dropped_codes)``.
+    """
+    kept: list[FusedCandidate] = []
+    dropped: list[str] = []
+    for c in candidates:
+        room = total_value * max_position_pct - held_value.get(c.code, 0.0)
+        price = price_of(c.code)
+        if price <= 0 or price * lot_size * fee_headroom <= room:
+            kept.append(c)
+        else:
+            dropped.append(c.code)
+    return kept, dropped
+
+
 # ---------------------------------------------------------- runtime helper
 
 def collect_signals_per_strategy(

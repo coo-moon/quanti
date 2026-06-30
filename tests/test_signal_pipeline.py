@@ -18,6 +18,7 @@ from quanti.agent.goal import Goal
 from quanti.agent.runtime import AgentRuntime
 from quanti.agent.signal_pipeline import (
     FusedCandidate,
+    filter_affordable,
     filter_by_threshold,
     fuse_buy_signals,
     industry_cap,
@@ -279,3 +280,42 @@ class TestRuntimeEnsemble:
         src = ensemble_db.list_decisions(limit=20, kind="candidate_source")
         assert len(src) == 1
         assert src[0]["details"]["no_screener_take"] == 100
+
+
+def _cand(code: str) -> FusedCandidate:
+    return FusedCandidate(code=code, strategy_score=0.7,
+                          factor_score=0.5, final_score=0.7)
+
+
+def test_filter_affordable_drops_unbuyable_lots():
+    """One A股 lot (100 股) costing more than the single-stock cap room sizes to
+    0 lots and gets rejected — such names must be dropped before the LLM sees
+    them. The 50k-account bug: a 943元 stock's lot (94,290) dwarfs 20%×50k =
+    10,000; only the 52元 name (lot 5,204) fits."""
+    cands = [_cand("600276"), _cand("001309"), _cand("688256")]
+    prices = {"600276": 52.04, "001309": 942.9, "688256": 1595.55}
+
+    kept, dropped = filter_affordable(
+        cands, total_value=50_000, max_position_pct=0.20,
+        held_value={}, price_of=lambda c: prices[c])
+    assert [c.code for c in kept] == ["600276"]   # lot 5,220 ≤ 10,000 cap
+    assert set(dropped) == {"001309", "688256"}   # lots 94k / 160k ≫ 10,000
+
+    # A 1M account clears them all (688256 lot 159,555 ≤ 20%×1M = 200,000).
+    kept2, dropped2 = filter_affordable(
+        cands, total_value=1_000_000, max_position_pct=0.20,
+        held_value={}, price_of=lambda c: prices[c])
+    assert dropped2 == [] and len(kept2) == 3
+
+
+def test_filter_affordable_keeps_unpriced_and_nets_held():
+    """price ≤ 0 (no quote on disk) is kept for downstream; already-held value
+    shrinks the room so the cap isn't double-counted."""
+    cands = [_cand("NOQUOTE"), _cand("600276")]
+    prices = {"NOQUOTE": 0.0, "600276": 52.04}
+    # 20%×50k = 10,000 room, but 6,000 already held → room 4,000 < lot 5,220.
+    kept, dropped = filter_affordable(
+        cands, total_value=50_000, max_position_pct=0.20,
+        held_value={"600276": 6_000.0}, price_of=lambda c: prices[c])
+    assert "NOQUOTE" in [c.code for c in kept]    # unpriced → kept
+    assert dropped == ["600276"]                  # netted room too small for a lot
