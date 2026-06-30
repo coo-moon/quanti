@@ -35,10 +35,16 @@ from quanti.execution.base import BrokerResult, PendingFillResult
 from quanti.execution.exits import (
     compute_atr_ratios, compute_peaks, compute_strategy_exits, load_strategies)
 from quanti.models import BarData, Direction, PriceType, Signal
-from quanti.risk.manager import RiskConfig, RiskManager, risk_config_from_dict
+from quanti.risk.manager import (
+    DRIFT_TRIM_STRATEGY,
+    RiskConfig,
+    RiskManager,
+    risk_config_from_dict,
+)
 from quanti.risk.sizer import Sizer, compute_buy_target_value
 from quanti.utils.market import (
     count_trading_days_between,
+    lot_round_strength,
     max_fill_shares,
     next_trading_bar,
     next_trading_day,
@@ -694,6 +700,12 @@ class PaperBroker:
             self._db.update_order_status(order_id, "rejected",
                                          reason="T+1 restriction at fill")
             return False
+        # Partial-sell: ONLY the concentration trim (削峰) sells a fraction; every
+        # other SELL (stop/TP/strategy/flatten/manual) fully exits regardless of
+        # its strength (some strategies emit closing SELLs with strength<1.0).
+        # Sub-lot trim → 0 → the <100 check below rejects (no-op).
+        if strategy_name == DRIFT_TRIM_STRATEGY:
+            quantity = lot_round_strength(quantity, signal.strength)
         # Capacity cap (B1): can't dump more than participation of turnover in
         # one bar. Remainder carries; a re-emitted SELL clears it next session.
         vcap = max_fill_shares(bar_amount, ref_price)
@@ -717,11 +729,16 @@ class PaperBroker:
         self._db.update_cash(state["cash"] + net)
         remaining = pos["quantity"] - quantity
         if remaining > 0:
-            # Frozen (today-bought) remainder stays — sellable next session.
+            # Keep ONLY the pre-existing today-frozen lot frozen — never freeze
+            # the settled shares we chose not to sell. A partial 削峰 trim of a
+            # settled position must leave the rest sellable (so a same-session
+            # stop isn't blocked); a capacity-capped exit likewise keeps trying.
+            kept = (int(pos.get("frozen_qty") or 0)
+                    if pos.get("frozen_date") == bar_date else 0)
             self._db.upsert_position(
                 signal.stock_code, remaining, pos["avg_cost"],
                 pos["current_price"] or pos["avg_cost"], pos["buy_date"],
-                frozen_qty=remaining, frozen_date=bar_date)
+                frozen_qty=min(kept, remaining), frozen_date=bar_date)
         else:
             self._db.delete_position(signal.stock_code)
         self._db.update_order_filled(order_id, "filled", price, quantity)
@@ -924,6 +941,10 @@ class PaperBroker:
             self._record_order(signal, strategy_name,
                                status="rejected", reason="T+1 restriction")
             return False
+        # Partial-sell: only the 削峰 trim sells a fraction; all other SELLs
+        # fully exit (their strength is a confidence score, not a sell fraction).
+        if strategy_name == DRIFT_TRIM_STRATEGY:
+            quantity = lot_round_strength(quantity, signal.strength)
         # Capacity cap (B1): ≤ participation of the bar's turnover; remainder
         # carries in the position and is re-sold next session.
         vcap = max_fill_shares(bar_amount, ref_price)
@@ -945,10 +966,14 @@ class PaperBroker:
         self._db.update_cash(state["cash"] + net)
         remaining = pos["quantity"] - quantity
         if remaining > 0:
+            # Keep only the pre-existing today-frozen lot frozen; leave the
+            # settled trim remainder sellable (don't block a same-session exit).
+            kept = (int(pos.get("frozen_qty") or 0)
+                    if pos.get("frozen_date") == bar_date else 0)
             self._db.upsert_position(
                 signal.stock_code, remaining, pos["avg_cost"],
                 pos["current_price"] or pos["avg_cost"], pos["buy_date"],
-                frozen_qty=remaining, frozen_date=bar_date)
+                frozen_qty=min(kept, remaining), frozen_date=bar_date)
         else:
             self._db.delete_position(signal.stock_code)
 
@@ -1015,6 +1040,14 @@ class PaperBroker:
         landed = 0
         for s in sells:
             if self.execute_signal(s, strategy_name="risk_exit"):
+                landed += 1
+        # Concentration trim (削峰, opt-in) — partial sells for names whose
+        # weight drifted past the band, excluding names already fully exited
+        # above. Rides the same sell path (T+1 / 涨跌停 / lots / partial-sell).
+        trims = self._risk.check_drift_trims(
+            portfolio, exclude={s.stock_code for s in sells})
+        for s in trims:
+            if self.execute_signal(s, strategy_name=DRIFT_TRIM_STRATEGY):
                 landed += 1
         return landed
 
