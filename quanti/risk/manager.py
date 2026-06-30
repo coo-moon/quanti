@@ -27,6 +27,13 @@ STOP_LOSS_REASON_PREFIX = "止损"
 emits it; protections identify stop-loss exits by it (plus strategy_name
 'risk_exit'). Changing the wording here keeps producer and consumer in sync."""
 
+DRIFT_TRIM_STRATEGY = "drift_trim"
+"""strategy_name tag for concentration-trim (削峰) partial sells. The ONLY sell
+path that honors a sub-1.0 signal.strength — every other SELL (stop / TP /
+strategy-exit / manual / flatten) sells the full sellable qty regardless of
+strength. The fill paths gate the partial-sell primitive on this tag, so a
+strategy that emits a closing SELL with strength<1.0 still fully exits."""
+
 
 @dataclass
 class RiskConfig:
@@ -68,6 +75,24 @@ class RiskConfig:
     ratio (volatility, dimensionless → adjust-agnostic) into check_exits."""
     atr_stop_n: int = 14
     """Lookback (trading days) for the ATR behind atr_stop_k."""
+
+    # --- Concentration trim (削峰) — opt-in, default OFF ---
+    drift_trim_enabled: bool = False
+    """When True, a holding whose weight drifts above
+    drift_trim_to_pct×(1+drift_trim_band) is PARTIALLY sold back down to the
+    drift_trim_to_pct edge. ONE-SIDED (trim-only; never tops up an underweight
+    name). Pure concentration/drawdown control, NOT an alpha/trend bet — it only
+    caps single-name concentration. Keep OFF unless a concrete concentration
+    problem exists: the ~万10 round-trip cost otherwise outweighs the benefit
+    (and quanti's research says passive equal-weight already wins)."""
+    drift_trim_to_pct: float = 0.10
+    """Trim an over-weight holding back down to this fraction of equity (the
+    band's lower edge — trade-to-edge, not to a tighter target)."""
+    drift_trim_band: float = 0.25
+    """No-trade band: only trigger a trim once weight exceeds
+    drift_trim_to_pct×(1+band) (e.g. 0.10×1.25 = 12.5%). MUST stay wide —
+    Davis-Norman's cube-root law: even a small per-trade cost needs a band
+    several % wide before trimming pays. A tight band bleeds cost to churn."""
 
 
 def risk_config_from_dict(overrides: dict) -> RiskConfig:
@@ -249,6 +274,39 @@ class RiskManager:
                             reason=(f"移动止盈 浮盈{pos.pnl_pct:+.1%} 自峰值回撤"
                                     f"{drawdown:.1%}")))
         return signals
+
+    def check_drift_trims(self, portfolio: Portfolio,
+                          exclude: set[str] | None = None) -> list[Signal]:
+        """One-sided concentration trim (削峰). For each holding whose weight has
+        drifted above drift_trim_to_pct×(1+band), emit a PARTIAL SELL whose
+        `strength` is the fraction to shave to bring it back to the
+        drift_trim_to_pct edge (trade-to-edge). Trim-only — never tops up an
+        underweight name. Opt-in (drift_trim_enabled); empty when off.
+
+        `exclude` = codes already being FULLY exited this cycle (stop/TP/strategy
+        sells) so a name isn't both flattened and trimmed. Pure risk/turnover
+        control: it reads only current weights, forecasts nothing."""
+        cfg = self.config
+        if not cfg.drift_trim_enabled or cfg.drift_trim_to_pct <= 0:
+            return []
+        exclude = exclude or set()
+        eq = portfolio.total_value
+        if eq <= 0:
+            return []
+        edge = cfg.drift_trim_to_pct
+        trigger = edge * (1.0 + cfg.drift_trim_band)
+        out: list[Signal] = []
+        for code, pos in portfolio.positions.items():
+            if code in exclude:
+                continue
+            w = pos.market_value / eq
+            if w > trigger:
+                frac = min(max((w - edge) / w, 0.0), 1.0)  # shave back to edge
+                if frac > 0:
+                    out.append(Signal(
+                        stock_code=code, direction=Direction.SELL, strength=frac,
+                        reason=f"削峰 权重{w:.1%}>{trigger:.1%}→回{edge:.0%}"))
+        return out
 
     def reset_daily(self) -> None:
         """Reset daily counters. Backtest calls this per simulated day; live/

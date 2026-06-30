@@ -807,6 +807,11 @@ class RiskControlBody(BaseModel):
     strategy_exit_enabled: bool
     atr_stop_k: float
     atr_stop_n: int
+    # Concentration trim (削峰) — opt-in, default off. Defaulted so existing
+    # clients that omit them still validate.
+    drift_trim_enabled: bool = False
+    drift_trim_to_pct: float = 0.10
+    drift_trim_band: float = 0.25
 
 
 def _risk_config_dict(db) -> dict:
@@ -821,6 +826,9 @@ def _risk_config_dict(db) -> dict:
         "strategy_exit_enabled": cfg.strategy_exit_enabled,
         "atr_stop_k": cfg.atr_stop_k,
         "atr_stop_n": cfg.atr_stop_n,
+        "drift_trim_enabled": cfg.drift_trim_enabled,
+        "drift_trim_to_pct": cfg.drift_trim_to_pct,
+        "drift_trim_band": cfg.drift_trim_band,
     }
 
 
@@ -847,6 +855,10 @@ async def set_risk_control(body: RiskControlBody, request: Request):
         errs.append("atr_stop_k 必须 ≥ 0")
     if body.atr_stop_n < 1:
         errs.append("atr_stop_n 必须 ≥ 1")
+    if not (0 < body.drift_trim_to_pct <= 1):
+        errs.append("削峰目标权重 drift_trim_to_pct 必须在 (0, 1]")
+    if body.drift_trim_band < 0:
+        errs.append("削峰带 drift_trim_band 必须 ≥ 0")
     if errs:
         raise HTTPException(status_code=422, detail="; ".join(errs))
     request.app.state.db.upsert_risk_config(body.model_dump())

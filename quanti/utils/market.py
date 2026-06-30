@@ -227,3 +227,18 @@ def max_fill_shares(bar_amount: float, price: float,
     if not bar_amount or bar_amount <= 0 or price <= 0:
         return None
     return int(participation * bar_amount / (price * 100)) * 100
+
+
+def lot_round_strength(qty: int, strength: float, lot: int = 100) -> int:
+    """Scale a sellable quantity by a signal's `strength`, rounded DOWN to whole
+    lots. `strength >= 1.0` (the default for full exits — stop-loss / take-profit
+    / flatten / strategy-sell) returns `qty` UNCHANGED, so existing full-exit
+    behavior is untouched. A partial strength (e.g. 0.4 from a concentration
+    trim) returns `floor(qty * strength / lot) * lot` — a sub-lot trim → 0 (no-op)."""
+    if strength >= 1.0:
+        return qty
+    if strength <= 0.0:
+        return 0
+    # round() before floor-to-lot: int() alone truncates float error
+    # (10000*0.57 = 5699.9999… → 5699 → 5600 instead of 5700).
+    return int(round(qty * strength)) // lot * lot

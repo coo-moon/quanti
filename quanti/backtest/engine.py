@@ -22,11 +22,15 @@ from quanti.backtest.metrics import compute_metrics
 from quanti.backtest.slippage import FlatSlippage, SlippageModel, coerce
 from quanti.data.provider import DataProvider
 from quanti.models import BarData, Direction, Portfolio, Position, Signal
-from quanti.risk.manager import RiskManager, STOP_LOSS_REASON_PREFIX
+from quanti.risk.manager import (
+    DRIFT_TRIM_STRATEGY,
+    RiskManager,
+    STOP_LOSS_REASON_PREFIX,
+)
 from quanti.risk.protections import ProtectionContext, ProtectionManager
 from quanti.risk.sizer import Sizer, compute_buy_target_value
 from quanti.strategy.base import BaseStrategy
-from quanti.utils.market import max_fill_shares, tradable_at_open
+from quanti.utils.market import lot_round_strength, max_fill_shares, tradable_at_open
 
 # A signal waits at most this many trading bars for a fillable (tradable, has a
 # bar) day before being abandoned — mirrors PaperBroker's pending TTL.
@@ -265,6 +269,17 @@ class BacktestEngine:
             def _queue(sig: Signal, sname: str) -> None:
                 key = (sig.stock_code, sig.direction)
                 if key in pending_keys:  # dedup: one order per code+direction
+                    # A full/forced SELL supersedes a still-pending partial 削峰
+                    # trim for the same code, so a carried (capacity-capped) trim
+                    # can't shadow a stop / strategy / portfolio-stop exit.
+                    if sig.direction == Direction.SELL and sname != DRIFT_TRIM_STRATEGY:
+                        for i, p in enumerate(pending):
+                            if (p["signal"].stock_code == sig.stock_code
+                                    and p["signal"].direction == Direction.SELL
+                                    and p["strategy_name"] == DRIFT_TRIM_STRATEGY):
+                                pending[i] = {"signal": sig, "gen_idx": idx,
+                                              "strategy_name": sname}
+                                break
                     return
                 pending.append({"signal": sig, "gen_idx": idx,
                                 "strategy_name": sname})
@@ -296,10 +311,18 @@ class BacktestEngine:
                     atr_r = {c: atr_ratio[c][current_date]
                              for c in portfolio.positions
                              if c in atr_ratio and current_date in atr_ratio[c]}
-                    for sl in self._risk.check_exits(
-                            portfolio, peaks=peaks, atr_ratios=atr_r):
+                    exit_sells = self._risk.check_exits(
+                        portfolio, peaks=peaks, atr_ratios=atr_r)
+                    for sl in exit_sells:
                         if sl.stock_code in today_bars:
                             _queue(sl, "risk_exit")
+                    # Concentration trim (削峰, opt-in) — backtest parity with
+                    # the live brokers; partial sells for names past the band,
+                    # excluding names already fully exited above.
+                    for tr in self._risk.check_drift_trims(
+                            portfolio, exclude={s.stock_code for s in exit_sells}):
+                        if tr.stock_code in today_bars:
+                            _queue(tr, DRIFT_TRIM_STRATEGY)
 
                 for code, bar in today_bars.items():
                     for signal in strategy.on_bar(bar):
@@ -366,7 +389,10 @@ class BacktestEngine:
                 continue
             filled = self._process_signal(sig, bar, portfolio, trades,
                                           current_date, p["strategy_name"])
-            if filled and sig.direction == Direction.SELL:
+            # Drop the post-entry peak only on a FULL exit; a partial 削峰 trim
+            # leaves shares held, so keep their trailing-TP peak intact.
+            if (filled and sig.direction == Direction.SELL
+                    and code not in portfolio.positions):
                 peaks.pop(code, None)
             # Retry an unfilled BUY (transient cash shortfall) within the TTL;
             # everything else (filled, or a sell with no position) is dropped.
@@ -391,7 +417,8 @@ class BacktestEngine:
                                        signal.strength)
         elif signal.direction == Direction.SELL:
             filled = self._execute_sell(code, bar, portfolio, trades, current_date,
-                                        strategy_name, signal.reason)
+                                        strategy_name, signal.reason,
+                                        signal.strength)
         else:
             return False
         if filled and self._risk is not None:
@@ -515,6 +542,7 @@ class BacktestEngine:
         current_date: date,
         strategy_name: str,
         reason: str = "",
+        strength: float = 1.0,
     ) -> bool:
         if code not in portfolio.positions:
             return False
@@ -525,13 +553,17 @@ class BacktestEngine:
         if pos.buy_date == current_date:
             return False
 
-        # Capacity cap (B1): can't dump more than `participation` of the bar's
-        # turnover in one bar. Sell what the bar allows; the remainder carries
-        # in the position and is re-sold next bar (the strategy/stop re-fires).
+        # Partial-sell: ONLY the concentration trim (削峰) sells a fraction; every
+        # other SELL fully exits regardless of strength (some strategies emit
+        # closing SELLs with strength<1.0). Then the capacity cap (B1) limits
+        # delivery; remainder carries + re-fires.
+        quantity = (lot_round_strength(pos.quantity, strength)
+                    if strategy_name == DRIFT_TRIM_STRATEGY else pos.quantity)
         cap = max_fill_shares(bar.amount, bar.open)
-        quantity = pos.quantity if cap is None else min(pos.quantity, cap)
+        if cap is not None:
+            quantity = min(quantity, cap)
         if quantity < 100:
-            return False  # too illiquid to move a lot this bar — retry next bar
+            return False  # too illiquid / sub-lot trim — retry next bar
         adv = self._adv20.get(code, {}).get(current_date, 0.0)
         slip_frac = self._slippage.adjust(
             code=code, price=bar.open, qty=quantity,

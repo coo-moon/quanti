@@ -38,9 +38,14 @@ from quanti.execution.base import BrokerResult, PendingFillResult
 from quanti.execution.exits import (
     compute_atr_ratios, compute_peaks, compute_strategy_exits, load_strategies)
 from quanti.models import Direction, Portfolio, Position, PriceType, Signal
-from quanti.risk.manager import RiskConfig, RiskManager, risk_config_from_dict
+from quanti.risk.manager import (
+    DRIFT_TRIM_STRATEGY,
+    RiskConfig,
+    RiskManager,
+    risk_config_from_dict,
+)
 from quanti.risk.sizer import compute_buy_target_value
-from quanti.utils.market import board_limit_pct, prev_bar_close
+from quanti.utils.market import board_limit_pct, lot_round_strength, prev_bar_close
 
 if TYPE_CHECKING:
     from quanti.risk.protections import ProtectionConfig
@@ -278,7 +283,17 @@ class QmtBroker:
                     f"跳过(实盘) 卖出 {signal.stock_code}: 当日买入 T+1 不可卖",
                     code=signal.stock_code, details={"venue": "qmt"})
                 return False, "rejected", r
-            volume = can_sell
+            # Partial-sell: ONLY the concentration trim (削峰) sells a fraction.
+            # Every other SELL (stop/TP/strategy/flatten/manual) fully exits
+            # can_sell — including odd lots (1–99 shares from dividends/rights),
+            # which must be flattenable. A sub-lot trim is a silent no-op (don't
+            # churn a 'rejected' mirror every cycle).
+            if strategy_name == DRIFT_TRIM_STRATEGY:
+                volume = lot_round_strength(can_sell, signal.strength)
+                if volume < 100:
+                    return False, "rejected", "trim below one lot (no-op)"
+            else:
+                volume = can_sell
             if strategy_name in _FORCED_EXIT_STRATEGIES:
                 # Forced exit (stop-loss / circuit-breaker flatten) MUST get out.
                 # A normal limit near last price won't fill on a fast drop or a
@@ -434,6 +449,14 @@ class QmtBroker:
         landed = 0
         for s in sells:
             if self.execute_signal(s, strategy_name="risk_exit"):
+                landed += 1
+        # Concentration trim (削峰, opt-in): partial sells back to the band edge
+        # for names not already fully exited. "drift_trim" is NOT a forced exit,
+        # so it prices at a normal limit (not the 跌停 floor).
+        trims = self._risk.check_drift_trims(
+            portfolio, exclude={s.stock_code for s in sells})
+        for s in trims:
+            if self.execute_signal(s, strategy_name=DRIFT_TRIM_STRATEGY):
                 landed += 1
         return landed
 

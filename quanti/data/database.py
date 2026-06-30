@@ -233,6 +233,11 @@ class Database:
             # OHLC, …) — kept separate from errors_json so coverage gaps don't
             # masquerade as hard failures yet stay visible to the UI.
             ("sync_jobs", "warnings_json", "TEXT DEFAULT '{}'"),
+            # Concentration-trim (削峰) config — opt-in, default off. Legacy
+            # risk_config rows backfill to the dataclass defaults.
+            ("risk_config", "drift_trim_enabled", "INTEGER DEFAULT 0"),
+            ("risk_config", "drift_trim_to_pct", "REAL DEFAULT 0.10"),
+            ("risk_config", "drift_trim_band", "REAL DEFAULT 0.25"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -461,6 +466,9 @@ class Database:
                 strategy_exit_enabled INTEGER NOT NULL,
                 atr_stop_k REAL NOT NULL DEFAULT 0,
                 atr_stop_n INTEGER NOT NULL DEFAULT 14,
+                drift_trim_enabled INTEGER NOT NULL DEFAULT 0,
+                drift_trim_to_pct REAL NOT NULL DEFAULT 0.10,
+                drift_trim_band REAL NOT NULL DEFAULT 0.25,
                 updated_at TEXT NOT NULL
             );
 
@@ -1570,7 +1578,8 @@ class Database:
         row = self.conn.execute(
             "SELECT stop_loss_pct, portfolio_stop_loss_pct, "
             "take_profit_activate_pct, take_profit_trail_pct, "
-            "strategy_exit_enabled, atr_stop_k, atr_stop_n "
+            "strategy_exit_enabled, atr_stop_k, atr_stop_n, "
+            "drift_trim_enabled, drift_trim_to_pct, drift_trim_band "
             "FROM risk_config WHERE id=1"
         ).fetchone()
         if row is None:
@@ -1580,6 +1589,8 @@ class Database:
             "take_profit_activate_pct": row[2], "take_profit_trail_pct": row[3],
             "strategy_exit_enabled": bool(row[4]),
             "atr_stop_k": row[5], "atr_stop_n": int(row[6]),
+            "drift_trim_enabled": bool(row[7]),
+            "drift_trim_to_pct": row[8], "drift_trim_band": row[9],
         }
 
     def upsert_risk_config(self, cfg: dict) -> None:
@@ -1592,8 +1603,9 @@ class Database:
             INSERT INTO risk_config (
                 id, stop_loss_pct, portfolio_stop_loss_pct,
                 take_profit_activate_pct, take_profit_trail_pct,
-                strategy_exit_enabled, atr_stop_k, atr_stop_n, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                strategy_exit_enabled, atr_stop_k, atr_stop_n,
+                drift_trim_enabled, drift_trim_to_pct, drift_trim_band, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 stop_loss_pct=excluded.stop_loss_pct,
                 portfolio_stop_loss_pct=excluded.portfolio_stop_loss_pct,
@@ -1602,12 +1614,18 @@ class Database:
                 strategy_exit_enabled=excluded.strategy_exit_enabled,
                 atr_stop_k=excluded.atr_stop_k,
                 atr_stop_n=excluded.atr_stop_n,
+                drift_trim_enabled=excluded.drift_trim_enabled,
+                drift_trim_to_pct=excluded.drift_trim_to_pct,
+                drift_trim_band=excluded.drift_trim_band,
                 updated_at=excluded.updated_at
             """,
             (cfg["stop_loss_pct"], cfg["portfolio_stop_loss_pct"],
              cfg["take_profit_activate_pct"], cfg["take_profit_trail_pct"],
              int(bool(cfg["strategy_exit_enabled"])), cfg["atr_stop_k"],
-             int(cfg["atr_stop_n"]), now),
+             int(cfg["atr_stop_n"]),
+             int(bool(cfg.get("drift_trim_enabled", False))),
+             cfg.get("drift_trim_to_pct", 0.10), cfg.get("drift_trim_band", 0.25),
+             now),
         )
         self.conn.commit()
 
