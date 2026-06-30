@@ -484,6 +484,9 @@ class PaperBroker:
                 "direction": o["direction"],
                 "quantity": o["quantity"],
                 "reason": o.get("reason", "") or "",
+                # 进场策略 = 该挂单的 strategy_name(买单 = fusion 选的进场策略;
+                # 卖单挂单 = risk_exit / drift_trim)。UI「进场策略」列读它。
+                "entry_strategy": o.get("strategy_name", "") or "",
                 "created_at": created_at,
                 "expected_fill_date": expected_fill_date,
                 "fill_price_basis": self._fill_basis,  # "open" → 次日开盘价
@@ -1059,10 +1062,10 @@ class PaperBroker:
         """Per-code post-entry peak — shared with QmtBroker via exits.py."""
         return compute_peaks(self._db, positions)
 
-    def _compute_strategy_exits(self, positions: list[dict]) -> set[str]:
-        """Codes whose owning entry-strategy now says SELL — shared helper."""
+    def _compute_strategy_exits(self, positions: list[dict]) -> dict[str, str]:
+        """{code: owning entry-strategy name} for holdings now flagging SELL."""
         if not self._risk.config.strategy_exit_enabled:
-            return set()
+            return {}
         return compute_strategy_exits(
             self._provider, self._load_strategies(), positions, self._db)
 

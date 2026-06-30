@@ -923,7 +923,10 @@ async def live_status(request: Request):
             "code": p["code"], "name": p.get("name", p["code"]),
             "quantity": p.get("quantity", 0),
             "avg_cost": p["avg_cost"], "current_price": p["current_price"],
-            "pnl_pct": p.get("pnl_pct", 0.0), **info,
+            "pnl_pct": p.get("pnl_pct", 0.0),
+            # entry_strategy rides along from list_positions via snapshot's
+            # **pos spread; surface it for the live-status 进场策略 column.
+            "entry_strategy": p.get("entry_strategy", ""), **info,
         })
     connected = broker.is_connected() if hasattr(broker, "is_connected") else None
     return {

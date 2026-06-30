@@ -240,6 +240,7 @@ def test_check_exits_stop_loss_reason_uses_prefix():
     from quanti.models import Portfolio, Position
     from quanti.risk.manager import (
         RiskManager, RiskConfig, STOP_LOSS_REASON_PREFIX,
+        STRATEGY_EXIT_REASON_PREFIX,
     )
     cfg = RiskConfig(stop_loss_pct=-0.08, take_profit_activate_pct=0.15,
                      take_profit_trail_pct=0.10)
@@ -271,6 +272,16 @@ def test_check_exits_stop_loss_reason_uses_prefix():
     assert sells_se, "expected strategy-exit"
     assert sells_se[0].reason  # non-empty
     assert not sells_se[0].reason.startswith(STOP_LOSS_REASON_PREFIX)
+    # strategy-exit uses its OWN prefix so audit/UI can tell it apart from
+    # stop-loss / take-profit (all three share strategy_name 'risk_exit').
+    assert sells_se[0].reason.startswith(STRATEGY_EXIT_REASON_PREFIX)
+
+    # 4. dict input names the owning strategy → reason carries it, so the audit
+    #    shows WHICH strategy said sell (not just that *a* risk_exit fired).
+    sells_named = rm.check_exits(
+        pf_se, strategy_sell_codes={"000003": "macd_cross"})
+    assert sells_named and "macd_cross" in sells_named[0].reason
+    assert sells_named[0].reason.startswith(STRATEGY_EXIT_REASON_PREFIX)
 
 
 def test_daily_cap_auto_resets_on_new_calendar_day(monkeypatch):

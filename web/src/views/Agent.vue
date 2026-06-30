@@ -275,7 +275,7 @@
           <thead>
             <tr>
               <th>代码</th><th>名称</th><th>数量</th>
-              <th>买入价</th><th>当前价</th><th>强制止损价</th><th>距止损</th><th>盈亏 %</th>
+              <th>买入价</th><th>当前价</th><th>强制止损价</th><th>距止损</th><th>盈亏 %</th><th>进场策略</th>
             </tr>
           </thead>
           <tbody>
@@ -291,6 +291,7 @@
               </td>
               <td :class="stopDistance(p) <= 0.03 ? 'bad' : ''">{{ formatPct(stopDistance(p)) }}</td>
               <td :class="p.pnl_pct >= 0 ? 'up' : 'down'">{{ formatPct(p.pnl_pct) }}</td>
+              <td>{{ p.entry_strategy || "—" }}</td>
             </tr>
           </tbody>
         </table>
@@ -365,6 +366,7 @@
             <th>加入队列</th>
             <th>预计成交日</th>
             <th>状态</th>
+            <th>进场策略</th>
             <th>理由</th>
           </tr>
         </thead>
@@ -386,6 +388,7 @@
                 已等 {{ o.trading_days_pending ?? 0 }}/{{ o.ttl_trading_days }} 交易日
               </span>
             </td>
+            <td>{{ o.entry_strategy || "—" }}</td>
             <td class="reason-cell" :title="o.reason">{{ o.reason || "—" }}</td>
           </tr>
         </tbody>
