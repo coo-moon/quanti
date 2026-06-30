@@ -46,7 +46,7 @@ strategy that emits a closing SELL with strength<1.0 still fully exits."""
 class RiskConfig:
     """Risk management configuration."""
 
-    max_position_pct: float = 0.20  # Max 20% per stock
+    max_position_pct: float = 0.10  # Max 10% per stock
     max_industry_pct: float = 0.30  # Max 30% per industry
     stop_loss_pct: float = -0.15
     """Absolute per-stock stop FLOOR — the widest a single-stock stop may ever
