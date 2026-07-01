@@ -191,10 +191,21 @@
             <span>wf_enabled</span>
             <em>walk-forward 滚动验证,杜绝单窗 IS 过拟合</em>
           </label>
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.dsr_gate" />
+            <span>dsr_gate</span>
+            <em>DSR 过拟合门:赢家 OOS 夏普按候选数做多重检验紧缩,低于 dsr_min 退等权(默认关,先看日志验校准)</em>
+          </label>
+          <label class="adv-num">
+            <span>dsr_min</span>
+            <input type="number" step="0.01" min="0" max="1"
+                   v-model.number="advParams.dsr_min" />
+            <em>DSR 门阈值 0~1,越高越严;默认 0.85(校准回测最优,平台 0.70~0.95)</em>
+          </label>
         </div>
         <div class="adv-note">
-          预设按钮会重置这四项;手动改完后下方保存目标按钮才会落库。LLM 模式的供应商与
-          多智能体增强开关见下方「LLM 增强层」。
+          预设按钮会重置上面四项模式开关(DSR 门独立,不受预设影响);手动改完后下方保存
+          目标按钮才会落库。LLM 模式的供应商与多智能体增强开关见下方「LLM 增强层」。
         </div>
       </details>
 
@@ -650,6 +661,9 @@ const advParams = reactive({
   industry_neutral: false,
   liquidity_filter: false,
   wf_enabled: true, // default-on
+  // DSR 过拟合门(独立于预设,默认关):赢家夏普做多重检验紧缩,低于 dsr_min 退等权。
+  dsr_gate: false,
+  dsr_min: 0.85, // 校准回测最优(54 月 OOS,见 scripts/dsr_calibration.py)
   // LLM enhancement layer (all default-off; ②③④ only apply in LLM mode,
   // ① sentiment also applies in ensemble mode).
   llm_provider: "anthropic" as "anthropic" | "deepseek",
@@ -675,6 +689,8 @@ function syncAdvFromParams() {
   advParams.industry_neutral = !!p.industry_neutral;
   advParams.liquidity_filter = !!p.liquidity_filter;
   advParams.wf_enabled = p.wf_enabled !== false; // default true if absent
+  advParams.dsr_gate = !!p.dsr_gate;
+  advParams.dsr_min = typeof p.dsr_min === "number" ? p.dsr_min : 0.85;
   advParams.llm_provider = p.llm_provider === "deepseek" ? "deepseek" : "anthropic";
   advParams.sentiment_enabled = !!p.sentiment_enabled;
   advParams.sentiment_blend =
@@ -703,6 +719,8 @@ function syncParamsFromAdv() {
     industry_neutral: advParams.industry_neutral,
     liquidity_filter: advParams.liquidity_filter,
     wf_enabled: advParams.wf_enabled,
+    dsr_gate: advParams.dsr_gate,
+    dsr_min: advParams.dsr_min,
     llm_provider: advParams.llm_provider,
     sentiment_enabled: advParams.sentiment_enabled,
     sentiment_blend: advParams.sentiment_blend,
