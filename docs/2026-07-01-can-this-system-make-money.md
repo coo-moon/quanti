@@ -152,6 +152,29 @@
   - **低波倾斜 / 组合熔断**:低波 top50 把回撤 -53.6%→-31.5%(两半程都成立);系统已有的 -30% 熔断 + ATR 止损保留。
 - **明确不要做的**:别追因子 alpha、别择时押 regime、别把默认选池赌在小盘宽度上(壳价值溢价正被注册制/退市抽掉地基 + 肥流动性尾部,2024-02 中证2000 单月 -32.8%)。当前 `no_screener_take=100` 大盘默认**不是"尾部保护"**(全周期它回撤最深),但它可交易;若放宽宽度,必须当作**带尾部风险的风格敞口显式限额**(小微盘≤组合 20%、剔除最小 30% 壳票、成交额下限 + 面值临界 fail-loud 过滤),并先过 DSR/PBO 闸。
 
-### 6.4 建议的后续代码改动(本次未贸然改动线上热路径)
+### 6.4 固化:推荐的"被动 beta + 风控"基线配置(可复制)
 
-把 DSR/PBO 闸接进 **StrategySelector / LLM 因子挖掘的采纳门**:当前 selector 按 OOS 夏普(3 折 ~14 交易日小样本)给资本权重,应在其上叠加"用候选数 N 对赢家夏普做多重检验紧缩(DSR),不过阈值则退回等权"。这直接根治审计里"选择是噪声"的病。因涉及注解校准(年化 vs 每期夏普、小 T),留作独立改动谨慎验证,不在本次一并塞进热路径。
+用户拍板方向 = 接受结论、固化被动+风控基线。以下是**可直接照抄的 `goal.params`**(参数名已对当前代码核实),配套风控已是默认值,无需改代码——把系统当"纪律化 beta 收割机"用,而不是 alpha 机器。
+
+```jsonc
+{
+  "agent_mode": "ensemble",     // 规则集成,不用 llm(LLM 无已证 alpha)
+  "equal_weight": true,         // 等权持有 → 分散,唯一稳健抬夏普的杠杆
+  "max_holdings": 0,            // 0=不砍持仓数 → 尽量分散(降特质风险)
+  "no_screener_take": 100,      // 保持大盘默认=可交易;放宽宽度是 regime 押注,别赌
+  "factor_blend": 0.0,          // 不混因子(池内 alpha≈0,融合参数未过闸)
+  "sentiment_enabled": false,   // 情绪层无回测证据
+  "use_generated_factors": false, // 生成因子须先过 DSR≥0.95/PBO≤0.2 才开
+  "rotation_enabled": false,    // 换仓 opt-in,默认关
+  "llm_debate": false
+}
+```
+
+风控基线(已是 `RiskConfig`/`ProtectionConfig` 默认,确认开着即可):`portfolio_stop_loss_pct=-0.30`(组合熔断)、`atr_stop_k=2.0`/`atr_stop_n=14`(ATR 止损)、`stop_loss_pct=-0.15`(绝对地板)、`max_position_pct=0.10`+`max_industry_pct=0.30`(post-trade 强制)、protections 的 `stoploss_guard`+`max_drawdown` guard(连损/回撤锁)。
+
+**如实预期**:这套 = 捕获 A 股大盘 beta + 硬风控,**没有 alpha**。收益随 beta regime 走(全周期基准 ADV100 约 -3%/年、近两年修复期 +42%),价值在于**回撤和过拟合风险被摁住、成本低、行为可解释**。想要更平的曲线可加**低波倾斜**(已验证把回撤 -53.6%→-31.5%,两半程都成立),但需把因子配置接成低波单因子(见 6.5,当前 `factor_blend` 走的是全 13 因子 composite,不等于低波)——属小改动,别当现成开关。
+
+### 6.5 建议的后续代码改动(本次未贸然改动线上热路径)
+
+1. **DSR/PBO 闸接进 StrategySelector / LLM 因子挖掘采纳门**:当前 selector 按 OOS 夏普(3 折 ~14 交易日小样本)给资本权重,应叠加"用候选数 N 对赢家夏普做多重检验紧缩(DSR),不过阈值退回等权"——直接根治审计里"选择是噪声"的病。涉及注解校准(年化 vs 每期夏普、小 T),留独立改动谨慎验。
+2. **低波单因子倾斜作为可选风控**:6.4 提到的低波降回撤(-53.6%→-31.5%)需要一个"只用 `realized_vol_20d`(或低波+低换手)的 `FactorConfig`"接口,让 `factor_blend` 能指向它而非全 13 因子 composite。这是**降风险**选项(非 alpha),小改动,先过 DSR/PBO 的回撤/夏普双核再默认化。
