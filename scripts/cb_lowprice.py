@@ -12,6 +12,7 @@
 """
 import sys
 import sqlite3
+import argparse
 from collections import defaultdict
 
 import numpy as np
@@ -21,7 +22,8 @@ from quanti.backtest.overfit import deflated_sharpe_ratio, pbo_cscv, sharpe_per_
 
 CB_DB = "data/cb.db"
 COST = 0.001          # 可转债:无印花税,佣金极低;0.1%/换手 保守
-START, END = "2021-01-01", "2026-06-30"
+# 默认 2018-2026(102 月,含 2018/2022 两次熊市,验 beta 跨 regime 稳健);--start 可调
+START, END = "2018-01-01", "2026-06-30"
 # 变体:(名字, top_n, 价格上限=剔除临近强赎的高价券)
 VARIANTS = [
     ("低价top15", 15, None), ("低价top20", 20, None),
@@ -128,6 +130,12 @@ def stat(r):
 
 
 def main():
+    global START, END
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", default=START)
+    ap.add_argument("--end", default=END)
+    args = ap.parse_args()
+    START, END = args.start, args.end
     con = sqlite3.connect(CB_DB)
     px = load(con)
     con.close()
