@@ -131,7 +131,12 @@ class StrategySelector:
 
     def evaluate(self, goal: Goal, codes: list[str],
                  candidates: Iterable[BaseStrategy] | None = None,
+                 as_of: date | None = None,
                  ) -> list[StrategyEvaluation]:
+        # `as_of` runs the whole evaluation (IS window + walk-forward folds) as
+        # of a historical date instead of today — used by scripts/dsr_calibration.py
+        # to replay past selector decisions on the exact production path. Default
+        # None → today, so live behavior is unchanged.
         candidates = list(candidates) if candidates is not None else self.load_candidates()
         if not candidates:
             return []
@@ -144,7 +149,7 @@ class StrategySelector:
         warmup_days = int(params.get("wf_warmup_days", 120))
         test_days = int(params.get("wf_test_days", 21))
 
-        end = date.today()
+        end = as_of or date.today()
         # In-sample window still computed for tie-break and as a fallback.
         is_start = end - timedelta(days=self._training_days)
         # Score strategies under the SAME exit policy they'll trade live
@@ -303,7 +308,9 @@ class StrategySelector:
                 dsr["dsr"], dsr["sr_observed"], dsr["sr0_benchmark"],
                 dsr["n_trials"], dsr["n_obs"], [round(w, 3) for w in weights])
             if bool(params.get("dsr_gate", False)):
-                dsr_min = float(params.get("dsr_min", 0.90))
+                # 0.85 default from scripts/dsr_calibration.py (54 月 OOS 重放):
+                # 0.70~0.95 是平台,0.85 是前瞻收益点最优;低于它退等权净减损。
+                dsr_min = float(params.get("dsr_min", 0.85))
                 if dsr["dsr"] < dsr_min:
                     logger.info("selector DSR gate: winner %s DSR %.3f < %.2f "
                                 "→ revert to equal weight",
