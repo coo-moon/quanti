@@ -428,6 +428,8 @@ export interface RiskControl {
   drift_trim_band: number;
   rotation_enabled: boolean;
   rotation_margin: number;
+  max_position_pct: number;
+  max_industry_pct: number;
 }
 export const fetchRiskControl = () =>
   api.get<RiskControl>("/config/risk-control");

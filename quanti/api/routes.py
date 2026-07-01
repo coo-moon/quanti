@@ -815,6 +815,10 @@ class RiskControlBody(BaseModel):
     # Score-gated rotation (换仓) — opt-in, default off.
     rotation_enabled: bool = False
     rotation_margin: float = 0.15
+    # Concentration caps (单票/行业上限). Defaulted so existing clients that
+    # omit them still validate; also the LLM's per-order size ceiling.
+    max_position_pct: float = 0.20
+    max_industry_pct: float = 0.30
 
 
 def _risk_config_dict(db) -> dict:
@@ -834,6 +838,8 @@ def _risk_config_dict(db) -> dict:
         "drift_trim_band": cfg.drift_trim_band,
         "rotation_enabled": cfg.rotation_enabled,
         "rotation_margin": cfg.rotation_margin,
+        "max_position_pct": cfg.max_position_pct,
+        "max_industry_pct": cfg.max_industry_pct,
     }
 
 
@@ -866,6 +872,10 @@ async def set_risk_control(body: RiskControlBody, request: Request):
         errs.append("削峰带 drift_trim_band 必须 ≥ 0")
     if not (0 < body.rotation_margin <= 1):
         errs.append("换仓分数门 rotation_margin 必须在 (0, 1]")
+    if not (0 < body.max_position_pct <= 0.5):
+        errs.append("单票上限 max_position_pct 必须在 (0, 50%]")
+    if not (0 < body.max_industry_pct <= 1):
+        errs.append("行业上限 max_industry_pct 必须在 (0, 100%]")
     if errs:
         raise HTTPException(status_code=422, detail="; ".join(errs))
     request.app.state.db.upsert_risk_config(body.model_dump())

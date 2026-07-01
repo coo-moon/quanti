@@ -90,6 +90,26 @@ def test_risk_config_roundtrip_drift_fields(tmp_path):
         db.close()
 
 
+def test_risk_config_roundtrip_concentration_caps(tmp_path):
+    db = Database(str(tmp_path / "rc_caps.db"))
+    db.initialize()
+    try:
+        db.upsert_risk_config({
+            "stop_loss_pct": -0.15, "portfolio_stop_loss_pct": -0.30,
+            "take_profit_activate_pct": 0.15, "take_profit_trail_pct": 0.10,
+            "strategy_exit_enabled": True, "atr_stop_k": 2.0, "atr_stop_n": 14,
+            "max_position_pct": 0.25, "max_industry_pct": 0.40,
+        })
+        got = db.get_risk_config()
+        assert got["max_position_pct"] == pytest.approx(0.25)
+        assert got["max_industry_pct"] == pytest.approx(0.40)
+        cfg = risk_config_from_dict(got)
+        assert cfg.max_position_pct == pytest.approx(0.25)
+        assert cfg.max_industry_pct == pytest.approx(0.40)
+    finally:
+        db.close()
+
+
 def _broker_with_position(tmp_path, qty: int):
     db = Database(str(tmp_path / "pb.db"))
     db.initialize()

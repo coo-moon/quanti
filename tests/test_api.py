@@ -180,6 +180,8 @@ class TestRiskControlConfig:
         assert r.status_code == 200
         assert r.json()["stop_loss_pct"] == -0.15  # absolute stop floor default
         assert r.json()["atr_stop_k"] == 2.0  # ATR-adaptive on by default
+        assert r.json()["max_position_pct"] == 0.20  # single-stock cap default
+        assert r.json()["max_industry_pct"] == 0.30  # industry cap default
 
     @pytest.mark.asyncio
     async def test_post_persists_and_audit_reflects(self, client):
@@ -208,3 +210,27 @@ class TestRiskControlConfig:
         broker._sync_risk_config()  # what check_exits/enforce do each cycle
         assert broker._risk.config.stop_loss_pct == -0.05
         assert broker._risk.config.atr_stop_k == 2.0
+
+    @pytest.mark.asyncio
+    async def test_post_persists_concentration_caps(self, client, app):
+        body = {**self._FULL, "max_position_pct": 0.25, "max_industry_pct": 0.40}
+        r = await client.post("/api/config/risk-control", json=body)
+        assert r.status_code == 200
+        assert r.json()["max_position_pct"] == 0.25
+        # GET reflects it
+        got = (await client.get("/api/config/risk-control")).json()
+        assert got["max_position_pct"] == 0.25 and got["max_industry_pct"] == 0.40
+        # Live broker picks it up on the next sync (no restart)
+        broker = app.state.broker
+        broker._sync_risk_config()
+        assert broker._risk.config.max_position_pct == 0.25
+        assert broker._risk.config.max_industry_pct == 0.40
+
+    @pytest.mark.asyncio
+    async def test_post_rejects_out_of_range_caps(self, client):
+        for field, bad in [("max_position_pct", 0.6),   # > 50% ceiling
+                           ("max_position_pct", 0.0),    # must be > 0
+                           ("max_industry_pct", 1.5)]:   # > 100%
+            r = await client.post("/api/config/risk-control",
+                                  json={**self._FULL, field: bad})
+            assert r.status_code == 422, f"{field}={bad} should be rejected"

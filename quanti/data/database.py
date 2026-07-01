@@ -257,6 +257,10 @@ class Database:
             # Score-gated rotation (换仓) config — opt-in, default off.
             ("risk_config", "rotation_enabled", "INTEGER DEFAULT 0"),
             ("risk_config", "rotation_margin", "REAL DEFAULT 0.15"),
+            # Concentration caps (单票/行业上限) — UI-adjustable. Legacy rows
+            # backfill to the dataclass defaults (20% / 30%).
+            ("risk_config", "max_position_pct", "REAL DEFAULT 0.20"),
+            ("risk_config", "max_industry_pct", "REAL DEFAULT 0.30"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -1597,7 +1601,7 @@ class Database:
     _RISK_CONFIG_FIELDS = (
         "stop_loss_pct", "portfolio_stop_loss_pct", "take_profit_activate_pct",
         "take_profit_trail_pct", "strategy_exit_enabled", "atr_stop_k",
-        "atr_stop_n",
+        "atr_stop_n", "max_position_pct", "max_industry_pct",
     )
 
     def get_risk_config(self) -> dict:
@@ -1608,7 +1612,8 @@ class Database:
             "take_profit_activate_pct, take_profit_trail_pct, "
             "strategy_exit_enabled, atr_stop_k, atr_stop_n, "
             "drift_trim_enabled, drift_trim_to_pct, drift_trim_band, "
-            "rotation_enabled, rotation_margin "
+            "rotation_enabled, rotation_margin, "
+            "max_position_pct, max_industry_pct "
             "FROM risk_config WHERE id=1"
         ).fetchone()
         if row is None:
@@ -1621,6 +1626,7 @@ class Database:
             "drift_trim_enabled": bool(row[7]),
             "drift_trim_to_pct": row[8], "drift_trim_band": row[9],
             "rotation_enabled": bool(row[10]), "rotation_margin": row[11],
+            "max_position_pct": row[12], "max_industry_pct": row[13],
         }
 
     def upsert_risk_config(self, cfg: dict) -> None:
@@ -1635,8 +1641,9 @@ class Database:
                 take_profit_activate_pct, take_profit_trail_pct,
                 strategy_exit_enabled, atr_stop_k, atr_stop_n,
                 drift_trim_enabled, drift_trim_to_pct, drift_trim_band,
-                rotation_enabled, rotation_margin, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                rotation_enabled, rotation_margin,
+                max_position_pct, max_industry_pct, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 stop_loss_pct=excluded.stop_loss_pct,
                 portfolio_stop_loss_pct=excluded.portfolio_stop_loss_pct,
@@ -1650,6 +1657,8 @@ class Database:
                 drift_trim_band=excluded.drift_trim_band,
                 rotation_enabled=excluded.rotation_enabled,
                 rotation_margin=excluded.rotation_margin,
+                max_position_pct=excluded.max_position_pct,
+                max_industry_pct=excluded.max_industry_pct,
                 updated_at=excluded.updated_at
             """,
             (cfg["stop_loss_pct"], cfg["portfolio_stop_loss_pct"],
@@ -1660,6 +1669,7 @@ class Database:
              cfg.get("drift_trim_to_pct", 0.10), cfg.get("drift_trim_band", 0.25),
              int(bool(cfg.get("rotation_enabled", False))),
              cfg.get("rotation_margin", 0.15),
+             cfg.get("max_position_pct", 0.20), cfg.get("max_industry_pct", 0.30),
              now),
         )
         self.conn.commit()
