@@ -599,6 +599,15 @@ class AgentRuntime:
         if max_holdings > 0:
             fused = fused[:max_holdings]
 
+        # Attach each candidate's latest close so the LLM path can reason about
+        # lot value (×100 = one A-share board lot) and affordability. fused is
+        # already filtered to the top-N, so this is a handful of cheap reads.
+        price_start = date.today() - timedelta(days=30)
+        for c in fused:
+            bars = self._provider.get_daily_bars(c.code, price_start, date.today())
+            if bars:
+                c.current_price = float(bars[-1].close)
+
         contributing = sorted({s for c in fused for s in c.contributing_strategies})
         self._db.log_decision(
             "strategy_ensemble",
