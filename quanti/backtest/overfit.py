@@ -68,6 +68,26 @@ def sharpe_per_obs(returns) -> float:
     return float(r.mean() / sd) if sd > 0 else 0.0
 
 
+def probabilistic_sharpe_from_stats(sr_per_obs: float, n_obs: int,
+                                    sr_benchmark: float = 0.0,
+                                    skew: float = 0.0, kurt: float = 3.0) -> float:
+    """PSR 的摘要统计版:只吃标量 → P(真实每期Sharpe > sr_benchmark)。
+
+    给「只有标量Sharpe、无完整收益序列」的调用方(如 selector)用。**口径陷阱**:
+    sr_per_obs 必须是**每期(非年化)**Sharpe——若你手上是年化Sharpe(×√252),
+    先除回 √(每年周期数)再传进来;n_obs 用真实观测数,否则 PSR 会严重误校准。
+    skew/kurt 是收益分布的偏度/(非超额)峰度(正态=3);拿不到时留默认(正态假设)。
+    """
+    if n_obs < 3:
+        return 0.0
+    sr = float(sr_per_obs)
+    denom = 1.0 - skew*sr + (kurt - 1.0)/4.0 * sr*sr
+    if denom <= 0:
+        denom = 1e-12
+    stat = (sr - sr_benchmark) * math.sqrt(n_obs - 1) / math.sqrt(denom)
+    return _norm_cdf(stat)
+
+
 def probabilistic_sharpe_ratio(returns, sr_benchmark: float = 0.0) -> float:
     """P(真实每期Sharpe > sr_benchmark)。返回 [0,1]。"""
     r = np.asarray(returns, dtype=float)
@@ -75,18 +95,15 @@ def probabilistic_sharpe_ratio(returns, sr_benchmark: float = 0.0) -> float:
     n = len(r)
     if n < 3:
         return 0.0
-    sr = sharpe_per_obs(r)
     sd = r.std(ddof=1)
     if sd <= 0:
         return 0.0
+    sr = float(r.mean() / sd)
     z = (r - r.mean()) / sd
     skew = float(np.mean(z**3))
     kurt = float(np.mean(z**4))  # 非超额峰度(正态=3)
-    denom = 1.0 - skew*sr + (kurt - 1.0)/4.0 * sr*sr
-    if denom <= 0:
-        denom = 1e-12
-    stat = (sr - sr_benchmark) * math.sqrt(n - 1) / math.sqrt(denom)
-    return _norm_cdf(stat)
+    return probabilistic_sharpe_from_stats(sr, n, sr_benchmark=sr_benchmark,
+                                           skew=skew, kurt=kurt)
 
 
 def expected_max_sharpe(trial_sharpes) -> float:
@@ -113,6 +130,23 @@ def deflated_sharpe_ratio(returns, trial_sharpes) -> dict:
     dsr = probabilistic_sharpe_ratio(returns, sr_benchmark=sr0)
     return {"dsr": dsr, "sr0_benchmark": sr0,
             "sr_observed": sharpe_per_obs(returns),
+            "n_trials": int(len(np.asarray(trial_sharpes)))}
+
+
+def deflated_sharpe_from_stats(sr_per_obs: float, n_obs: int, trial_sharpes,
+                               skew: float = 0.0, kurt: float = 3.0) -> dict:
+    """DSR 的摘要统计版:给「只有标量Sharpe」的调用方用。
+
+    sr_per_obs 必须是**每期(非年化)**Sharpe(见 probabilistic_sharpe_from_stats
+    的口径陷阱);trial_sharpes 是本次搜索所有配置的**每期**Sharpe(含赢家),
+    用来估选择偏差把基准抬高到 expected_max_sharpe。有完整收益序列时优先用
+    deflated_sharpe_ratio(会自动算真实 skew/kurt,最准)。
+    """
+    sr0 = expected_max_sharpe(trial_sharpes)
+    dsr = probabilistic_sharpe_from_stats(sr_per_obs, n_obs, sr_benchmark=sr0,
+                                          skew=skew, kurt=kurt)
+    return {"dsr": dsr, "sr0_benchmark": sr0,
+            "sr_observed": float(sr_per_obs),
             "n_trials": int(len(np.asarray(trial_sharpes)))}
 
 
@@ -183,6 +217,18 @@ def _selftest():
     best = trials[int(np.argmax(sharpes))]
     dsr_noise = deflated_sharpe_ratio(best, sharpes)["dsr"]
     assert dsr_noise < 0.9, f"噪声挑优 DSR 不该高,得 {dsr_noise:.3f}"
+
+    # 3b) from-stats 版必须与 series 版数值一致(同 skew/kurt/n)
+    z_best = (best - best.mean()) / best.std(ddof=1)
+    ps_stats = probabilistic_sharpe_from_stats(
+        sharpe_per_obs(best), len(best), 0.0,
+        float(np.mean(z_best**3)), float(np.mean(z_best**4)))
+    assert abs(ps_stats - probabilistic_sharpe_ratio(best, 0.0)) < 1e-9, \
+        "from-stats PSR 应与 series 版逐位一致"
+    dsr_stats = deflated_sharpe_from_stats(
+        sharpe_per_obs(best), len(best), sharpes,
+        float(np.mean(z_best**3)), float(np.mean(z_best**4)))["dsr"]
+    assert abs(dsr_stats - dsr_noise) < 1e-9, "from-stats DSR 应与 series 版一致"
 
     # 4) PBO:纯噪声矩阵 → PBO≈0.5
     Mn = rng.normal(0.0, 0.01, (160, 40))
