@@ -840,17 +840,20 @@ def run_llm_decision(
                         f"risk triad cut {o['code']} below floor (keep={keep:.2f})")
             valid_orders = kept
 
-    # Convert to Signal objects. The broker's sizer (if configured) will
-    # then turn size_pct into a notional. We use signal.strength = size_pct
-    # so a FixedSizer with max_pct=0.10 will deploy exactly the LLM's request
-    # (strength * max_pct ≈ size_pct when max_pct=0.10).
+    # Convert to Signal objects. The broker's sizer (if configured) turns
+    # size_pct into a notional. strength encodes size_pct as a fraction of the
+    # single-stock cap (cfg.max_size_pct == RiskConfig.max_position_pct), so a
+    # FixedSizer with max_pct=max_position_pct deploys exactly the LLM's request
+    # (strength * max_pct == size_pct). Normalizing by the cap — not a hard-coded
+    # 0.10 — keeps 10–20% requests distinct now that the cap is parameter-driven;
+    # the max(0.01, …) guard mirrors _tools_schema's floor against a 0 cap.
     # Carry each candidate's dominant strategy onto the buy signal so the
     # position records who to replay at exit (the LLM picks FROM candidates,
     # so the ensemble's strategy attribution still applies).
     dominant_by_code = {c.code: c.dominant_strategy for c in candidates}
     signals = [
         Signal(stock_code=o["code"], direction=Direction.BUY,
-               strength=min(1.0, float(o["size_pct"]) / 0.10),
+               strength=min(1.0, float(o["size_pct"]) / max(0.01, cfg.max_size_pct)),
                reason=f"LLM: {o.get('reason', '')}",
                entry_strategy=dominant_by_code.get(o["code"], ""))
         for o in valid_orders

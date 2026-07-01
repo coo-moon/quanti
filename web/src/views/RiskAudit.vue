@@ -54,6 +54,14 @@
 
       <form v-else class="card edit-form" @submit.prevent="save">
         <div class="form-grid">
+          <label>单票上限 (%,单只最大占比)
+            <input type="number" step="1" min="1" max="50"
+                   v-model.number="form.max_position_pct" />
+          </label>
+          <label>行业上限 (%,单行业最大占比)
+            <input type="number" step="1" min="1" max="100"
+                   v-model.number="form.max_industry_pct" />
+          </label>
           <label>止损地板 (%,绝对兜底)
             <input type="number" step="0.5" v-model.number="form.stop_loss_pct" />
           </label>
@@ -98,7 +106,7 @@
           </label>
         </div>
         <p class="form-hint">
-          止损地板 / 熔断为负百分比(如 -15)。ATR k&gt;0 时单标的止损用 -k×(ATR/价)为主、地板兜底(止损永不宽于地板);k=0 则只用地板。改动即时生效,无需重启。
+          单票上限=单只股票最大占总资产比例(默认 20%,风控硬闸门,也是 LLM 单笔可提的仓位上限);行业上限=单个行业合计最大占比(默认 30%)。上限越高,LLM/等权 sizer 每票可买越多——小账户上调单票上限能让高价票「一手」买得起。止损地板 / 熔断为负百分比(如 -15)。ATR k&gt;0 时单标的止损用 -k×(ATR/价)为主、地板兜底(止损永不宽于地板);k=0 则只用地板。改动即时生效,无需重启。
         </p>
         <p v-if="form.drift_trim_enabled" class="form-hint">
           削峰=纯控集中度、单边只削不补:某票权重涨过 目标×(1+带)(默认 10%×1.25=12.5%)就部分卖回 10%。带要宽——往返成本约万10,削太勤会亏手续费。仅在某票占比失控时开。
@@ -291,6 +299,8 @@ const form = reactive({
   stop_loss_pct: -15, portfolio_stop_loss_pct: -30,
   take_profit_activate_pct: 15, take_profit_trail_pct: 10,
   strategy_exit_enabled: true, atr_stop_k: 0, atr_stop_n: 14,
+  // 单票/行业上限(占比以 % 显示;后端存分数)
+  max_position_pct: 20, max_industry_pct: 30,
   // 削峰减仓(占比以 % 显示;后端存分数)
   drift_trim_enabled: false, drift_trim_to_pct: 10, drift_trim_band: 25,
   // 分数门换仓(margin 是 final_score 差值,0–1 原值,不按 % 换算)
@@ -312,6 +322,8 @@ async function toggleEdit() {
     form.strategy_exit_enabled = c.strategy_exit_enabled;
     form.atr_stop_k = c.atr_stop_k;
     form.atr_stop_n = c.atr_stop_n;
+    form.max_position_pct = +(c.max_position_pct * 100).toFixed(2);
+    form.max_industry_pct = +(c.max_industry_pct * 100).toFixed(2);
     form.drift_trim_enabled = c.drift_trim_enabled;
     form.drift_trim_to_pct = +(c.drift_trim_to_pct * 100).toFixed(2);
     form.drift_trim_band = +(c.drift_trim_band * 100).toFixed(2);
@@ -336,6 +348,8 @@ async function save() {
       strategy_exit_enabled: form.strategy_exit_enabled,
       atr_stop_k: form.atr_stop_k,
       atr_stop_n: form.atr_stop_n,
+      max_position_pct: form.max_position_pct / 100,
+      max_industry_pct: form.max_industry_pct / 100,
       drift_trim_enabled: form.drift_trim_enabled,
       drift_trim_to_pct: form.drift_trim_to_pct / 100,
       drift_trim_band: form.drift_trim_band / 100,

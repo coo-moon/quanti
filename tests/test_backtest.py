@@ -272,7 +272,9 @@ def test_backtest_no_10000_share_cap(tmp_path):
     s = BuyOnceStrategy()
     s.init({"strength": 1.0})
     res = BacktestEngine(provider, 1_000_000.0,
-                         risk_manager=RiskManager(RiskConfig()),
+                         # Pin 10% so the cap this test documents stays fixed,
+                         # decoupled from the RiskConfig default (now 20%).
+                         risk_manager=RiskManager(RiskConfig(max_position_pct=0.10)),
                          slippage=0.0).run(s, codes,
                                            date(2024, 1, 1), date(2024, 2, 1))
     db.close()
@@ -305,7 +307,9 @@ def test_backtest_volume_cap_limits_single_bar_fill(tmp_path):
     s = BuyOnceStrategy()
     s.init({"strength": 1.0})
     res = BacktestEngine(provider, 1_000_000.0,
-                         risk_manager=RiskManager(RiskConfig()),
+                         # Pin 10% so the "10% single-stock cap" this test
+                         # documents stays fixed, decoupled from the default.
+                         risk_manager=RiskManager(RiskConfig(max_position_pct=0.10)),
                          slippage=0.0).run(s, ["000001"],
                                            date(2024, 1, 1), date(2024, 2, 1))
     qty = next(t.quantity for t in res.trades if t.direction == Direction.BUY)

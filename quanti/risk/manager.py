@@ -46,8 +46,8 @@ strategy that emits a closing SELL with strength<1.0 still fully exits."""
 class RiskConfig:
     """Risk management configuration."""
 
-    max_position_pct: float = 0.10  # Max 10% per stock
-    max_industry_pct: float = 0.30  # Max 30% per industry
+    max_position_pct: float = 0.20  # Max 20% per stock (UI-adjustable, persisted in risk_config)
+    max_industry_pct: float = 0.30  # Max 30% per industry (UI-adjustable, persisted in risk_config)
     stop_loss_pct: float = -0.15
     """Absolute per-stock stop FLOOR — the widest a single-stock stop may ever
     be. ATR (atr_stop_k>0) is the primary stop and tightens on top of this; a

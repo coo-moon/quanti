@@ -134,9 +134,9 @@ class TestDecisionLoop:
 
 # ----- run_llm_decision (end-to-end with stub) ------------------------
 
-@pytest.fixture
-def llm_setup(tmp_path):
-    db = Database(str(tmp_path / "llm.db"))
+def _make_llm_db(tmp_path, name="llm.db"):
+    """Build a DB seeded with 80 bars of a ~10元 stock. Returns (db, provider)."""
+    db = Database(str(tmp_path / name))
     db.initialize()
     today = pd.Timestamp.today().normalize()
     dates = pd.bdate_range(end=today, periods=80)
@@ -153,7 +153,12 @@ def llm_setup(tmp_path):
         "turnover": np.full(len(dates), 1.0),
     })
     db.save_daily_quotes(df)
-    provider = DataProvider(db)
+    return db, DataProvider(db)
+
+
+@pytest.fixture
+def llm_setup(tmp_path):
+    db, provider = _make_llm_db(tmp_path)
     broker = PaperBroker(db, provider, initial_cash=1_000_000)
     yield db, provider, broker
     db.close()
@@ -206,7 +211,8 @@ class TestRunLLMDecision:
                    "999999" in str(d.get("details", "")) for d in logs)
 
     def test_oversize_pct_rejected(self, llm_setup):
-        """size_pct > 0.10 is rejected by the runtime regardless of risk manager."""
+        """size_pct above the single-stock cap (default 20%) is rejected by the
+        runtime regardless of the risk manager. 0.50 > the 0.20 cap here."""
         db, _, broker = llm_setup
         client = StubLLMClient([
             _propose_block(orders=[{
@@ -221,6 +227,41 @@ class TestRunLLMDecision:
                                   candidates=candidates, llm_client=client)
         assert result["filled"] == 0
         assert result["signals"] == 0
+
+    def test_size_pct_deployed_proportional_to_cap(self, tmp_path):
+        """size_pct is honored as a fraction of the single-stock cap. With a
+        FixedSizer(max_pct=cap), a size_pct at HALF the cap deploys ~half the
+        notional of a size_pct AT the cap. The old hard-coded /0.10 divisor
+        saturated any size_pct ≥ 0.10 to strength 1.0 → identical deployment,
+        which this test would catch (half == full)."""
+        from quanti.risk.manager import RiskConfig
+        from quanti.risk.sizer import FixedSizer
+        cap = 0.20
+        candidates = [FusedCandidate(
+            code="000001", strategy_score=0.7, factor_score=0.5,
+            final_score=0.7, industry="银行",
+            contributing_strategies=["ma_cross"])]
+
+        def deploy(size_pct, name):
+            db, provider = _make_llm_db(tmp_path, name)
+            broker = PaperBroker(
+                db, provider, initial_cash=1_000_000,
+                risk_config=RiskConfig(max_position_pct=cap),
+                sizer=FixedSizer(max_pct=cap))
+            client = StubLLMClient([_propose_block(orders=[{
+                "code": "000001", "direction": "buy",
+                "size_pct": size_pct, "reason": "x"}])])
+            result = run_llm_decision(db=db, broker=broker, goal=Goal(),
+                                      candidates=candidates, llm_client=client)
+            assert result["filled"] == 1, f"expected a fill for size_pct={size_pct}"
+            spent = 1_000_000 - db.get_portfolio_state()["cash"]
+            db.close()
+            return spent
+
+        half = deploy(0.10, "half.db")   # half the cap → strength 0.5
+        full = deploy(0.20, "full.db")   # at the cap  → strength 1.0
+        assert 0 < half < full
+        assert half == pytest.approx(full / 2, rel=0.15)
 
     def test_sell_direction_rejected(self, llm_setup):
         """LLM only proposes BUYs; sells flow through risk manager separately."""
