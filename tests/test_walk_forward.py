@@ -10,6 +10,8 @@ Two things we want to guarantee:
 
 from __future__ import annotations
 
+import math
+import types
 from datetime import date
 
 import numpy as np
@@ -18,6 +20,7 @@ import pytest
 
 from quanti.agent.goal import Goal, RiskTolerance
 from quanti.agent.selector import StrategyEvaluation, StrategySelector
+from quanti.backtest.metrics import annualized_sharpe
 from quanti.agent.walk_forward import (
     Fold,
     FoldResult,
@@ -284,6 +287,107 @@ class TestTopK:
         # All weights positive (we floor non-positive Sharpes at 0 but
         # softmax avoids exactly 0)
         assert all(w > 0 for _, w in pairs)
+
+
+class TestDSRGate:
+    """Deflated-Sharpe overlay: a best-of-N lucky Sharpe gets its capital
+    concentration stripped (revert to equal weight); a genuine edge keeps it.
+
+    Calibration hinges on feeding DSR a per-period (non-annualized) Sharpe and
+    the real observation count — the selector stores annualized Sharpe, so a
+    ×√252 mis-calibration here would fire the gate on everything.
+    """
+
+    @staticmethod
+    def _ev(name: str, returns) -> StrategyEvaluation:
+        r = [float(x) for x in returns]
+        ann = annualized_sharpe(r)  # what the selector actually stores
+        return StrategyEvaluation(
+            strategy_name=name, annual_return=0.1, max_drawdown=-0.05,
+            sharpe=ann, total_trades=len(r), score=0.0,
+            oos_annual_return=0.1, oos_max_drawdown=-0.05, oos_sharpe=ann,
+            oos_consistency=0.0, n_folds=3, oos_trades=len(r),
+            n_obs=len(r), oos_returns=r)
+
+    @classmethod
+    def _noise_ranking(cls, seed: int, n: int = 20):
+        rng = np.random.default_rng(seed)
+        evs = [cls._ev(f"n{i}", rng.normal(0.0, 0.01, 60)) for i in range(n)]
+        evs.sort(key=lambda e: e.oos_sharpe, reverse=True)  # lucky one first
+        for rank, e in enumerate(evs):
+            e.score = 100.0 - rank
+        return evs
+
+    @classmethod
+    def _edge_ranking(cls, seed: int, n: int = 20):
+        rng = np.random.default_rng(seed)
+        noise = [cls._ev(f"n{i}", rng.normal(0.0, 0.01, 60)) for i in range(n - 1)]
+        # Unambiguous edge: sr≈0.6/period over 250 obs → DSR≈0.998 even after
+        # the N-trial haircut (a 0.4/120-obs edge lands ~0.67 — realistically
+        # borderline, but too flaky to hang a unit test on).
+        edge = cls._ev("edge", rng.normal(0.006, 0.01, 250))
+        ranking = [edge] + noise
+        for rank, e in enumerate(ranking):
+            e.score = 100.0 - rank  # edge is the rank winner
+        return ranking
+
+    # -- calibration: the estimator itself --------------------------------
+    def test_dsr_low_for_best_of_n_noise(self):
+        ranking = self._noise_ranking(seed=42)
+        dsr = StrategySelector._winner_dsr(ranking[0], ranking, wf_enabled=True)
+        assert dsr is not None
+        assert dsr["dsr"] < 0.9, f"noise best-of-N DSR should be low, got {dsr['dsr']:.3f}"
+
+    def test_dsr_high_for_true_edge(self):
+        ranking = self._edge_ranking(seed=7)
+        dsr = StrategySelector._winner_dsr(ranking[0], ranking, wf_enabled=True)
+        assert dsr["dsr"] > 0.9, f"true edge DSR should be high, got {dsr['dsr']:.3f}"
+
+    def test_per_obs_sharpe_deannualizes(self):
+        """The load-bearing calibration knob: the scalar fallback must divide
+        the stored *annualized* Sharpe by √252. An annualized 15.87 is a
+        per-period 1.0; feeding 15.87 into per-period DSR math is nonsense."""
+        from quanti.backtest.overfit import sharpe_per_obs
+        scalar = StrategyEvaluation(  # no oos_returns → scalar fallback
+            "s", 0.1, -0.05, 0.0, 30, 0.0, oos_sharpe=math.sqrt(252.0),
+            n_folds=3, oos_trades=30, n_obs=200)
+        assert StrategySelector._per_obs_sharpe(scalar, wf_enabled=True) == \
+            pytest.approx(1.0)
+        # Returns path uses the series directly (no ÷√252 double-count).
+        series = StrategyEvaluation(
+            "s2", 0.1, -0.05, 0.0, 30, 0.0, n_folds=3, oos_trades=30,
+            oos_returns=[0.01, -0.005, 0.008, 0.002, 0.01])
+        assert StrategySelector._per_obs_sharpe(series, wf_enabled=True) == \
+            pytest.approx(sharpe_per_obs(series.oos_returns))
+
+    # -- wiring: does the gate actually move the weights? -----------------
+    def _run_pick_topk(self, monkeypatch, ranking, params):
+        selector = StrategySelector(None, None)
+        cands = [types.SimpleNamespace(name=e.strategy_name) for e in ranking]
+        monkeypatch.setattr(selector, "load_candidates", lambda: cands)
+        monkeypatch.setattr(selector, "evaluate", lambda *a, **k: ranking)
+        pairs, _ = selector.pick_topk(Goal(params=params), codes=["x"], k=3)
+        return pairs
+
+    def test_gate_reverts_noise_to_equal_weight(self, monkeypatch):
+        ranking = self._noise_ranking(seed=42)
+        # Gate OFF: lucky winner keeps a concentrated (unequal) softmax weight.
+        w_off = [w for _, w in self._run_pick_topk(
+            monkeypatch, ranking, {"dsr_gate": False})]
+        assert max(w_off) - min(w_off) > 1e-3, "gate off → softmax stays concentrated"
+        # Gate ON: low DSR → revert to equal weight.
+        w_on = [w for _, w in self._run_pick_topk(
+            monkeypatch, ranking, {"dsr_gate": True})]
+        assert all(abs(w - 1 / 3) < 1e-9 for w in w_on), \
+            f"gate on + low DSR → equal weight, got {w_on}"
+
+    def test_gate_keeps_true_edge_weight(self, monkeypatch):
+        ranking = self._edge_ranking(seed=7)
+        pairs = self._run_pick_topk(monkeypatch, ranking, {"dsr_gate": True})
+        weights = {s.name: w for s, w in pairs}
+        assert weights["edge"] == max(weights.values())
+        assert weights["edge"] > 1 / 3 + 1e-3, \
+            f"high-DSR edge should keep concentrated weight, got {weights}"
 
 
 def test_selector_engine_enables_protections(monkeypatch, seeded_long):
