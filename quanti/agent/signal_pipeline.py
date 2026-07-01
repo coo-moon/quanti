@@ -51,6 +51,7 @@ class FusedCandidate:
     contributing_strategies: list[str] = field(default_factory=list)
     dominant_strategy: str = ""  # argmax(weight×strength); owns the exit
     industry: str = ""
+    current_price: float = 0.0  # latest close; for lot-value (×100) / affordability context. 0 = unknown
 
     def to_signal(self, reason: str = "", strength: float | None = None) -> Signal:
         """Materialize into a Signal that PaperBroker can ingest.

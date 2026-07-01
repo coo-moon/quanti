@@ -24,6 +24,7 @@ from quanti.agent.goal import Goal, save_goal
 from quanti.agent.llm_runtime import (
     LLMConfig,
     LLMDecisionLoop,
+    _tools_schema,
     build_context_message,
     run_llm_decision,
 )
@@ -273,6 +274,36 @@ class TestContextBuilder:
             candidates=[], recent_decisions=[])
         assert "当前持仓: 空" in msg
         assert "本轮无候选股" in msg
+
+    def test_context_surfaces_limits_position_ratio_and_lot_value(self):
+        portfolio = {
+            "total_value": 1_000_000, "cash": 700_000, "market_value": 300_000,
+            "pnl_pct": 0.05,
+            "positions": [{"code": "000001", "name": "平安", "quantity": 10000,
+                           "avg_cost": 10.0, "current_price": 30.0,
+                           "market_value": 300_000, "pnl_pct": 2.0}],
+        }
+        cands = [FusedCandidate(code="600519", strategy_score=0.7, factor_score=1.0,
+                                final_score=0.8, industry="白酒", current_price=50.0)]
+        msg = build_context_message(
+            goal=Goal(), portfolio=portfolio, candidates=cands, recent_decisions=[],
+            risk_limits={"max_position_pct": 0.20, "max_industry_pct": 0.30,
+                         "max_daily_trades": 20, "portfolio_stop_loss_pct": -0.30,
+                         "lot_size": 100})
+        assert "当前仓位 30%" in msg          # market_value / total_value
+        assert "占比 30.0%" in msg            # per-position weight
+        assert "单票上限: 20%" in msg          # parameter-driven, not 10%
+        assert "≈¥200,000" in msg             # cap 元 value = total × 20%
+        assert "每手¥5,000" in msg            # 50.0 × 100 shares
+
+    def test_tools_schema_size_ceiling_is_parameter_driven(self):
+        def cap(schema):
+            po = next(t for t in schema if t["name"] == "propose_orders")
+            return po["input_schema"]["properties"]["orders"]["items"][
+                "properties"]["size_pct"]["maximum"]
+        assert cap(_tools_schema(0.10)) == 0.10
+        assert cap(_tools_schema(0.25)) == 0.25
+        assert cap(_tools_schema(0.0)) == 0.01   # floored so schema stays valid
 
 
 # ----- runtime integration -------------------------------------------

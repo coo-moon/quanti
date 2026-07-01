@@ -64,13 +64,19 @@ already hold heavily; don't pile into one industry.
 4. Call `propose_orders` exactly once with your final picks. Each order gets:
    - code: the stock code
    - direction: "buy" (sells are handled by stop-loss machinery, not you)
-   - size_pct: target weight as fraction of portfolio (0.01-0.10). The system \
-will further clamp this by single-stock risk limits.
+   - size_pct: target weight as fraction of portfolio. Stay within the \
+single-stock cap shown in the "限额" section of the context — the system \
+re-clamps every order by the single-stock / industry limits AFTER you, so a \
+size above the cap is just wasted. Size realistically: each candidate lists \
+its 现价 and 每手 (one A-share board lot = 100 shares), and the context gives \
+总资产 and 现金 — a buy must fund at least one whole lot, so don't propose a \
+size_pct whose 元 value (size_pct × 总资产) can't buy even one lot.
    - reason: ONE SHORT Chinese sentence (≤60 chars) explaining your call.
 
 Constraints you MUST respect:
   * NEVER propose more than 5 orders per tick.
-  * NEVER propose size_pct > 0.10 (risk manager caps anyway, but make it easy on it).
+  * NEVER propose size_pct above the single-stock cap in the "限额" section \
+(risk manager caps anyway, but make it easy on it).
   * NEVER propose orders for codes not in the candidate list — those haven't been vetted.
   * If you don't see attractive candidates, call propose_orders with an empty `orders=[]`. \
 That's a valid "wait" decision.
@@ -99,6 +105,7 @@ class LLMConfig:
     max_tool_iterations: int = 5
     max_candidates_in_context: int = 20
     max_decisions_in_context: int = 5
+    max_size_pct: float = 0.10  # LLM's per-order size ceiling; set from RiskConfig.max_position_pct so the limit is parameter-driven, not hard-coded
     temperature: float = 0.3  # mild creativity, mostly deterministic
     debate_enabled: bool = False     # run a Bull/Bear debate before judgment
     debate_rounds: int = 1           # Bull→Bear exchanges before the manager decides
@@ -210,64 +217,70 @@ class AnthropicLLMClient:
 
 # ----------------------------------------------------------- tool schemas
 
-TOOLS_SCHEMA = [
-    {
-        "name": "inspect_position",
-        "description": "Get current position details for a single stock "
-                       "(quantity, average cost, unrealized PnL).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Stock code, e.g. 000001"}
+def _tools_schema(max_size_pct: float = 0.10) -> list[dict]:
+    """Tool schemas for the decision loop. ``size_pct``'s upper bound is
+    parameter-driven (= RiskConfig.max_position_pct) so the LLM's expressible
+    size range tracks the configured single-stock cap instead of a hard-coded
+    0.10 — the limit is an input, not a constant."""
+    return [
+        {
+            "name": "inspect_position",
+            "description": "Get current position details for a single stock "
+                           "(quantity, average cost, unrealized PnL).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Stock code, e.g. 000001"}
+                },
+                "required": ["code"],
             },
-            "required": ["code"],
         },
-    },
-    {
-        "name": "inspect_decision_history",
-        "description": "Return the most recent N decisions made by the agent — "
-                       "useful for understanding why a position was opened or "
-                       "closed, or if a stock has been repeatedly losing.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "minimum": 1, "maximum": 20,
-                          "description": "How many recent decisions to fetch"}
+        {
+            "name": "inspect_decision_history",
+            "description": "Return the most recent N decisions made by the agent — "
+                           "useful for understanding why a position was opened or "
+                           "closed, or if a stock has been repeatedly losing.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20,
+                              "description": "How many recent decisions to fetch"}
+                },
+                "required": ["limit"],
             },
-            "required": ["limit"],
         },
-    },
-    {
-        "name": "propose_orders",
-        "description": "Submit final order proposals for this tick. Call exactly "
-                       "once to end the decision loop. Empty list = 'do nothing'.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "orders": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "code": {"type": "string"},
-                            "direction": {"type": "string", "enum": ["buy"]},
-                            "size_pct": {"type": "number",
-                                         "minimum": 0.01, "maximum": 0.10},
-                            "reason": {"type": "string", "maxLength": 80},
+        {
+            "name": "propose_orders",
+            "description": "Submit final order proposals for this tick. Call exactly "
+                           "once to end the decision loop. Empty list = 'do nothing'.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "orders": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "code": {"type": "string"},
+                                "direction": {"type": "string", "enum": ["buy"]},
+                                "size_pct": {"type": "number",
+                                             "minimum": 0.01,
+                                             "maximum": max(0.01, max_size_pct)},
+                                "reason": {"type": "string", "maxLength": 80},
+                            },
+                            "required": ["code", "direction", "size_pct", "reason"],
                         },
-                        "required": ["code", "direction", "size_pct", "reason"],
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "One paragraph (≤300 chars) explaining your "
+                                       "overall thinking for this tick. Shown in UI.",
                     },
                 },
-                "reasoning": {
-                    "type": "string",
-                    "description": "One paragraph (≤300 chars) explaining your "
-                                   "overall thinking for this tick. Shown in UI.",
-                },
+                "required": ["orders"],
             },
-            "required": ["orders"],
         },
-    },
-]
+    ]
 
 
 # ----------------------------------------------------------- decision loop
@@ -318,7 +331,7 @@ class LLMDecisionLoop:
                     model=self._cfg.model,
                     system=system_blocks,
                     messages=messages,
-                    tools=TOOLS_SCHEMA,
+                    tools=_tools_schema(self._cfg.max_size_pct),
                     max_tokens=self._cfg.max_tokens,
                     temperature=self._cfg.temperature,
                 )
@@ -570,6 +583,7 @@ def build_context_message(
     max_candidates: int = 20,
     max_decisions: int = 5,
     reflections: list[dict] | None = None,
+    risk_limits: dict | None = None,
 ) -> str:
     """Compact, deterministic textual context for the LLM.
 
@@ -585,32 +599,58 @@ def build_context_message(
     lines.append(f"- 调仓频率: {goal.rebalance_freq}")
     lines.append("")
 
+    total_v = float(portfolio.get("total_value", 0) or 0)
+    cash_v = float(portfolio.get("cash", 0) or 0)
+    mv_v = float(portfolio.get("market_value", total_v - cash_v) or 0)
     lines.append("# Portfolio")
-    lines.append(f"- 总资产: ¥{portfolio.get('total_value', 0):,.0f}")
-    lines.append(f"- 现金: ¥{portfolio.get('cash', 0):,.0f}")
+    lines.append(f"- 总资产: ¥{total_v:,.0f}")
+    if total_v > 0:
+        lines.append(f"- 现金: ¥{cash_v:,.0f} (可用 {cash_v / total_v:.0%})")
+        lines.append(f"- 持仓市值: ¥{mv_v:,.0f} (当前仓位 {mv_v / total_v:.0%})")
+    else:
+        lines.append(f"- 现金: ¥{cash_v:,.0f}")
     lines.append(f"- 累计盈亏: {portfolio.get('pnl_pct', 0):+.2%}")
     positions = portfolio.get("positions", []) or []
     if positions:
-        lines.append("- 当前持仓:")
+        lines.append("- 当前持仓 (占比 = 该票市值/总资产):")
         for p in sorted(positions, key=lambda p: p.get("code", "")):
+            w = (float(p.get("market_value", 0) or 0) / total_v) if total_v > 0 else 0.0
             lines.append(f"  - {p.get('code')} {p.get('name', '')} "
                          f"x{p.get('quantity', 0)} "
                          f"均价{p.get('avg_cost', 0):.2f} "
                          f"现价{p.get('current_price', 0):.2f} "
-                         f"盈亏 {p.get('pnl_pct', 0):+.2%}")
+                         f"盈亏 {p.get('pnl_pct', 0):+.2%} "
+                         f"占比 {w:.1%}")
     else:
         lines.append("- 当前持仓: 空")
     lines.append("")
+
+    # Hard limits — surfaced so the LLM sizes within them (the RiskManager
+    # re-enforces every one of these post-proposal regardless).
+    lot = int(risk_limits.get("lot_size", 100)) if risk_limits else 100
+    if risk_limits:
+        mp = float(risk_limits.get("max_position_pct", 0.10))
+        cap_amt = total_v * mp if total_v > 0 else 0.0
+        lines.append("# 限额 (硬约束 — 你提议后系统会再次强制收口,越界自动砍回)")
+        lines.append(f"- 单票上限: {mp:.0%}"
+                     + (f" (≈¥{cap_amt:,.0f})" if cap_amt else ""))
+        lines.append(f"- 行业上限: {float(risk_limits.get('max_industry_pct', 0.30)):.0%}")
+        lines.append(f"- 日内开仓上限: {int(risk_limits.get('max_daily_trades', 20))} 笔")
+        lines.append(f"- 组合回撤断路器: {float(risk_limits.get('portfolio_stop_loss_pct', -0.30)):.0%} (触发清仓停机)")
+        lines.append(f"- A股最小交易单位: 1 手 = {lot} 股,买入金额须为整手")
+        lines.append("")
 
     lines.append(f"# 候选股 (top {max_candidates}, 按 final_score 降序)")
     for c in candidates[:max_candidates]:
         sent = (f" 情绪={c.sentiment_score:+.2f}"
                 if getattr(c, "sentiment_score", 0.0) else "")
+        price = float(getattr(c, "current_price", 0.0) or 0.0)
+        px = f" 现价¥{price:.2f} 每手¥{price * lot:,.0f}" if price > 0 else ""
         lines.append(
             f"- {c.code} | final={c.final_score:.2f} "
             f"strat={c.strategy_score:.2f} factor={c.factor_score:+.2f}{sent} "
             f"行业={c.industry or '未知'} "
-            f"策略={'+'.join(c.contributing_strategies) or '无'}"
+            f"策略={'+'.join(c.contributing_strategies) or '无'}{px}"
         )
     if not candidates:
         lines.append("- (本轮无候选股)")
@@ -691,6 +731,26 @@ def run_llm_decision(
     portfolio = broker.snapshot_portfolio()
     recent = db.list_decisions(limit=cfg.max_decisions_in_context)
 
+    # Live risk limits → fed to the LLM as context AND used as the per-order
+    # size ceiling, so the cap is parameter-driven (RiskConfig.max_position_pct)
+    # rather than a hard-coded 0.10. The mechanical RiskManager still enforces
+    # every one of these downstream. Fail-soft to defaults if the config read
+    # blows up — defaults ARE the system's safety floor.
+    from quanti.risk.manager import RiskConfig, risk_config_from_dict
+    try:
+        rc = risk_config_from_dict(db.get_risk_config())
+    except Exception as e:  # noqa: BLE001 - config read must not break a tick
+        logger.warning(f"risk_config read failed, using defaults: {e}")
+        rc = RiskConfig()
+    cfg.max_size_pct = rc.max_position_pct
+    risk_limits = {
+        "max_position_pct": rc.max_position_pct,
+        "max_industry_pct": rc.max_industry_pct,
+        "max_daily_trades": rc.max_daily_trades,
+        "portfolio_stop_loss_pct": rc.portfolio_stop_loss_pct,
+        "lot_size": 100,
+    }
+
     # Outcome-keyed reflections: relevant past round-trips bound to realized
     # P&L, replacing pure "recent N" with "relevant N". Read-only, no LLM cost.
     reflections: list[dict] = []
@@ -705,7 +765,7 @@ def run_llm_decision(
     ctx = build_context_message(goal, portfolio, candidates, recent,
                                 max_candidates=cfg.max_candidates_in_context,
                                 max_decisions=cfg.max_decisions_in_context,
-                                reflections=reflections)
+                                reflections=reflections, risk_limits=risk_limits)
 
     # Optional Bull/Bear debate. The transcript is appended to the context so
     # the judgment loop below acts as the research manager weighing both sides.
@@ -748,8 +808,9 @@ def run_llm_decision(
         if code not in allowed_codes:
             rejection_reasons.append(f"LLM proposed {code} not in candidate set")
             continue
-        if not (0 < size_pct <= 0.10):
-            rejection_reasons.append(f"LLM proposed {code} with invalid size_pct={size_pct}")
+        if not (0 < size_pct <= cfg.max_size_pct):
+            rejection_reasons.append(
+                f"LLM proposed {code} size_pct={size_pct} outside (0, {cfg.max_size_pct:.2f}]")
             continue
         if str(o.get("direction", "")).lower() != "buy":
             rejection_reasons.append(f"LLM proposed non-buy for {code}")
