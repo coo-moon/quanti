@@ -10,7 +10,7 @@
   exposure[t] = 1 if nav[t-1] >= SMA_W(nav)[t-1] else 0(否则空仓吃现金 rf)。
 现金收益故意设 0(不粉饰叠加;真实货基 ~1.5%/y 只会让叠加更好看)。
 
-网格 W∈{3..12} 月。先验固定 W=10(≈200 交易日经典趋势)报 OOS,再用整网格算 PBO——
+网格 W∈{3..12} 月。先验固定 W=10 月(≈145 交易日,趋势中周期)报 OOS,再用整网格算 PBO——
 若"挑最优窗口"就是过拟合,PBO 会接近 0.5。
 
 用法:.venv/bin/python scripts/candidate_stability.py [--start --end --pools 1000,100]

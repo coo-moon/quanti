@@ -135,10 +135,12 @@ def pbo_cscv(perf_matrix, n_splits: int = 16) -> dict:
     blocks = [M[i*block:(i+1)*block] for i in range(S)]
 
     def _sharpe(rows):  # 每列的每期Sharpe
+        # ddof=1 与 PSR/DSR 口径一致。注:同一 block-set 内所有列行数相同,
+        # ddof 只是全列共有的常数缩放 → 不改 argmax/排名 → 对 PBO 数值零影响;
+        # 统一口径纯为可读性,避免复核者误判为"漏检过拟合"。
         mu = rows.mean(axis=0)
-        sd = rows.std(axis=0, ddof=0)
-        out = np.where(sd > 0, mu / sd, 0.0)
-        return out
+        sd = rows.std(axis=0, ddof=1)
+        return np.where(sd > 0, mu / sd, 0.0)
 
     logits, overfit = [], 0
     all_idx = set(range(S))
