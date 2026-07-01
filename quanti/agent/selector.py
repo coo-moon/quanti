@@ -23,7 +23,8 @@ The "best" score blends:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -32,6 +33,11 @@ from quanti.agent.goal import Goal, RiskTolerance
 from quanti.agent.params import resolve_params
 from quanti.agent.walk_forward import run_walk_forward
 from quanti.backtest.engine import BacktestEngine
+from quanti.backtest.overfit import (
+    deflated_sharpe_from_stats,
+    deflated_sharpe_ratio,
+    sharpe_per_obs,
+)
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.risk.manager import RiskConfig, RiskManager
@@ -47,6 +53,17 @@ logger = logging.getLogger(__name__)
 # components nor gets softmax capital weight (overrideable via goal.params
 # "wf_min_oos_trades"). Real money shouldn't ride a 2-trade Sharpe.
 _MIN_OOS_TRADES = 10
+
+# Periods/year used to annualize Sharpe (metrics.annualized_sharpe uses 252).
+# DSR math is per-period, so we divide the stored *annualized* oos_sharpe back
+# by √252 before feeding it to the deflated-Sharpe estimator. Getting this
+# wrong mis-calibrates DSR badly (a √252≈15.9× error in the Sharpe).
+_TRADING_DAYS = 252.0
+
+# Below this the pooled-OOS DSR gate is off: the softmax winner keeps its
+# multiple-testing haircut only when we tried enough distinct strategies for
+# expected_max_sharpe to mean anything (needs ≥2 trials to have any dispersion).
+_MIN_DSR_TRIALS = 2
 
 
 @dataclass
@@ -65,6 +82,12 @@ class StrategyEvaluation:
     oos_consistency: float = 0.0
     n_folds: int = 0
     oos_trades: int = 0   # total OOS trades across folds (confidence guard)
+    # Observation count backing the Sharpe used for DSR: pooled OOS bars (WF)
+    # or IS trading days (no-WF). Real T for the deflated-Sharpe estimator.
+    n_obs: int = 0
+    # Pooled OOS daily returns across folds. Kept off as_dict() (audit bloat);
+    # feeds the most-accurate DSR path (real skew/kurt) in pick_topk.
+    oos_returns: list[float] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -80,6 +103,7 @@ class StrategyEvaluation:
             "oos_consistency": self.oos_consistency,
             "n_folds": self.n_folds,
             "oos_trades": self.oos_trades,
+            "n_obs": self.n_obs,
         }
 
 
@@ -159,6 +183,8 @@ class StrategySelector:
                     sharpe=float(m.get("sharpe_ratio", 0) or 0),
                     total_trades=len(is_bt.trades),
                     score=0.0,
+                    # IS obs count — the T for the no-WF DSR fallback.
+                    n_obs=int(m.get("trading_days", 0) or 0),
                 )
                 if wf_enabled:
                     # Fresh instance per fold via factory. `copy.copy` is
@@ -180,6 +206,13 @@ class StrategySelector:
                     ev.oos_consistency = wf.oos_consistency
                     ev.n_folds = len(wf.folds)
                     ev.oos_trades = wf.total_trades_oos
+                    # Pooled OOS returns (concat across folds) drive the most
+                    # accurate DSR path; real T = their count.
+                    pooled: list[float] = []
+                    for fr in wf.folds:
+                        pooled.extend(fr.oos_returns)
+                    ev.oos_returns = pooled
+                    ev.n_obs = len(pooled)
                 ev.score = self._score(ev, goal)
                 return ev
             except Exception as e:
@@ -247,11 +280,35 @@ class StrategySelector:
             # Soft-temperature weighting. temp=1.0 (was 0.5) flattens the
             # allocation so a noisy Sharpe edge — estimated from short OOS
             # windows — doesn't concentrate most of the capital into one pick.
-            import math
             temp = 1.0
             exps = [math.exp(s / temp) for s in sharpes]
             ze = sum(exps)
             weights = [e / ze for e in exps]
+
+        # --- DSR multiple-testing deflation (diagnostic always; gate opt-in) ---
+        # The softmax above hands concentrated capital to the rank winner on a
+        # Sharpe estimated from short OOS windows — the exact "selection is
+        # noise" pathology the 2026-07-01 audit flagged. Deflate the winner's
+        # Sharpe by how many strategies we tried (N candidates = the
+        # multiple-testing family): a best-of-N fluke earns a low deflated-Sharpe
+        # probability. Gate is opt-in (dsr_gate, default off) until the logged
+        # DSR confirms it's calibrated and not mis-firing; on trip we revert the
+        # whole top-K to equal weight (zeroes the winner's concentration edge,
+        # a strict overlay on the existing min-OOS-trades confidence guard).
+        dsr = self._winner_dsr(top[0], ranking, wf_enabled)
+        if dsr is not None:
+            logger.info(
+                "selector DSR: winner=%s dsr=%.3f sr_obs=%.4f sr0=%.4f "
+                "n_trials=%d n_obs=%d weights=%s", top[0].strategy_name,
+                dsr["dsr"], dsr["sr_observed"], dsr["sr0_benchmark"],
+                dsr["n_trials"], dsr["n_obs"], [round(w, 3) for w in weights])
+            if bool(params.get("dsr_gate", False)):
+                dsr_min = float(params.get("dsr_min", 0.90))
+                if dsr["dsr"] < dsr_min:
+                    logger.info("selector DSR gate: winner %s DSR %.3f < %.2f "
+                                "→ revert to equal weight",
+                                top[0].strategy_name, dsr["dsr"], dsr_min)
+                    weights = [1.0 / len(top)] * len(top)
 
         pairs: list[tuple[BaseStrategy, float]] = []
         by_name = {s.name: s for s in candidates}
@@ -260,6 +317,48 @@ class StrategySelector:
             if strat is not None:
                 pairs.append((strat, w))
         return pairs, ranking
+
+    # -------------------------------------------------------------- DSR gate
+    @staticmethod
+    def _per_obs_sharpe(ev: StrategyEvaluation, wf_enabled: bool) -> float:
+        """Per-period (NON-annualized) Sharpe for DSR math.
+
+        Prefer the pooled OOS return series (exact). Else de-annualize the
+        stored Sharpe by ÷√252 — the stored oos_sharpe/sharpe are annualized
+        (metrics.annualized_sharpe ×√252) but DSR is a per-period quantity.
+        """
+        if len(ev.oos_returns) >= 3:
+            return sharpe_per_obs(ev.oos_returns)
+        ann = ev.oos_sharpe if (wf_enabled and ev.n_folds > 0) else ev.sharpe
+        return ann / math.sqrt(_TRADING_DAYS)
+
+    @staticmethod
+    def _winner_dsr(winner: StrategyEvaluation,
+                    ranking: list[StrategyEvaluation],
+                    wf_enabled: bool) -> dict | None:
+        """Deflated Sharpe of the rank winner vs the full N-candidate trial set.
+
+        The N candidates ARE the multiple-testing family (selection breadth);
+        their per-obs Sharpe dispersion sets how high a best-of-N fluke can
+        reach. Returns the DSR info dict (with `n_obs`), or None when there
+        aren't enough trials or observations to estimate it. Uses the pooled
+        OOS returns when present (real skew/kurt, real T — most accurate) and
+        falls back to summary stats for the no-WF scalar case.
+        """
+        trials = [StrategySelector._per_obs_sharpe(ev, wf_enabled)
+                  for ev in ranking]
+        if len(trials) < _MIN_DSR_TRIALS:
+            return None
+        if len(winner.oos_returns) >= 3:
+            info = deflated_sharpe_ratio(winner.oos_returns, trials)
+        elif winner.n_obs >= 3:
+            info = deflated_sharpe_from_stats(
+                StrategySelector._per_obs_sharpe(winner, wf_enabled),
+                winner.n_obs, trials)
+        else:
+            return None
+        info["n_obs"] = winner.n_obs
+        return info
 
     # ------------------------------------------------------------ scoring
     @staticmethod
