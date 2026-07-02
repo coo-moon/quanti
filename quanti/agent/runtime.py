@@ -926,19 +926,25 @@ class AgentRuntime:
             from quanti.agent.universe import sort_by_adv20
             candidates = sort_by_adv20(self._provider, universe)[:take]
             # Observability for the silent beta this fallback fixes: top-N by
-            # liquidity == a large-cap book. Regime-split validation
-            # (2026-06-26, scripts/breadth_regime.py) shows breadth is a
-            # regime-dependent BETA CHOICE, not a free optimization — the
-            # ADV100/300/1000 ranking flips by regime:
-            #   micro-cap crash (2024-01): ADV100 -14% vs ADV1000 -31% (large
-            #     caps protect hard);  large-cap recovery (24-07~): ADV100 +43%
-            #     vs ADV1000 +36%;  small-cap regime (21~23): ADV1000 -19% vs
-            #     ADV100 -27%;  full 5y: ~tied (ADV1000 -2.5% / -53% DD vs
-            #     ADV100 -3.2% / -58% DD).
-            # Keep the large-cap default: it's the tail-protective posture and
-            # this system's edge is drawdown control, not alpha. But log it
-            # once/day so the operator sees the beta they're running and can
-            # widen via no_screener_take if they want small-cap exposure.
+            # liquidity == a large-cap book. Pool-width sweep + adversarial
+            # validation (2026-07-02, scripts/baseline_returns.py, memory
+            # adv-pool-width-findings) settled the "should we widen?" question:
+            #   * Equal-weight paper gradient is monotone-wider-is-better
+            #     (full market +11.5%/yr Sharpe 0.59 vs ADV100 -2.2%/yr), but
+            #     it is EQUAL-WEIGHT SMALL-CAP SIZE BETA, not liquidity
+            #     quality: cap-weighting the same pools collapses the gradient
+            #     (ADV100 and ADV1000 both ≈ +4%/yr) and full-market
+            #     equal-weight capacity is ~¥2.7亿 (untradable microcap tail;
+            #     ADV100 ≈ ¥134亿, ADV1000 ≈ ¥264亿).
+            #   * Ranking flips by regime — wide pools win only in the
+            #     21~23 small-cap bear; micro-cap crash (2024-01: full market
+            #     -13%/mo, intramonth -29.7% vs ADV100 -2.7%) and 2026H1
+            #     (full market +2.1% vs ADV100 +38.1%) flip to narrow-best.
+            # Keep the large-cap default: it's the tradable, tail-protective
+            # posture, and the paper alpha it "gives up" cannot absorb real
+            # capital. But log it once/day so the operator sees the beta
+            # they're running and can widen via no_screener_take — knowing
+            # that's a regime bet, not a free optimization.
             today = date.today()
             if self._candidate_source_logged != today:
                 self._candidate_source_logged = today
@@ -946,7 +952,8 @@ class AgentRuntime:
                     "candidate_source",
                     f"无 screener:取 ADV 前 {take} 只 = 大盘 beta(防御:微盘踩踏回撤更小)。"
                     f"放宽 no_screener_take 纳中小盘在小盘行情更强、微盘崩盘尾部更大——"
-                    f"是 regime 押注、非免费优化。",
+                    f"是 regime 押注、非免费优化;宽池等权的纸面超额是不可交易的"
+                    f"小盘 size beta(2026-07 验证,scripts/baseline_returns.py)。",
                     details={"no_screener_take": take, "universe": len(universe)})
 
         # Observe-only active-vs-passive guardrail: once/day, compare the
