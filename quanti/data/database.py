@@ -1022,6 +1022,30 @@ class Database:
         row = self.conn.execute("SELECT MAX(date) FROM daily_quotes").fetchone()
         return self._safe_quote_date(row[0]) if row else None
 
+    def get_market_latest_quote_date(self, min_coverage: float = 0.5,
+                                     window: int = 120) -> date | None:
+        """Newest bar date backed by a market-wide sync, not a stray per-code
+        top-up: the latest date whose row count reaches `min_coverage` of the
+        busiest day among the most recent `window` distinct dates. A bare
+        MAX(date) let 1-2 manually-synced codes mark the whole library fresh
+        while 5000+ codes sat a trading day behind (the by-date top-up then
+        never ran). Single-code/watchlist DBs degrade gracefully: every date
+        is a "full" day there, so this equals the global MAX."""
+        rows = self.conn.execute(
+            "SELECT date, COUNT(*) FROM daily_quotes "
+            "GROUP BY date ORDER BY date DESC LIMIT ?",
+            (window,),
+        ).fetchall()
+        counts = [(self._safe_quote_date(r[0]), int(r[1])) for r in rows]
+        counts = [(d, n) for d, n in counts if d is not None]
+        if not counts:
+            return None
+        full = max(n for _, n in counts)
+        for d, n in counts:  # newest → oldest
+            if n >= min_coverage * full:
+                return d
+        return None  # unreachable: the busiest day always qualifies
+
     def get_latest_quote_before(self, code: str, d: date
                                 ) -> tuple[float, float] | None:
         """(raw close, adj_factor) of `code`'s newest bar strictly before `d`,

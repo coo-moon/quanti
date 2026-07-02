@@ -612,7 +612,12 @@ class BackgroundQuoteSyncer:
         sleep so the outer loop just `continue`s."""
         cfg = self._cfg
         expected = expected_latest_bar(self._now())
-        latest = self._db.get_global_latest_quote_date()
+        # Market-wide latest, NOT the bare MAX(date): a couple of codes synced
+        # per-code (manual /api/sync/quotes, agent tick) already carry today's
+        # bar, and a global MAX would call the library fresh while the other
+        # 5000+ codes sit on yesterday — both the freshness gate below and the
+        # missing-days range start from this value.
+        latest = self._db.get_market_latest_quote_date()
 
         if latest is None:
             # Empty library — a multi-year bulk load belongs in the explicit,

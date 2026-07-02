@@ -577,6 +577,36 @@ class TestByDateFastPath:
         assert "失败" in (syncer.status().last_error or "")
         db.close()
 
+    def test_per_code_fresh_bars_do_not_mask_market_staleness(self, tmp_path):
+        """Regression (2026-07-02): manual /api/sync/quotes and the agent's
+        _ensure_recent_data wrote TODAY's bar for 1-2 codes, pushing the
+        global MAX(date) to `expected` — the by-date top-up then idled
+        forever while 5000+ codes sat on yesterday's bar. Freshness must
+        follow the market-wide latest, not a stray per-code top-up."""
+        clock = datetime(2024, 6, 12, 16, 0)      # Wed post-close → exp 06-12
+        db = Database(str(tmp_path / "mask.db"))
+        db.initialize()
+        codes = [f"{i:06d}" for i in range(20)]
+        db.save_daily_quotes(pd.DataFrame({       # whole market at Tue 06-11
+            "code": codes, "date": date(2024, 6, 11),
+            "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+            "volume": 1.0, "amount": 1.0, "turnover": 0.0}))
+        db.save_daily_quotes(pd.DataFrame({       # 2 codes topped up per-code
+            "code": codes[:2], "date": date(2024, 6, 12),
+            "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+            "volume": 1.0, "amount": 1.0, "turnover": 0.0}))
+        adapter = ByDateStubAdapter(db)
+        syncer = BackgroundQuoteSyncer(
+            db=db, adapter_factory=lambda: adapter, now_fn=lambda: clock,
+            config=BackgroundSyncConfig(by_date_sleep_sec=0.0,
+                                        batch_idle_sec=0.0,
+                                        idle_interval_sec=0))
+        syncer._process_by_date(adapter)
+        # Must top up 06-12 for the whole market (and only 06-12 — the
+        # market-latest 06-11 is already complete).
+        assert adapter.by_date_calls == [date(2024, 6, 12)]
+        db.close()
+
     def test_far_behind_caps_to_max_topup(self, tmp_path):
         clock = datetime(2024, 6, 28, 16, 0)         # Fri
         db = self._db_at(tmp_path, date(2024, 1, 2))  # ~6 months behind
