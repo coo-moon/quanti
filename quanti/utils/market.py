@@ -113,6 +113,39 @@ def next_trading_day(after: date,
     return d
 
 
+# Opening call auction matches at 09:25 — before that moment today's open
+# price does not exist yet, and a fresh order still joins today's auction.
+PRE_OPEN_CUTOFF = time(9, 25)
+
+
+def order_decision_date(created_at: datetime,
+                        provider: Optional[DataProvider] = None) -> date:
+    """Trading day whose data an order's decision was based on.
+
+    The agent's 23:30 daily cycle runs a ~2h pipeline, so its orders are
+    often stamped past midnight (e.g. 01:32 on day D) although they were
+    decided on D-1's close. Dating them D makes `next_trading_bar`
+    (strictly-greater) skip D's bar and adds a full extra trading day of
+    lag vs the designed next-session OPEN fill.
+
+    Any order created before the 09:25 auction match therefore belongs to
+    the PREVIOUS trading day: it can still join day D's open auction, and
+    D's open is unknown at creation time, so filling it on D's bar is not
+    look-ahead. Orders created at/after 09:25 keep their wall-clock date.
+    """
+    dt = _to_beijing(created_at)
+    if dt.time() >= PRE_OPEN_CUTOFF:
+        return dt.date()
+    d = dt.date() - timedelta(days=1)
+    # Bounded like next_trading_day: 14 calendar days covers the longest
+    # A-share holiday stretch.
+    for _ in range(14):
+        if is_trading_day(d, provider):
+            return d
+        d -= timedelta(days=1)
+    return d
+
+
 def next_trading_bar(provider: DataProvider, code: str,
                      after_date: date) -> Optional[BarData]:
     """Earliest available bar for `code` with date > `after_date`.

@@ -104,7 +104,17 @@ UI:
 * ❌ 部分成交 — status=PARTIAL 枚举存在但不用。pending 要么全成要么全不成。
 * ❌ BacktestEngine 改动。回测路径保持现状(自身已是 bar-by-bar)。
 
-## 验收 Gate
+## 追记 2026-07-02: created_date = 决策数据基准日
+
+agent `daily_run_time=23:30` 启动 LLM cycle,流水线 ~2h,订单 `created_at`
+常落在次日凌晨(如 01:32)。原实现直接取 `created_at` 的墙钟日期做
+`next_trading_bar` 的 `after_date`(严格大于),导致基于 07-01 收盘的信号
+最早 07-03 开盘成交——比本设计(次日 OPEN、滞后 1 个交易日)多滞后一天。
+
+修复: `quanti/utils/market.py::order_decision_date` — 凌晨(<09:25 集合竞价
+撮合前)创建的订单归属上一交易日;09:25 后保持墙钟日期。无前视:当日开盘价
+在 09:25 前不存在,该订单仍可参与当日竞价。TTL 同步按决策日计龄(跨午夜的
+单早一天过期,与其数据实际年龄一致)。
 
 * `pytest -q` 仍全过(168 → 170+ 新测试)。
 * 重启 server 后,18:00 的 tick 不再产生 `trade` 记录,但产生 `order_queued`。

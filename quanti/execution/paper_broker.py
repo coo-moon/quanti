@@ -48,6 +48,7 @@ from quanti.utils.market import (
     max_fill_shares,
     next_trading_bar,
     next_trading_day,
+    order_decision_date,
     prev_bar_close,
     tradable_at_close,
     tradable_at_open,
@@ -355,7 +356,14 @@ class PaperBroker:
         for o in pending:
             created_at = o.get("created_at", "")
             try:
-                created_date = datetime.fromisoformat(created_at).date()
+                # Decision-data day, not the wall-clock date: the 23:30 agent
+                # cycle stamps orders past midnight, and dating those rows by
+                # wall clock would push the fill a full extra trading day out
+                # (next_trading_bar is strictly-greater). TTL ages from the
+                # same day, so a spilled-over order also expires one day
+                # sooner — consistent with how old its data actually is.
+                created_date = order_decision_date(
+                    datetime.fromisoformat(created_at), self._provider)
             except (ValueError, TypeError):
                 # Bad row, can't reason about TTL — cancel and move on.
                 self._db.update_order_status(o["order_id"], "cancelled",
@@ -459,7 +467,10 @@ class PaperBroker:
         for o in self._db.list_orders(limit=1000, status="pending"):
             created_at = o.get("created_at", "")
             try:
-                created_date = datetime.fromisoformat(created_at).date()
+                # Same decision-day attribution as try_fill_pending_orders,
+                # so the advertised fill date matches what the scanner does.
+                created_date = order_decision_date(
+                    datetime.fromisoformat(created_at), self._provider)
             except (ValueError, TypeError):
                 created_date = None
 
