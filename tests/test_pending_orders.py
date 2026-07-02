@@ -143,6 +143,22 @@ def _append_new_bar(db, code, days_from_today_back=0,
     db.save_daily_quotes(df)
 
 
+def _backdate_pending(db, days: int = 1) -> datetime:
+    """Rewrite every pending order's created_at to NOON `days` ago.
+
+    Noon matters: order_decision_date re-attributes pre-09:25 timestamps to
+    the previous trading day, so a backdate carrying the suite's wall-clock
+    time would shift by an extra day when tests run in the early morning.
+    Pinning to 12:00 keeps decision date == calendar date at any run time.
+    """
+    ts = (datetime.now() - timedelta(days=days)).replace(
+        hour=12, minute=0, second=0, microsecond=0)
+    db.conn.execute("UPDATE orders SET created_at=? WHERE status='pending'",
+                    (ts.isoformat(),))
+    db.conn.commit()
+    return ts
+
+
 class TestEntryStrategyPlumbing:
     def test_entry_strategy_survives_queue_to_position(self, seeded_pending):
         """A buy signal's entry_strategy must travel signal → order row →
@@ -157,10 +173,7 @@ class TestEntryStrategyPlumbing:
         # Stored on the pending order row.
         assert db.list_orders(status="pending")[0]["entry_strategy"] == "turtle_breakout"
         # Backdate + new bar so it fills.
-        db.conn.execute(
-            "UPDATE orders SET created_at=? WHERE code='AAA' AND status='pending'",
-            ((datetime.now() - timedelta(days=1)).isoformat(),))
-        db.conn.commit()
+        _backdate_pending(db)
         _append_new_bar(db, "AAA", days_from_today_back=0,
                         open_price=11.0, close_price=11.1)
         broker.try_fill_pending_orders()
@@ -199,10 +212,7 @@ class TestFilling:
         # Sanity: queued, not filled
         assert len(db.list_orders(status="pending")) == 1
         # Backdate created_at to yesterday so today's new bar is "after"
-        db.conn.execute(
-            "UPDATE orders SET created_at=? WHERE code='AAA' AND status='pending'",
-            ((datetime.now() - timedelta(days=1)).isoformat(),))
-        db.conn.commit()
+        _backdate_pending(db)
 
         # Append today's bar with a clean OPEN = 11.00 we can recognize.
         _append_new_bar(db, "AAA", days_from_today_back=0,
@@ -231,6 +241,10 @@ class TestFilling:
         sig = Signal(stock_code="AAA", direction=Direction.BUY,
                      strength=0.5, reason="queue")
         broker.execute_signal(sig, "test")
+        # Pin created_at to noon: an early-morning (<09:25) suite run would
+        # otherwise re-attribute the order to the previous session, where the
+        # fixture's synthetic weekend bars could satisfy next_trading_bar.
+        _backdate_pending(db, days=0)
         result = broker.try_fill_pending_orders()
         assert result.scanned == 1
         assert result.filled == 0
@@ -255,10 +269,7 @@ class TestRiskAtFill:
                      strength=0.9, reason="queue")
         broker.execute_signal(sig, "test")
         # Backdate so today's bar is "after" the order
-        db.conn.execute(
-            "UPDATE orders SET created_at=? WHERE code='AAA' AND status='pending'",
-            ((datetime.now() - timedelta(days=1)).isoformat(),))
-        db.conn.commit()
+        _backdate_pending(db)
         # Zero out cash
         db.update_cash(0.0)
         _append_new_bar(db, "AAA", days_from_today_back=0,
@@ -285,10 +296,7 @@ class TestTTL:
                      strength=0.3, reason="queue")
         broker.execute_signal(sig, "test")
         # Backdate created_at so the TTL math triggers
-        db.conn.execute(
-            "UPDATE orders SET created_at=? WHERE code='BBB'",
-            ((datetime.now() - timedelta(days=10)).isoformat(),))
-        db.conn.commit()
+        _backdate_pending(db, days=10)
         result = broker.try_fill_pending_orders()
         # BBB has no new bar past created date → expired
         assert result.expired == 1
@@ -296,6 +304,178 @@ class TestTTL:
         assert len(cancelled) == 1
         # Decision log
         assert len(db.list_decisions(kind="order_expired_pending")) == 1
+
+
+# --- decision-date attribution (midnight-spillover fix) --------------------
+
+class TestOrderDecisionDate:
+    """`order_decision_date` maps an order's wall-clock created_at to the
+    trading day whose data the decision was based on.
+
+    The agent's 23:30 daily cycle spills past midnight (~2h pipeline), so an
+    order stamped 01:32 on day D was decided on D-1's close. Dating it D made
+    `next_trading_bar` (strictly-greater) skip D's bar → an extra trading day
+    of lag vs the design (next-session OPEN fill). Anything created before the
+    09:25 opening-auction match belongs to the previous session; D's open is
+    still unknown then, so filling on D's bar is not look-ahead.
+
+    Fixed 2026 calendar: 07-01 Wed, 07-02 Thu, 07-04 Sat, 07-06 Mon.
+    """
+
+    def test_same_night_keeps_wall_clock_date(self):
+        from quanti.utils.market import order_decision_date
+        assert order_decision_date(datetime(2026, 7, 1, 23, 45)) == date(2026, 7, 1)
+
+    def test_past_midnight_attributes_to_previous_trading_day(self):
+        from quanti.utils.market import order_decision_date
+        assert order_decision_date(datetime(2026, 7, 2, 1, 32)) == date(2026, 7, 1)
+
+    def test_intraday_keeps_wall_clock_date(self):
+        from quanti.utils.market import order_decision_date
+        assert order_decision_date(datetime(2026, 7, 2, 10, 0)) == date(2026, 7, 2)
+
+    def test_cutoff_boundary_at_auction_match(self):
+        from quanti.utils.market import order_decision_date
+        # 09:25 is when the opening auction matches — from that moment
+        # today's open is knowable, so the order keeps its wall-clock date.
+        assert order_decision_date(datetime(2026, 7, 2, 9, 25)) == date(2026, 7, 2)
+        assert order_decision_date(datetime(2026, 7, 2, 9, 24, 59)) == date(2026, 7, 1)
+
+    def test_saturday_early_morning_attributes_to_friday(self):
+        from quanti.utils.market import order_decision_date
+        assert order_decision_date(datetime(2026, 7, 4, 1, 32)) == date(2026, 7, 3)
+
+    def test_monday_early_morning_skips_weekend(self):
+        from quanti.utils.market import order_decision_date
+        assert order_decision_date(datetime(2026, 7, 6, 1, 32)) == date(2026, 7, 3)
+
+
+@pytest.fixture
+def fixed_calendar_pending(tmp_path):
+    """Fixed-calendar variant of `seeded_pending` for the midnight-spillover
+    tests: AAA has bars 2026-06-29 (Mon) .. 2026-07-01 (Wed), all dates
+    hard-coded so assertions don't depend on when the suite runs."""
+    db = Database(str(tmp_path / "fx.db"))
+    db.initialize()
+    db.upsert_stock("AAA", "alpha", "SZ", date(1991, 4, 3), "test")
+    days = [date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1)]
+    prices = [10.0, 10.05, 10.10]
+    df = pd.DataFrame({
+        "code": "AAA",
+        "date": days,
+        "open": [p - 0.02 for p in prices],
+        "high": [p + 0.05 for p in prices],
+        "low": [p - 0.05 for p in prices],
+        "close": prices,
+        "volume": np.full(3, 5_000_000.0),
+        "amount": [p * 5_000_000 for p in prices],
+        "turnover": np.full(3, 1.0),
+    })
+    db.save_daily_quotes(df)
+    provider = DataProvider(db)
+    yield db, provider
+    db.close()
+
+
+def _set_created_at(db, iso_ts: str) -> None:
+    db.conn.execute("UPDATE orders SET created_at=? WHERE status='pending'",
+                    (iso_ts,))
+    db.conn.commit()
+
+
+def _append_bar_on(db, code, d, open_price, close_price):
+    df = pd.DataFrame([{
+        "code": code, "date": d,
+        "open": open_price, "high": close_price + 0.1,
+        "low": open_price - 0.1, "close": close_price,
+        "volume": 5_000_000.0,
+        "amount": close_price * 5_000_000,
+        "turnover": 1.0,
+    }])
+    db.save_daily_quotes(df)
+
+
+class TestMidnightSpilloverFill:
+    """An order stamped past midnight (23:30 cycle + ~2h pipeline) must fill
+    at the SAME day's open — the design's next-session fill for a decision
+    made on the previous close — not slip an extra trading day."""
+
+    def test_past_midnight_order_fills_on_same_days_bar(self, fixed_calendar_pending):
+        """Order stamped 07-02 01:32 (decided on 07-01 close) + the 07-02 bar
+        arrives → fills at the 07-02 OPEN. Wall-clock dating would demand a
+        bar > 07-02 and slip the fill to 07-03."""
+        db, provider = fixed_calendar_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending", slippage=0.001)
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY,
+                   strength=0.5, reason="llm cycle"), "llm")
+        _set_created_at(db, "2026-07-02T01:32:00")
+        _append_bar_on(db, "AAA", date(2026, 7, 2),
+                       open_price=10.20, close_price=10.30)
+
+        result = broker.try_fill_pending_orders()
+        assert result.filled == 1, \
+            f"expected same-day fill, got {result}"
+        trades = db.list_trades()
+        assert len(trades) == 1
+        assert trades[0]["trade_date"] == "2026-07-02"
+        # Filled at the 07-02 open + slippage, not any later bar.
+        assert trades[0]["price"] == pytest.approx(10.20 * 1.001, rel=1e-6)
+
+    def test_same_night_order_still_fills_next_session(self, fixed_calendar_pending):
+        """Control: a pipeline that finishes BEFORE midnight (23:45) keeps the
+        existing behavior — decision day 07-01, fill on the 07-02 bar."""
+        db, provider = fixed_calendar_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending", slippage=0.001)
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY,
+                   strength=0.5, reason="llm cycle"), "llm")
+        _set_created_at(db, "2026-07-01T23:45:00")
+        _append_bar_on(db, "AAA", date(2026, 7, 2),
+                       open_price=10.20, close_price=10.30)
+
+        result = broker.try_fill_pending_orders()
+        assert result.filled == 1
+        assert db.list_trades()[0]["trade_date"] == "2026-07-02"
+
+    def test_past_midnight_order_never_fills_on_known_bar(self, fixed_calendar_pending):
+        """No look-ahead: at 07-02 01:32 the newest bar on disk is 07-01 —
+        already known when the order was created — so it must NOT fill until
+        a genuinely newer bar arrives."""
+        db, provider = fixed_calendar_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending")
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY,
+                   strength=0.5, reason="llm cycle"), "llm")
+        _set_created_at(db, "2026-07-02T01:32:00")
+        # No 07-02 bar appended.
+        result = broker.try_fill_pending_orders()
+        assert result.filled == 0
+        assert db.list_trades() == []
+
+    def test_detail_expected_fill_date_uses_decision_day(self, fixed_calendar_pending):
+        """UI: the 07-02 01:32 order should advertise 07-02 as its expected
+        fill date (next session after the 07-01 decision day), not 07-03."""
+        db, provider = fixed_calendar_pending
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending")
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY,
+                   strength=0.5, reason="llm cycle"), "llm")
+        _set_created_at(db, "2026-07-02T01:32:00")
+
+        d = broker.pending_orders_detail()[0]
+        assert d["bar_available"] is False        # 07-02 bar not on disk yet
+        assert d["expected_fill_date"] == "2026-07-02"
+
+        _append_bar_on(db, "AAA", date(2026, 7, 2),
+                       open_price=10.20, close_price=10.30)
+        d = broker.pending_orders_detail()[0]
+        assert d["bar_available"] is True
+        assert d["expected_fill_date"] == "2026-07-02"
 
 
 # --- limit-up/down tradability gate (audit C3) ---------------------------
@@ -306,10 +486,7 @@ class TestLimitTradabilityGate:
     backtest already gated this; these pin the broker to the same rule."""
 
     def _backdate(self, db):
-        db.conn.execute(
-            "UPDATE orders SET created_at=? WHERE status='pending'",
-            ((datetime.now() - timedelta(days=1)).isoformat(),))
-        db.conn.commit()
+        _backdate_pending(db)
 
     def test_pending_buy_blocked_by_limit_up(self, seeded_pending):
         db, provider = seeded_pending
@@ -396,6 +573,8 @@ class TestPendingDetail:
         broker.execute_signal(
             Signal(stock_code="AAA", direction=Direction.BUY,
                    strength=0.5, reason="排队测试"), "test")
+        # Noon pin — see test_no_new_bar_keeps_pending.
+        _backdate_pending(db, days=0)
         detail = broker.pending_orders_detail()
         assert len(detail) == 1
         d = detail[0]
@@ -419,10 +598,7 @@ class TestPendingDetail:
             Signal(stock_code="AAA", direction=Direction.BUY,
                    strength=0.5, reason="q"), "test")
         # Backdate to yesterday, then append today's bar → it's now "next".
-        db.conn.execute(
-            "UPDATE orders SET created_at=? WHERE code='AAA' AND status='pending'",
-            ((datetime.now() - timedelta(days=1)).isoformat(),))
-        db.conn.commit()
+        created = _backdate_pending(db).date()
         _append_new_bar(db, "AAA", days_from_today_back=0,
                         open_price=11.0, close_price=11.1)
         today = pd.Timestamp.today().normalize().date()
@@ -433,7 +609,6 @@ class TestPendingDetail:
         # 0 when "today" is a weekend/holiday. Assert it matches the calendar
         # function (robust on any run date) rather than hard-coding >= 1.
         from quanti.utils.market import count_trading_days_between
-        created = (datetime.now() - timedelta(days=1)).date()
         assert d["trading_days_pending"] == count_trading_days_between(created, today)
 
     def test_detail_exposes_entry_strategy_not_decision_label(self, seeded_pending):
