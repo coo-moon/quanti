@@ -69,6 +69,53 @@ def test_garbage_quote_date_does_not_crash(tmp_path):
     db.close()
 
 
+def test_market_latest_quote_date_ignores_stray_fresh_codes(tmp_path):
+    """get_market_latest_quote_date anchors by-date sync freshness: a date
+    backed by only 1-2 per-code top-ups must NOT count as the market's
+    latest (that made bg-sync idle while 5000+ codes sat a day behind);
+    a date with market-scale coverage must."""
+    db = Database(str(tmp_path / "ml.db"))
+    db.initialize()
+    assert db.get_market_latest_quote_date() is None      # empty table
+
+    def put(code: str, d: str) -> None:
+        db.conn.execute(
+            "INSERT INTO daily_quotes (code, date, open, high, low, close,"
+            " volume, amount, turnover) VALUES (?,?,?,?,?,?,?,?,?)",
+            (code, d, 1, 1, 1, 1, 1, 1, 1))
+
+    codes = [f"{i:06d}" for i in range(20)]
+    for c in codes:
+        put(c, "2026-07-01")
+    for c in codes[:2]:               # per-code path wrote today's stray bars
+        put(c, "2026-07-02")
+    db.conn.commit()
+    assert db.get_market_latest_quote_date() == date(2026, 7, 1)
+    # Dashboard semantics unchanged: global MAX still sees the stray bars.
+    assert db.get_global_latest_quote_date() == date(2026, 7, 2)
+
+    # A by-date sync lands (2 halted codes missing) → today now counts.
+    for c in codes[2:18]:
+        put(c, "2026-07-02")
+    db.conn.commit()
+    assert db.get_market_latest_quote_date() == date(2026, 7, 2)
+    db.close()
+
+
+def test_market_latest_quote_date_single_code_db(tmp_path):
+    """A tiny watchlist DB (one code) has no 'market' to compare against —
+    every date is a full day, so the newest bar wins, same as global MAX."""
+    db = Database(str(tmp_path / "ml1.db"))
+    db.initialize()
+    db.conn.execute(
+        "INSERT INTO daily_quotes (code, date, open, high, low, close,"
+        " volume, amount, turnover) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("000001", "2026-07-02", 1, 1, 1, 1, 1, 1, 1))
+    db.conn.commit()
+    assert db.get_market_latest_quote_date() == date(2026, 7, 2)
+    db.close()
+
+
 def test_global_latest_quote_date(tmp_path):
     """Max bar date across all codes (feeds the dashboard 最近更新 card);
     None on an empty table."""
