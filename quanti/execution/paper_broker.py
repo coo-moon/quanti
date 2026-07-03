@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 if TYPE_CHECKING:
     from quanti.risk.protections import ProtectionConfig
@@ -43,6 +43,7 @@ from quanti.risk.manager import (
 )
 from quanti.risk.sizer import Sizer, compute_buy_target_value
 from quanti.utils.market import (
+    board_limit_pct,
     count_trading_days_between,
     lot_round_strength,
     max_fill_shares,
@@ -79,6 +80,7 @@ class PaperBroker:
         pending_ttl_trading_days: int = 3,
         fill_price_basis: Literal["open", "close"] = "open",
         strategies_dir: str = "strategies",
+        realtime_quote_fn: Callable[[list[str]], dict[str, float]] | None = None,
     ) -> None:
         """Args:
             protection_config: ProtectionManager thresholds; None → default
@@ -93,6 +95,11 @@ class PaperBroker:
                 days without a fillable bar are auto-cancelled.
             fill_price_basis: which price of the next bar to fill at.
                 "open" matches realistic open-auction behavior.
+            realtime_quote_fn: optional batch last-price source
+                (codes → {code: price}) used to mark positions DURING trading
+                sessions, so the intraday guard sees today's prices instead of
+                yesterday's close. Marks only — fills keep their bar-based
+                pricing. None (tests/backtests) → daily-close marks as before.
         """
         self._db = db
         self._provider = provider
@@ -108,6 +115,7 @@ class PaperBroker:
         self._pending_ttl_days = pending_ttl_trading_days
         self._fill_basis = fill_price_basis
         self._strategies_dir = strategies_dir
+        self._realtime_quote_fn = realtime_quote_fn
         self._strategy_cache: dict | None = None  # name → strategy instance
         # Idempotent — only writes if no row exists.
         self._db.ensure_portfolio(initial_cash)
@@ -156,6 +164,59 @@ class PaperBroker:
         bars = self._provider.get_daily_bars(code, start, end)
         return bars[-1] if bars else None
 
+    def _intraday_marks(self, codes: list[str]) -> dict[str, float]:
+        """In-session realtime last-price overlay for position marks, on the
+        hfq axis (raw quote × latest adj_factor) so it's comparable with
+        avg_cost / daily-close marks, which all live on that axis.
+
+        Returns {} without a quote source, outside trading sessions, in
+        immediate fill mode, or on fetch failure (warned) — callers then fall
+        back to the daily close, so those paths behave exactly as before.
+        Immediate mode is excluded on purpose: it prices fills off the latest
+        daily bar, so realtime marks would let an exit decide at today's
+        price but fill at yesterday's close. Marks only, never fill prices:
+        pending fills stay at the next bar's open, so a realtime quote hiccup
+        can degrade mark freshness but can never move money at a wrong price.
+
+        NOTE this makes paper stops intraday-touch (like live), not the
+        close-confirmed semantics of the 4h tick / backtest — a name that
+        pierces the stop intraday queues its exit that day even if the close
+        recovers (fills next open, no close re-confirmation).
+        """
+        if (self._realtime_quote_fn is None or not codes
+                or self._fill_mode != "pending"):
+            return {}
+        from quanti.utils.market import in_trading_session
+        if not in_trading_session(datetime.now(), self._provider):
+            return {}
+        try:
+            raw = self._realtime_quote_fn(codes)
+        except Exception as e:  # noqa: BLE001 - stale marks beat a dead guard/UI
+            logger.warning(
+                "realtime marks unavailable, falling back to daily close: %s", e)
+            return {}
+        out: dict[str, float] = {}
+        tomorrow = date.today() + timedelta(days=1)
+        for code, price in raw.items():
+            if not price or price <= 0:
+                continue
+            ref = self._db.get_latest_quote_before(code, tomorrow)
+            if ref is None:
+                continue  # no bar on disk → no factor/band reference: skip
+            raw_close, factor = ref
+            # Bad-tick guard: a real print can't sit outside ±~30% (widest
+            # A-share daily band, 北交所) of the last raw close. One glitched
+            # quote must not fire a stop or the circuit breaker. Slightly
+            # loose (0.35) so a stale-by-one-day close can't reject a real
+            # limit move.
+            if raw_close > 0 and abs(price / raw_close - 1.0) > 0.35:
+                logger.warning(
+                    "discarding out-of-band quote %s=%.2f (last close %.2f)",
+                    code, price, raw_close)
+                continue
+            out[code] = price * (factor if factor > 0 else 1.0)
+        return out
+
     # ------------------------------------------------------------ portfolio
     def snapshot_portfolio(self) -> dict:
         """Mark all positions to the latest close, persist a snapshot, return summary."""
@@ -165,8 +226,12 @@ class PaperBroker:
         market_value = 0.0
         enriched: list[dict] = []
         latest_d: date | None = None
+        # In-session realtime overlay (paper intraday guard); {} off-session.
+        marks = self._intraday_marks([p["code"] for p in positions])
         for pos in positions:
-            quote = self._latest_close(pos["code"])
+            live = marks.get(pos["code"])
+            quote = ((live, date.today()) if live
+                     else self._latest_close(pos["code"]))
             price = quote[0] if quote else pos["current_price"] or pos["avg_cost"]
             if quote:
                 self._db.set_position_price(pos["code"], price)
@@ -191,7 +256,15 @@ class PaperBroker:
 
         total = cash + market_value
         snap_d = latest_d or date.today()
-        self._db.save_portfolio_snapshot(snap_d, cash, market_value, total)
+        # In-session (realtime-marked) snapshots are transient — do NOT
+        # persist them. portfolio_snapshots must stay a close-marked daily
+        # series: an intraday spike written here would inflate the drawdown
+        # high-water mark (get_peak_total_value = table MAX, rows are never
+        # rewritten once the day passes) and pollute attribution/protection
+        # equity series. The circuit breaker still sees the realtime total
+        # via this method's return value.
+        if not marks:
+            self._db.save_portfolio_snapshot(snap_d, cash, market_value, total)
         return {
             "cash": cash,
             "initial_cash": state["initial_cash"],
@@ -566,6 +639,37 @@ class PaperBroker:
             details={"positions": len(sells), "acted": acted,
                      "filled": result.filled, "pending": result.pending})
         return acted
+
+    def sell_at_market(self, code: str, reason: str = "手动实时卖出") -> dict:
+        """Manual in-session market sell: fill NOW at the realtime mark (hfq
+        axis, slippage/commission/T+1 all via the normal _fill_sell path)
+        instead of queueing for the next open — mirrors a live market order.
+
+        Fails loudly (ValueError) without an in-session realtime quote or
+        into a limit-down lock; off-session sells go through the normal
+        pending path (`execute_signal`). A pending SELL already queued for
+        the code is cancelled first so it can't double-fill tomorrow.
+        """
+        marks = self._intraday_marks([code])
+        price = marks.get(code)
+        if not price:
+            raise ValueError("无盘中实时报价(非交易时段/无行情源/报价异常),请用挂单卖出")
+        # Limit-down lock: a market sell can't fill into a locked-down name.
+        # Judge on the raw quote vs the last raw close with the board's band.
+        ref = self._db.get_latest_quote_before(code, date.today() + timedelta(days=1))
+        if ref is not None and ref[0] > 0:
+            raw_close, factor = ref
+            raw_now = price / (factor if factor > 0 else 1.0)
+            if raw_now <= raw_close * (1 - board_limit_pct(code)) + 1e-9:
+                raise ValueError("跌停锁死,当前无法市价卖出")
+        for o in self._db.list_orders(limit=1000, status="pending"):
+            if o["code"] == code and o["direction"] == "sell":
+                self._db.update_order_status(o["order_id"], "cancelled",
+                                             reason="superseded by market sell")
+        sig = Signal(stock_code=code, direction=Direction.SELL,
+                     strength=1.0, reason=reason)
+        filled = self._fill_sell(sig, price, date.today(), "manual")
+        return {"filled": filled, "price": price}
 
     def enforce_portfolio_stop(self) -> bool:
         """Portfolio drawdown circuit breaker: if equity is down past
@@ -1037,11 +1141,16 @@ class PaperBroker:
         """
         self._sync_risk_config()
         portfolio = self._build_runtime_portfolio()
-        # Refresh prices first.
+        # Refresh prices first — realtime marks in-session (so the intraday
+        # guard catches today's stop hits), else latest daily close.
+        marks = self._intraday_marks(list(portfolio.positions))
         for code, position in portfolio.positions.items():
-            quote = self._latest_close(code)
-            if quote:
-                position.current_price = quote[0]
+            price = marks.get(code)
+            if price is None:
+                quote = self._latest_close(code)
+                price = quote[0] if quote else None
+            if price:
+                position.current_price = price
 
         positions = self._db.list_positions()
         peaks = self._compute_peaks(positions)

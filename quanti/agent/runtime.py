@@ -201,11 +201,12 @@ class AgentRuntime:
         }
 
     def _guard_loop(self) -> None:
-        """Fast intraday guard (live only): every `intraday_guard_sec`, reconcile
-        venue fills + run exits + the portfolio circuit breaker — so async fills
+        """Fast intraday guard: every `intraday_guard_sec`, reconcile venue
+        fills + run exits + the portfolio circuit breaker — so async fills
         and stop-losses are caught in ~1 min instead of waiting for the 4h full
-        tick. Idles outside trading sessions / when the venue isn't connected, so
-        marks always ride xtdata realtime quotes via the bridge, never stale data."""
+        tick. Idles outside trading sessions / when the venue isn't connected.
+        Marks ride realtime quotes: xtdata via the bridge on live, Tencent
+        quotes on paper (PaperBroker._intraday_marks), never stale data."""
         while not self._stop_flag.is_set():
             if self._stop_flag.wait(self._intraday_guard_sec):
                 return
@@ -218,8 +219,8 @@ class AgentRuntime:
         from quanti.utils.market import in_trading_session
         if not in_trading_session(datetime.now(), self._provider):
             return
-        # Only act when the live venue is actually connected — exits/marks must
-        # ride xtdata realtime quotes via the bridge, never stale/mock data.
+        # Only act when the venue is connected (paper: always) — live exits/
+        # marks must ride xtdata quotes via the bridge, never stale/mock data.
         is_conn = getattr(self._broker, "is_connected", None)
         if callable(is_conn) and not is_conn():
             return
@@ -249,8 +250,11 @@ class AgentRuntime:
         self.start()
 
     def status(self) -> AgentStatus:
+        # Snapshot BEFORE taking the status lock: in-session it may do real
+        # network I/O (realtime marks) — holding the lock through that would
+        # block start/stop and every other status() caller on a slow quote.
+        snap = self._broker.snapshot_portfolio()
         with self._lock:
-            snap = self._broker.snapshot_portfolio()
             self._status.total_value = snap["total_value"]
             self._status.pnl_pct = snap["pnl_pct"]
             return AgentStatus(

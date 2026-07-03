@@ -330,3 +330,175 @@ def test_frozen_lot_settles_next_session(setup):
     sells = [t for t in db.list_trades() if t["direction"] == "sell"]
     assert sells[0]["quantity"] == 1500
     assert db.list_positions() == []
+
+
+# ---------------------------------------------------------- intraday marks
+
+def _mk_broker(db, provider, quote_fn):
+    # Realtime marks are pending-mode only (immediate prices fills off the
+    # latest daily bar — marks there would decouple decision from fill).
+    return PaperBroker(db, provider, initial_cash=200_000,
+                       fill_mode="pending", realtime_quote_fn=quote_fn)
+
+
+def _in_session(monkeypatch, value: bool):
+    monkeypatch.setattr("quanti.utils.market.in_trading_session",
+                        lambda *a, **k: value)
+
+
+def test_intraday_marks_override_daily_close_in_session(setup, monkeypatch):
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 12.34})
+    _in_session(monkeypatch, True)
+    snap = broker.snapshot_portfolio()
+    pos = snap["positions"][0]
+    assert pos["current_price"] == pytest.approx(12.34)  # adj_factor 1.0
+    assert pos["price_date"] == date.today().isoformat()
+    assert snap["market_value"] == pytest.approx(12.34 * 1000)
+
+
+def test_intraday_marks_convert_raw_quote_to_hfq_axis(setup, monkeypatch):
+    """Tencent quotes are RAW; the account books are hfq — the mark must be
+    raw × latest adj_factor or dividend-heavy names show phantom losses."""
+    db, provider, _ = setup
+    db.conn.execute("UPDATE daily_quotes SET adj_factor=1.2 WHERE code='000001'")
+    db.upsert_position("000001", 1000, 12.0, 12.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.0})
+    _in_session(monkeypatch, True)
+    snap = broker.snapshot_portfolio()
+    assert snap["positions"][0]["current_price"] == pytest.approx(10.0 * 1.2)
+
+
+def test_intraday_marks_reject_out_of_band_quote(setup, monkeypatch):
+    """One glitched print (way outside the ±35% daily-band envelope) must not
+    become a mark — it could fire a stop or the circuit breaker."""
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 3.0})  # ~-70%
+    _in_session(monkeypatch, True)
+    snap = broker.snapshot_portfolio()
+    # Falls back to the daily-close mark, not the bad tick.
+    assert snap["positions"][0]["current_price"] != pytest.approx(3.0)
+    assert snap["positions"][0]["current_price"] > 5.0
+
+
+def test_intraday_marks_ignored_off_session(setup, monkeypatch):
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 11.0})
+    _in_session(monkeypatch, False)
+    snap = broker.snapshot_portfolio()
+    # Off-session the quote fn must not even matter: daily-close mark.
+    assert snap["positions"][0]["current_price"] != pytest.approx(11.0)
+
+
+def test_intraday_marks_ignored_in_immediate_mode(setup, monkeypatch):
+    """Immediate mode fills at the latest daily bar — realtime marks would
+    let exits decide at today's price but fill at yesterday's close, so the
+    overlay must stay off (CLI `agent tick` / MCP / backtests use this mode)."""
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    broker = PaperBroker(db, provider, initial_cash=200_000,
+                         realtime_quote_fn=lambda codes: {"000001": 11.0})
+    _in_session(monkeypatch, True)
+    snap = broker.snapshot_portfolio()
+    assert snap["positions"][0]["current_price"] != pytest.approx(11.0)
+
+
+def test_intraday_marks_fetch_failure_falls_back(setup, monkeypatch):
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+
+    def boom(codes):
+        raise OSError("qt.gtimg.cn unreachable")
+
+    broker = _mk_broker(db, provider, boom)
+    _in_session(monkeypatch, True)
+    snap = broker.snapshot_portfolio()  # must not raise
+    assert snap["positions"][0]["current_price"] > 0
+
+
+def test_intraday_snapshot_not_persisted(setup, monkeypatch):
+    """Realtime-marked snapshots are transient: persisting them would let an
+    intraday spike inflate the circuit breaker's high-water mark forever."""
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 11.0})
+    _in_session(monkeypatch, True)
+    broker.snapshot_portfolio()
+    assert db.get_portfolio_snapshots() == []      # in-session: not persisted
+    _in_session(monkeypatch, False)
+    broker.snapshot_portfolio()
+    assert len(db.get_portfolio_snapshots()) == 1  # close-marked: persisted
+
+
+def test_intraday_crash_triggers_stop_via_check_exits(setup, monkeypatch):
+    """The point of the paper intraday guard: a stop hit at TODAY's realtime
+    price queues the exit today, instead of waiting for today's bar to land.
+    The fill itself stays pending (next bar's open) — marks never price fills."""
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    # -20% intraday: through the -15% stop floor, inside the ±35% band.
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 8.0})
+    _in_session(monkeypatch, True)
+    assert broker.check_exits() >= 1
+    pending = db.list_orders(limit=10, status="pending")
+    assert [o for o in pending if o["direction"] == "sell"]
+    assert not [t for t in db.list_trades() if t["direction"] == "sell"]
+
+
+def test_no_quote_fn_keeps_legacy_marks(setup):
+    """Default construction (tests/backtests) never touches realtime marks."""
+    db, _, broker = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    snap = broker.snapshot_portfolio()
+    assert snap["positions"][0]["current_price"] > 0
+
+
+# ---------------------------------------------------------- market sell
+
+def test_sell_at_market_fills_at_realtime_mark(setup, monkeypatch):
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.8})
+    _in_session(monkeypatch, True)
+    r = broker.sell_at_market("000001")
+    assert r["filled"] is True and r["price"] == pytest.approx(10.8)
+    assert db.list_positions() == []
+    sells = [t for t in db.list_trades() if t["direction"] == "sell"]
+    assert sells and sells[0]["price"] == pytest.approx(10.8 * (1 - 0.001))
+
+
+def test_sell_at_market_rejects_without_quote(setup, monkeypatch):
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.8})
+    _in_session(monkeypatch, False)  # off-session → no realtime quote
+    with pytest.raises(ValueError):
+        broker.sell_at_market("000001")
+
+
+def test_sell_at_market_rejects_limit_down_lock(setup, monkeypatch):
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
+    locked = raw_close * 0.90  # main board -10% = limit-down
+    broker = _mk_broker(db, provider, lambda codes: {"000001": locked})
+    _in_session(monkeypatch, True)
+    with pytest.raises(ValueError, match="跌停"):
+        broker.sell_at_market("000001")
+
+
+def test_sell_at_market_cancels_queued_sell(setup, monkeypatch):
+    """A pending SELL for the code is superseded — no double-fill tomorrow."""
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.5})
+    assert broker.execute_signal(
+        Signal("000001", Direction.SELL, 1.0, "queued exit"), "t") is True
+    assert db.list_orders(limit=10, status="pending")
+    _in_session(monkeypatch, True)
+    assert broker.sell_at_market("000001")["filled"] is True
+    assert db.list_orders(limit=10, status="pending") == []

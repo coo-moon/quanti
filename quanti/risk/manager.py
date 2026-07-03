@@ -244,11 +244,15 @@ class RiskManager:
         trips it flattens everything, so in effect the full order is
         circuit-breaker > stop-loss > strategy-exit > take-profit.
 
-        Price basis (固化 — 收盘确认型, matches the backtest's next-bar-open
-        model so live and backtest agree):
-          • pos.current_price is the latest CLOSE (EOD mark), not an intraday
-            print. Stops/TP are evaluated on the close, never intraday — a name
-            that pierced the stop intraday but closed above it does NOT exit.
+        Price basis (固化 — 收盘确认型 on the daily-tick/backtest path):
+          • pos.current_price is the latest CLOSE (EOD mark) on the 4h tick
+            and in backtests — stops evaluated on the close, never intraday.
+            EXCEPTION: the intraday guard (live via xtdata; paper via Tencent
+            marks, PaperBroker._intraday_marks) feeds realtime prices here,
+            making stops intraday-touch on that path — a deliberate
+            live-fidelity divergence from the backtest's close-confirmed model
+            (a name that pierces the stop intraday queues its exit that day
+            even if the close recovers).
           • peaks[code] is the post-entry highest HIGH (intraday) since entry.
             So the trailing TP measures an intraday peak vs a close retrace by
             design (a deliberate close-confirmed trail), NOT a bug.

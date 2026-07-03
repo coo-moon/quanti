@@ -48,14 +48,17 @@ def create_app(
     broker = make_broker(db, provider, account=account,
                          initial_cash=initial_cash, fill_mode="pending",
                          strategies_dir=strategies_dir or "strategies")
-    # Live runs a fast intraday guard (reconcile fills + exits + circuit breaker
-    # on a ~1min cadence, riding xtdata realtime quotes via the bridge); paper
-    # has nothing to gain intraday (next-open fills, daily-close marks) → off.
+    # Both accounts run the fast intraday guard (reconcile fills + exits +
+    # circuit breaker on a ~1min cadence). Live rides xtdata realtime quotes
+    # via the bridge; paper rides free Tencent quotes (execution.factory) so
+    # intraday stop hits are caught the day they happen instead of after the
+    # next daily bar lands. Paper exits still FILL at the next bar's open —
+    # realtime prices are marks only.
     agent = AgentRuntime(
         db=db, provider=provider, broker=broker,
         strategies_dir=strategies_dir or "strategies",
         screeners_dir=screeners_dir or "screeners",
-        intraday_guard_sec=60 if account == "live" else 0)
+        intraday_guard_sec=60)
     # Independent daemon that keeps daily_quotes fresh, decoupled from the
     # agent's 4h tick. Auto-starts by default so cold-start users don't
     # have to know about it; tests pass autostart_background_sync=False
