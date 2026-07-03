@@ -99,6 +99,18 @@ def in_trading_session(now: datetime | None = None,
     return is_market_open(dt) and is_trading_day(dt.date(), provider)
 
 
+def session_closed_for_day(now: datetime | None = None,
+                           provider: Optional[DataProvider] = None) -> bool:
+    """True when today's marks are final: a non-trading day, or a trading day
+    at/after the 15:00 close. Gates persisting live equity snapshots — an
+    intraday realtime mark is transient and must not be written where it can
+    fossilize (process dies before the close overwrite)."""
+    dt = _to_beijing(now)
+    if not is_trading_day(dt.date(), provider):
+        return True
+    return dt.time() >= AFTERNOON_CLOSE
+
+
 def next_trading_day(after: date,
                      provider: Optional[DataProvider] = None) -> date:
     """First trading day strictly after `after`."""

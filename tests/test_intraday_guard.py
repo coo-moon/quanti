@@ -12,7 +12,7 @@ from quanti.data.provider import DataProvider
 from quanti.execution.factory import make_broker
 from quanti.execution.paper_broker import PaperBroker
 from quanti.execution.qmt_broker import QmtBroker
-from quanti.utils.market import in_trading_session
+from quanti.utils.market import in_trading_session, session_closed_for_day
 
 
 @pytest.fixture
@@ -34,6 +34,14 @@ def test_in_trading_session_window():
     assert in_trading_session(datetime(2026, 6, 24, 10, 0)) is True    # Wed, morning
     assert in_trading_session(datetime(2026, 6, 24, 12, 0)) is False   # Wed, lunch
     assert in_trading_session(datetime(2026, 6, 28, 10, 0)) is False   # Sunday
+
+
+def test_session_closed_for_day():
+    assert session_closed_for_day(datetime(2026, 6, 24, 10, 0)) is False   # intraday
+    assert session_closed_for_day(datetime(2026, 6, 24, 12, 0)) is False   # lunch: not final
+    assert session_closed_for_day(datetime(2026, 6, 24, 15, 0)) is True    # at close
+    assert session_closed_for_day(datetime(2026, 6, 24, 16, 30)) is True   # post-close
+    assert session_closed_for_day(datetime(2026, 6, 28, 10, 0)) is True    # Sunday
 
 
 class _FakeBroker:
