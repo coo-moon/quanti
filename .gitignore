@@ -16,8 +16,7 @@ env/
 *.db-wal
 *.db.bak
 *.sqlite3
-data/*.csv
-data/*.parquet
+data/
 node_modules/
 web/dist/
 .pytest_cache/
