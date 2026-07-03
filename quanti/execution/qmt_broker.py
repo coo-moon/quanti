@@ -435,7 +435,8 @@ class QmtBroker:
         self._sync_risk_config()
         portfolio, _ = self._reconciled_portfolio()
         positions = self._db.list_positions()
-        peaks = compute_peaks(self._db, positions)
+        # raw_axis: venue prices (last_price/avg_price) are raw, not hfq.
+        peaks = compute_peaks(self._db, positions, raw_axis=True)
         if self._risk.config.strategy_exit_enabled:
             strategy_sells = compute_strategy_exits(
                 self._provider, self._load_strategies(), positions, self._db)

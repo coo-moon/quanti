@@ -645,15 +645,17 @@ def test_snapshot_position_has_price_date(seeded_pending):
 
 # --- exit engine: trailing take-profit + strategy replay -----------------
 
-def _exit_db(tmp_path, bars: list[tuple]):
+def _exit_db(tmp_path, bars: list[tuple], factor: float = 1.0):
     """Fresh DB with one stock AAA and an explicit bar series.
-    bars = list of (date, open, high, low, close)."""
+    bars = list of (date, open, high, low, close); prices are RAW and stored
+    with adj_factor=`factor` (hfq = raw × factor)."""
     db = Database(str(tmp_path / "exit.db"))
     db.initialize()
     db.upsert_stock("AAA", "alpha", "SZ", date(1991, 4, 3), "test")
     df = pd.DataFrame([{
         "code": "AAA", "date": d, "open": o, "high": h, "low": lo,
         "close": c, "volume": 5e6, "amount": c * 5e6, "turnover": 1.0,
+        "adj_factor": factor,
     } for (d, o, h, lo, c) in bars])
     db.save_daily_quotes(df)
     return db
@@ -695,6 +697,33 @@ class TestExitEngine:
         peaks = broker._compute_peaks(
             [{"code": "AAA", "buy_date": buy}])
         assert peaks["AAA"] == pytest.approx(13.0)
+
+    def test_trailing_tp_fires_for_dividend_stock(self, tmp_path):
+        """adj_factor≠1 axis consistency: current_price is hfq, so the peak
+        must be hfq too (raw high × adj_factor). With the old raw MAX(high)
+        peak this dividend stock (factor 1.3) showed a fake +11.8% 'drawdown'
+        and the trailing TP never fired; on the hfq axis it is -14% → sell."""
+        today = pd.Timestamp.today().normalize()
+        raw = [(8.0, 8.2, 7.8, 8.0), (9.5, 10.0, 9.3, 9.8),   # peak high 10.0
+               (9.5, 9.6, 9.2, 9.3), (9.1, 9.2, 8.9, 9.0),
+               (8.7, 8.8, 8.5, 8.6)]                          # close 8.6
+        bars = [((today - pd.Timedelta(days=n)).date(), o, h, lo, c)
+                for n, (o, h, lo, c) in zip(range(4, -1, -1), raw)]
+        db = _exit_db(tmp_path, bars, factor=1.3)
+        buy = (today - pd.Timedelta(days=20)).date()
+        # hfq peak = 10.0 × 1.3; the raw 10.0 peak was the bug.
+        assert db.get_high_water("AAA", buy) == pytest.approx(13.0)
+        # avg_cost 9.1 hfq; current hfq close = 8.6 × 1.3 = 11.18 → +22.9%
+        # (armed), retrace off 13.0 = -14% → fires.
+        db.upsert_position("AAA", 1000, 9.1, 11.18, buy)
+        broker = PaperBroker(db, DataProvider(db), fill_mode="immediate",
+                             risk_config=RiskConfig(
+                                 take_profit_activate_pct=0.15,
+                                 take_profit_trail_pct=0.10,
+                                 strategy_exit_enabled=False))
+        assert broker.check_exits() == 1
+        trades = db.list_trades()
+        assert len(trades) == 1 and trades[0]["direction"] == "sell"
 
     def test_strategy_replay_detects_turtle_exit(self, tmp_path):
         """A holding owned by turtle_breakout that breaks below the N/2-day
