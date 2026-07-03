@@ -107,7 +107,7 @@ def test_live_status_endpoint(tmp_path):
     with TestClient(app) as c:
         r = c.get("/api/agent/live-status").json()
     assert set(r) >= {"is_live", "guard", "positions"}
-    assert r["guard"]["enabled"] is False   # paper account → guard off
+    assert r["guard"]["enabled"] is True    # paper runs the guard too (Tencent marks)
     assert r["positions"] == []             # empty portfolio
     db.close()
 

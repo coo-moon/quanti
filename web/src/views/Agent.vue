@@ -286,7 +286,7 @@
           <thead>
             <tr>
               <th>代码</th><th>名称</th><th>数量</th>
-              <th>买入价</th><th>当前价</th><th>强制止损价</th><th>距止损</th><th>盈亏 %</th><th>进场策略</th>
+              <th>买入价</th><th>当前价</th><th>强制止损价</th><th>距止损</th><th>盈亏 %</th><th>进场策略</th><th></th>
             </tr>
           </thead>
           <tbody>
@@ -303,6 +303,11 @@
               <td :class="stopDistance(p) <= 0.03 ? 'bad' : ''">{{ formatPct(stopDistance(p)) }}</td>
               <td :class="p.pnl_pct >= 0 ? 'up' : 'down'">{{ formatPct(p.pnl_pct) }}</td>
               <td>{{ p.entry_strategy || "—" }}</td>
+              <td>
+                <button class="btn-link" :disabled="busy || !liveStatus.guard.in_session"
+                        :title="liveStatus.guard.in_session ? '按当前实时价立即成交' : '仅交易时段可用'"
+                        @click="sellMarket(p.code, p.current_price)">实时卖出</button>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -354,8 +359,11 @@
             <td :title="p.score == null ? '已掉出候选池(换仓视作最弱)' : ''">
               {{ p.score == null ? "—" : p.score.toFixed(2) }}
             </td>
-            <td>
-              <button class="btn-link" @click="sellOne(p.code)">卖出</button>
+            <td class="nowrap">
+              <button class="btn-link" @click="sellOne(p.code)">挂单卖出</button>
+              <button class="btn-link" v-if="liveStatus?.guard.in_session" :disabled="busy"
+                      title="按当前实时价立即成交"
+                      @click="sellMarket(p.code, p.current_price)">实时卖出</button>
             </td>
           </tr>
         </tbody>
@@ -615,6 +623,7 @@ import {
   fetchScreeners,
   fetchStrategies,
   manualOrder,
+  sellAtMarket,
   resetPortfolio,
   updateGoal,
   runOptimizeAsync,
@@ -1216,12 +1225,30 @@ async function placeManual() {
 }
 
 async function sellOne(code: string) {
-  if (!confirm(`确认全部卖出 ${code} ?`)) return;
+  if (!confirm(`确认全部卖出 ${code} ?(挂单,次日开盘成交)`)) return;
   busy.value = true;
   try {
     const r = await manualOrder({ code, direction: "sell", reason: "manual sell" });
     setMessage(r.data.filled ? "已卖出" : "卖出失败", !r.data.filled);
     portfolio.value = r.data.snapshot;
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function sellMarket(code: string, price?: number) {
+  const hint = price ? ` ≈¥${price.toFixed(2)}` : "";
+  if (!confirm(`确认按当前实时价${hint} 市价卖出 ${code} 全部可卖数量?(立即成交)`)) return;
+  busy.value = true;
+  try {
+    const r = await sellAtMarket(code);
+    setMessage(
+      r.data.filled ? `已按 ¥${r.data.price.toFixed(2)} 实时卖出 ${code}`
+        : "实时卖出被拒(T+1 冻结/无可卖数量)", !r.data.filled);
+    portfolio.value = r.data.snapshot;
+    await loadStatus();
+  } catch (e: any) {
+    setMessage("实时卖出失败: " + (e?.response?.data?.detail ?? e?.message ?? e), true);
   } finally {
     busy.value = false;
   }

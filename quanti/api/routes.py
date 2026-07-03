@@ -961,6 +961,23 @@ async def live_status(request: Request):
     }
 
 
+@router.post("/positions/{code}/sell-market")
+async def sell_position_at_market(code: str, request: Request):
+    """Manual in-session market sell at the realtime mark (paper). 409 when
+    off-session / no quote / limit-down locked; brokers without the
+    capability (live QMT for now) get 501."""
+    broker = request.app.state.broker
+    fn = getattr(broker, "sell_at_market", None)
+    if fn is None:
+        raise HTTPException(status_code=501,
+                            detail="当前账户的 broker 不支持实时市价卖出")
+    try:
+        result = fn(code)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {**result, "snapshot": broker.snapshot_portfolio()}
+
+
 @router.post("/portfolio/reset")
 async def reset_portfolio(request: Request, initial_cash: float = 1_000_000.0):
     request.app.state.db.reset_portfolio(initial_cash)
