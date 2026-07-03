@@ -462,6 +462,17 @@ class Database:
                 created_at TEXT NOT NULL
             );
 
+            -- Monotone equity high-water mark for the portfolio circuit
+            -- breaker. Separate from portfolio_snapshots because snapshot
+            -- rows are close-only and overwritable: an intraday realtime
+            -- peak must survive a process restart without fossilizing a
+            -- phantom value into the equity curve.
+            CREATE TABLE IF NOT EXISTS portfolio_hwm (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                peak_value REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             -- Agent / goal -----------------------------------------------
 
             CREATE TABLE IF NOT EXISTS app_config (
@@ -1302,7 +1313,8 @@ class Database:
         now = datetime.now().isoformat()
         self.conn.executescript(
             "DELETE FROM positions; DELETE FROM orders; DELETE FROM trades; "
-            "DELETE FROM portfolio_snapshots; DELETE FROM portfolio_state;"
+            "DELETE FROM portfolio_snapshots; DELETE FROM portfolio_state; "
+            "DELETE FROM portfolio_hwm;"
         )
         self.conn.execute(
             "INSERT INTO portfolio_state (id, cash, initial_cash, created_at, updated_at) "
@@ -1541,11 +1553,33 @@ class Database:
         ]
 
     def get_peak_total_value(self) -> float:
-        """Highest portfolio total_value ever recorded — the high-water mark for
-        the portfolio drawdown circuit breaker. 0.0 when no snapshots exist."""
-        row = self.conn.execute(
-            "SELECT MAX(total_value) FROM portfolio_snapshots").fetchone()
-        return float(row[0]) if row and row[0] is not None else 0.0
+        """Equity high-water mark for the portfolio drawdown circuit breaker:
+        max of all (close-only) snapshots and the monotone intraday HWM row.
+        0.0 when neither exists."""
+        snap = self.conn.execute(
+            "SELECT MAX(total_value) FROM portfolio_snapshots").fetchone()[0]
+        hwm = self.conn.execute(
+            "SELECT peak_value FROM portfolio_hwm WHERE id=1").fetchone()
+        return max(float(snap) if snap is not None else 0.0,
+                   float(hwm[0]) if hwm else 0.0)
+
+    def raise_hwm(self, value: float) -> None:
+        """Monotonically raise the persisted equity high-water mark; a lower
+        value is a no-op. Lets the circuit breaker remember an intraday peak
+        across restarts without writing it into the snapshot table."""
+        from datetime import datetime
+        self.conn.execute(
+            """
+            INSERT INTO portfolio_hwm (id, peak_value, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                peak_value = excluded.peak_value,
+                updated_at = excluded.updated_at
+            WHERE excluded.peak_value > portfolio_hwm.peak_value
+            """,
+            (value, datetime.now().isoformat()),
+        )
+        self.conn.commit()
 
     def save_portfolio_snapshot(self, snapshot_date: date, cash: float,
                                 market_value: float, total_value: float) -> None:

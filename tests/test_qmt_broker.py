@@ -454,3 +454,77 @@ def test_peaks_raw_axis_divides_by_latest_factor(env):
     peaks = compute_peaks(db, [{"code": "000002", "buy_date": date(2000, 1, 1)}],
                           raw_axis=True)
     assert peaks["000002"] == pytest.approx(13.0 / 1.4)
+
+
+# --- Circuit-breaker HWM: intraday marks must not fossilize; peak survives ---
+# a restart via the monotone portfolio_hwm row (not the snapshot table).
+
+class AssetBridge(InProcBridge):
+    """InProcBridge with a controllable flat /trader/asset (no positions)."""
+
+    def __init__(self, total: float) -> None:
+        super().__init__()
+        self.total = total
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        if path == "/trader/asset":
+            return {"cash": self.total, "market_value": 0.0,
+                    "total_asset": self.total}
+        if path == "/trader/positions":
+            return {"positions": []}
+        return super().get(path, params)
+
+
+def test_intraday_snapshot_not_persisted(env, monkeypatch):
+    db, provider = env
+    monkeypatch.setattr("quanti.execution.qmt_broker.session_closed_for_day",
+                        lambda *a, **k: False)
+    broker = _make(db, provider, client=AssetBridge(1_000_000))
+    snap = broker.snapshot_portfolio()
+    assert snap["total_value"] == pytest.approx(1_000_000)
+    assert db.get_portfolio_snapshots() == []
+
+
+def test_postclose_snapshot_persisted(env, monkeypatch):
+    db, provider = env
+    monkeypatch.setattr("quanti.execution.qmt_broker.session_closed_for_day",
+                        lambda *a, **k: True)
+    broker = _make(db, provider, client=AssetBridge(1_000_000))
+    broker.snapshot_portfolio()
+    rows = db.get_portfolio_snapshots()
+    assert len(rows) == 1
+    assert rows[0]["total_value"] == pytest.approx(1_000_000)
+
+
+def test_portfolio_stop_hwm_survives_restart(env, tmp_path, monkeypatch):
+    """盘中冲高 → 进程死掉(该日无收盘覆写)→ 重启后熔断仍以真实盘中峰为
+    高水位触发,且幻影峰值没有写进 equity curve。"""
+    db, provider = env
+    monkeypatch.setattr("quanti.execution.qmt_broker.session_closed_for_day",
+                        lambda *a, **k: False)
+    cfg = RiskConfig(portfolio_stop_loss_pct=-0.10)
+    bridge = AssetBridge(1_100_000)
+    broker = _make(db, provider, client=bridge, risk_config=cfg)
+    assert broker.enforce_portfolio_stop() is False  # at the peak: no trip
+    assert db.get_portfolio_snapshots() == []        # peak not in equity curve
+    assert db.get_peak_total_value() == pytest.approx(1_100_000)
+
+    # "restart": a fresh Database over the same file
+    db2 = Database(str(tmp_path / "t.db"))
+    db2.initialize()
+    try:
+        assert db2.get_peak_total_value() == pytest.approx(1_100_000)
+        bridge.total = 950_000  # -13.6% from the intraday peak
+        broker2 = _make(db2, DataProvider(db2), client=bridge, risk_config=cfg)
+        assert broker2.enforce_portfolio_stop() is True
+    finally:
+        db2.close()
+
+
+def test_raise_hwm_is_monotone_and_reset_clears_it(env):
+    db, _provider = env
+    db.raise_hwm(2_000_000)
+    db.raise_hwm(1_500_000)  # lower: no-op
+    assert db.get_peak_total_value() == pytest.approx(2_000_000)
+    db.reset_portfolio(1_000_000)
+    assert db.get_peak_total_value() == 0.0

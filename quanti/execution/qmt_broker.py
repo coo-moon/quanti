@@ -45,7 +45,8 @@ from quanti.risk.manager import (
     risk_config_from_dict,
 )
 from quanti.risk.sizer import compute_buy_target_value
-from quanti.utils.market import board_limit_pct, lot_round_strength, prev_bar_close
+from quanti.utils.market import (
+    board_limit_pct, lot_round_strength, prev_bar_close, session_closed_for_day)
 
 if TYPE_CHECKING:
     from quanti.risk.protections import ProtectionConfig
@@ -182,9 +183,15 @@ class QmtBroker:
                 "pnl": (cur - avg) * vol,
                 "pnl_pct": (cur - avg) / avg if avg else 0.0,
             })
-        # Persist the equity snapshot so the portfolio drawdown high-water mark
-        # accumulates for the circuit breaker (and the UI equity curve).
-        self._db.save_portfolio_snapshot(date.today(), cash, market_value, total)
+        # Persist the equity snapshot (UI equity curve / attribution) only once
+        # today's marks are final. An intraday realtime mark is transient: if
+        # the process dies before the close overwrite, a phantom peak would
+        # fossilize into the day's row. The circuit-breaker HWM rides the
+        # monotone portfolio_hwm row instead (enforce_portfolio_stop), so it
+        # still sees intraday peaks.
+        if session_closed_for_day(datetime.now(), self._provider):
+            self._db.save_portfolio_snapshot(date.today(), cash, market_value,
+                                             total)
         return {
             "cash": cash, "initial_cash": self._initial_cash,
             "market_value": market_value, "total_value": total,
@@ -557,13 +564,16 @@ class QmtBroker:
         """Portfolio drawdown circuit breaker (live): flatten + signal halt when
         equity is down past portfolio_stop_loss_pct from its high-water mark.
 
-        Reads the high-water mark BEFORE snapshot_portfolio() overwrites today's
-        snapshot row, so a same-day top-then-drop still trips it (audit G3/L2)."""
+        The HWM is the monotone portfolio_hwm row raised on every check, so a
+        same-day top-then-drop still trips it (audit G3/L2) AND the intraday
+        peak survives a process restart — without ever writing a transient
+        realtime mark into the (close-only) snapshot table."""
         self._sync_risk_config()
         prior_peak = self._db.get_peak_total_value()
-        snap = self.snapshot_portfolio()  # persists today's snapshot (overwrite)
+        snap = self.snapshot_portfolio()  # intraday: returns marks, no persist
         total = snap["total_value"]
         peak = max(prior_peak, total)
+        self._db.raise_hwm(peak)
         if not self._risk.check_portfolio_stop(total, peak):
             return False
         self.cancel_all_pending()
