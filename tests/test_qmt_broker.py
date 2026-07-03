@@ -432,3 +432,25 @@ def test_check_exits_fires_trailing_tp_live(env, monkeypatch):
         {"code": "000001", "buy_date": date(2000, 1, 1), "entry_strategy": ""}])
     monkeypatch.setattr(broker._db, "get_high_water", lambda code, since: 35.0)
     assert broker.check_exits() == 1  # trailing TP fired and landed
+
+
+def test_peaks_raw_axis_divides_by_latest_factor(env):
+    """Live venue prices (last_price/avg_price) are raw, so QMT's peaks must
+    be re-expressed on today's raw axis: hfq peak ÷ latest adj_factor. The
+    bare hfq peak would make an ex-dividend gap read as a retrace."""
+    from quanti.execution.exits import compute_peaks
+    db, _ = env
+    today = pd.Timestamp.today().normalize()
+    db.save_daily_quotes(pd.DataFrame([
+        # pre-div bar: raw high 13.0, factor 1.0 → hfq high 13.0
+        {"code": "000002", "date": (today - pd.Timedelta(days=1)).date(),
+         "open": 12.8, "high": 13.0, "low": 12.5, "close": 12.6,
+         "volume": 1e6, "amount": 1.26e7, "turnover": 1.0, "adj_factor": 1.0},
+        # ex-div bar: raw ~9, factor 1.4 → hfq ~12.7 (no new high)
+        {"code": "000002", "date": today.date(),
+         "open": 9.0, "high": 9.1, "low": 8.9, "close": 9.0,
+         "volume": 1e6, "amount": 9e6, "turnover": 1.0, "adj_factor": 1.4},
+    ]))
+    peaks = compute_peaks(db, [{"code": "000002", "buy_date": date(2000, 1, 1)}],
+                          raw_axis=True)
+    assert peaks["000002"] == pytest.approx(13.0 / 1.4)

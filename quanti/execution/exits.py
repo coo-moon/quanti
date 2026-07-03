@@ -19,16 +19,31 @@ from quanti.models import Direction
 logger = logging.getLogger(__name__)
 
 
-def compute_peaks(db, positions: list[dict]) -> dict[str, float]:
-    """Per-code highest high since buy_date (post-entry peak), for trailing TP."""
+def compute_peaks(db, positions: list[dict],
+                  raw_axis: bool = False) -> dict[str, float]:
+    """Per-code highest high since buy_date (post-entry peak), for trailing TP.
+
+    ``get_high_water`` returns the peak on the hfq axis — right for
+    PaperBroker, whose current_price/avg_cost come off the provider's hfq
+    default. Live venue prices are raw: pass ``raw_axis=True`` to divide each
+    peak by the code's latest adj_factor, re-expressing it on today's raw
+    axis so (current - peak)/peak stays a return-space retrace across
+    ex-dividend gaps."""
     peaks: dict[str, float] = {}
     for p in positions:
         bd = p.get("buy_date")
         if bd is None:
             continue
         hw = db.get_high_water(p["code"], bd)
-        if hw is not None:
-            peaks[p["code"]] = hw
+        if hw is None:
+            continue
+        if raw_axis:
+            q = db.get_latest_quote_before(p["code"],
+                                           date.today() + timedelta(days=1))
+            if q is None or q[1] <= 0:
+                continue
+            hw /= q[1]
+        peaks[p["code"]] = hw
     return peaks
 
 

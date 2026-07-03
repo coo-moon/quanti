@@ -1065,9 +1065,14 @@ class Database:
 
     def get_high_water(self, code: str, since: date) -> float | None:
         """Highest intraday high for `code` on/after `since` (the post-entry
-        peak, for trailing take-profit). None if no bars in range."""
+        peak, for trailing take-profit), on the hfq axis (raw high ×
+        adj_factor) — the axis the provider serves prices on by default, so
+        the peak is comparable to a position's current_price/avg_cost. A raw
+        MAX(high) sits ~30% low for dividend payers (adj_factor>1) and the
+        trailing TP never fires. None if no bars in range."""
         row = self.conn.execute(
-            "SELECT MAX(high) FROM daily_quotes WHERE code=? AND date>=?",
+            "SELECT MAX(high * COALESCE(adj_factor, 1.0)) FROM daily_quotes "
+            "WHERE code=? AND date>=?",
             (code, since.isoformat()),
         ).fetchone()
         if row is None or row[0] is None:
