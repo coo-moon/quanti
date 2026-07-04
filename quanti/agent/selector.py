@@ -81,6 +81,11 @@ class StrategyEvaluation:
     oos_sharpe: float = 0.0
     oos_consistency: float = 0.0
     n_folds: int = 0
+    # Folds that actually produced OOS returns. The independent-sample
+    # guardrail (_aggregate zeroes oos_sharpe below _MIN_POPULATED_FOLDS) hinges
+    # on this, so the DSR path reuses it instead of re-deriving trust from the
+    # raw pooled series (see _per_obs_sharpe / _winner_dsr).
+    n_populated_folds: int = 0
     oos_trades: int = 0   # total OOS trades across folds (confidence guard)
     # Observation count backing the Sharpe used for DSR: pooled OOS bars (WF)
     # or IS trading days (no-WF). Real T for the deflated-Sharpe estimator.
@@ -102,6 +107,7 @@ class StrategyEvaluation:
             "oos_sharpe": self.oos_sharpe,
             "oos_consistency": self.oos_consistency,
             "n_folds": self.n_folds,
+            "n_populated_folds": self.n_populated_folds,
             "oos_trades": self.oos_trades,
             "n_obs": self.n_obs,
         }
@@ -233,6 +239,7 @@ class StrategySelector:
                     ev.oos_sharpe = wf.oos_sharpe
                     ev.oos_consistency = wf.oos_consistency
                     ev.n_folds = len(wf.folds)
+                    ev.n_populated_folds = wf.n_populated_folds
                     ev.oos_trades = wf.total_trades_oos
                     # Pooled OOS returns (concat across folds) drive the most
                     # accurate DSR path; real T = their count.
@@ -350,14 +357,29 @@ class StrategySelector:
 
     # -------------------------------------------------------------- DSR gate
     @staticmethod
+    def _trust_pooled(ev: StrategyEvaluation, wf_enabled: bool) -> bool:
+        """Whether ev's pooled OOS series clears the independent-sample
+        guardrail (≥ _MIN_POPULATED_FOLDS populated folds) — the SAME floor
+        _aggregate uses before it trusts oos_sharpe. A series pooled from a
+        single populated fold is one draw/regime, not an independent-cycle
+        signal; below the floor _aggregate has already zeroed oos_sharpe, so the
+        DSR path must not resurrect a nonzero Sharpe from the raw series. No WF
+        (no folds) → nothing to pool."""
+        if not (wf_enabled and ev.n_folds > 0):
+            return False
+        return ev.n_populated_folds >= _MIN_POPULATED_FOLDS
+
+    @staticmethod
     def _per_obs_sharpe(ev: StrategyEvaluation, wf_enabled: bool) -> float:
         """Per-period (NON-annualized) Sharpe for DSR math.
 
-        Prefer the pooled OOS return series (exact). Else de-annualize the
-        stored Sharpe by ÷√252 — the stored oos_sharpe/sharpe are annualized
-        (metrics.annualized_sharpe ×√252) but DSR is a per-period quantity.
+        Prefer the pooled OOS return series (exact) — but only when it clears
+        the independent-sample guardrail (_trust_pooled). Otherwise de-annualize
+        the stored Sharpe by ÷√252: the stored oos_sharpe/sharpe are annualized
+        (metrics.annualized_sharpe ×√252) but DSR is a per-period quantity, and
+        below the guardrail oos_sharpe is already 0 → a consistent per-obs 0.
         """
-        if len(ev.oos_returns) >= 3:
+        if len(ev.oos_returns) >= 3 and StrategySelector._trust_pooled(ev, wf_enabled):
             return sharpe_per_obs(ev.oos_returns)
         ann = ev.oos_sharpe if (wf_enabled and ev.n_folds > 0) else ev.sharpe
         return ann / math.sqrt(_TRADING_DAYS)
@@ -372,14 +394,17 @@ class StrategySelector:
         their per-obs Sharpe dispersion sets how high a best-of-N fluke can
         reach. Returns the DSR info dict (with `n_obs`), or None when there
         aren't enough trials or observations to estimate it. Uses the pooled
-        OOS returns when present (real skew/kurt, real T — most accurate) and
-        falls back to summary stats for the no-WF scalar case.
+        OOS returns when present AND trusted by the independent-sample guardrail
+        (real skew/kurt, real T — most accurate); else falls back to summary
+        stats fed the guardrail-consistent (possibly zeroed) Sharpe, so a
+        single-populated-fold winner never reports a Sharpe the score zeroed.
         """
         trials = [StrategySelector._per_obs_sharpe(ev, wf_enabled)
                   for ev in ranking]
         if len(trials) < _MIN_DSR_TRIALS:
             return None
-        if len(winner.oos_returns) >= 3:
+        if (len(winner.oos_returns) >= 3
+                and StrategySelector._trust_pooled(winner, wf_enabled)):
             info = deflated_sharpe_ratio(winner.oos_returns, trials)
         elif winner.n_obs >= 3:
             info = deflated_sharpe_from_stats(

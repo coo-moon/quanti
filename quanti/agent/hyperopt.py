@@ -137,8 +137,13 @@ class HyperOptimizer:
         tuned = _wf(best_combo)
         default = _wf({})
 
-        # 3) Accept gate.
-        folds_ok = len(tuned.folds) >= self.min_folds
+        # 3) Accept gate. Count *populated* folds, not requested ones:
+        # run_walk_forward appends a FoldResult for every fold (empty ones
+        # included), so len(tuned.folds) == n_folds always and the old
+        # `len(folds) >= min_folds` was vacuous (n_folds default 6 ≥ 2). The
+        # OOS Sharpe is only an independent-cycle signal across enough populated
+        # blocks — the same floor _aggregate uses to trust it.
+        folds_ok = tuned.n_populated_folds >= self.min_folds
         trades_ok = tuned.total_trades_oos >= self.min_trades_oos
         beats = tuned.oos_sharpe > default.oos_sharpe + self.accept_margin
         positive = tuned.oos_sharpe > 0
@@ -146,7 +151,7 @@ class HyperOptimizer:
         if accepted:
             verdict = "accepted"
         elif not folds_ok:
-            verdict = f"rejected: folds {len(tuned.folds)} < {self.min_folds}"
+            verdict = f"rejected: folds {tuned.n_populated_folds} < {self.min_folds}"
         elif not trades_ok:
             verdict = f"rejected: trades {tuned.total_trades_oos} < {self.min_trades_oos}"
         else:
