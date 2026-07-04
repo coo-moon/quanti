@@ -1107,11 +1107,13 @@ class AgentRuntime:
         result = self._broker.execute_signals(signals, strategy_name=strategy_name)
         snap = self._broker.snapshot_portfolio()
 
-        # In pending mode, `result.filled` is 0 and `result.pending` is the
-        # count of queued signals. Surface both so users see the lifecycle.
+        # Pending mode can mix outcomes in one batch: in-session SELLs fill
+        # immediately (live-mirror) while BUYs queue — surface both counts.
         # `pending_result` (from the start of this tick) shows what filled
         # from PRIOR ticks' queue at today's open.
-        landed_label = f"成交 {result.filled}" if result.filled else f"挂单 {result.pending}"
+        landed_bits = ([f"成交 {result.filled}"] if result.filled else []) \
+            + ([f"挂单 {result.pending}"] if result.pending else [])
+        landed_label = "/".join(landed_bits) or "成交 0"
         pre_filled = pending_result.filled if pending_result else 0
         pre_pending = pending_result.still_pending if pending_result else 0
         pre_expired = pending_result.expired if pending_result else 0

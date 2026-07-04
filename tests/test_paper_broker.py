@@ -435,17 +435,23 @@ def test_intraday_snapshot_not_persisted(setup, monkeypatch):
 
 def test_intraday_crash_triggers_stop_via_check_exits(setup, monkeypatch):
     """The point of the paper intraday guard: a stop hit at TODAY's realtime
-    price queues the exit today, instead of waiting for today's bar to land.
-    The fill itself stays pending (next bar's open) — marks never price fills."""
+    price exits TODAY at that price (live-mirror market sell), instead of
+    waiting for today's bar to land and filling at tomorrow's open."""
+    from datetime import timedelta as _td
     db, provider, _ = setup
     db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
-    # -20% intraday: through the -15% stop floor, inside the ±35% band.
-    broker = _mk_broker(db, provider, lambda codes: {"000001": 8.0})
+    # -8% vs yesterday's close: through the ~-4% ATR stop (k=2, ATR≈2% on the
+    # fixture walk) but above the -10% main-board limit-down, so the market
+    # sell is actually fillable — a realistic single-day stop hit.
+    raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
+    crash = raw_close * 0.92
+    broker = _mk_broker(db, provider, lambda codes: {"000001": crash})
     _in_session(monkeypatch, True)
     assert broker.check_exits() >= 1
-    pending = db.list_orders(limit=10, status="pending")
-    assert [o for o in pending if o["direction"] == "sell"]
-    assert not [t for t in db.list_trades() if t["direction"] == "sell"]
+    sells = [t for t in db.list_trades() if t["direction"] == "sell"]
+    assert sells and sells[0]["price"] == pytest.approx(crash * (1 - 0.001))
+    assert db.list_positions() == []
+    assert db.list_orders(limit=10, status="pending") == []
 
 
 def test_no_quote_fn_keeps_legacy_marks(setup):
@@ -456,30 +462,46 @@ def test_no_quote_fn_keeps_legacy_marks(setup):
     assert snap["positions"][0]["current_price"] > 0
 
 
-# ---------------------------------------------------------- market sell
+# ------------------------------------------------- live-mirror market sells
 
-def test_sell_at_market_fills_at_realtime_mark(setup, monkeypatch):
+def test_in_session_sell_fills_now_at_realtime_price(setup, monkeypatch):
+    """Pending mode + in-session quote: a SELL fills immediately at the
+    realtime mark, exactly like a live market sell via xtdata."""
     db, provider, _ = setup
     db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
     broker = _mk_broker(db, provider, lambda codes: {"000001": 10.8})
     _in_session(monkeypatch, True)
-    r = broker.sell_at_market("000001")
-    assert r["filled"] is True and r["price"] == pytest.approx(10.8)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "exit"), "t") == "filled"
     assert db.list_positions() == []
     sells = [t for t in db.list_trades() if t["direction"] == "sell"]
     assert sells and sells[0]["price"] == pytest.approx(10.8 * (1 - 0.001))
 
 
-def test_sell_at_market_rejects_without_quote(setup, monkeypatch):
+def test_off_session_sell_queues_as_before(setup, monkeypatch):
     db, provider, _ = setup
     db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
     broker = _mk_broker(db, provider, lambda codes: {"000001": 10.8})
-    _in_session(monkeypatch, False)  # off-session → no realtime quote
-    with pytest.raises(ValueError):
-        broker.sell_at_market("000001")
+    _in_session(monkeypatch, False)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "exit"), "t") == "pending"
+    assert db.list_positions() != []
+    assert db.list_orders(limit=10, status="pending")
 
 
-def test_sell_at_market_rejects_limit_down_lock(setup, monkeypatch):
+def test_in_session_buy_still_queues(setup, monkeypatch):
+    """Live-mirror is sells-only: BUYs keep the next-open queue semantics."""
+    db, provider, _ = setup
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.8})
+    _in_session(monkeypatch, True)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.BUY, 0.5, "entry"), "t") == "pending"
+    assert db.list_positions() == []
+
+
+def test_limit_down_locked_sell_falls_back_to_queue(setup, monkeypatch):
+    """Into a limit-down lock a market sell can't fill — the order rests in
+    the queue (like at a live venue) instead of being rejected."""
     from datetime import timedelta as _td
     db, provider, _ = setup
     db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
@@ -487,18 +509,125 @@ def test_sell_at_market_rejects_limit_down_lock(setup, monkeypatch):
     locked = raw_close * 0.90  # main board -10% = limit-down
     broker = _mk_broker(db, provider, lambda codes: {"000001": locked})
     _in_session(monkeypatch, True)
-    with pytest.raises(ValueError, match="跌停"):
-        broker.sell_at_market("000001")
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "exit"), "t") == "pending"
+    assert db.list_positions() != []
 
 
-def test_sell_at_market_cancels_queued_sell(setup, monkeypatch):
-    """A pending SELL for the code is superseded — no double-fill tomorrow."""
+def test_t1_frozen_sell_falls_back_to_queue(setup, monkeypatch):
+    """A holding entirely bought today can't sell now (T+1) — queue it so it
+    still fills at tomorrow's open instead of being rejected outright."""
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date.today(),
+                       frozen_qty=1000, frozen_date=date.today())
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.8})
+    _in_session(monkeypatch, True)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "exit"), "t") == "pending"
+    assert db.list_positions() != []
+
+
+def test_market_sell_supersedes_queued_sell(setup, monkeypatch):
+    """An overnight queued SELL is cancelled when the in-session market sell
+    fills — no double-fill tomorrow."""
     db, provider, _ = setup
     db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
     broker = _mk_broker(db, provider, lambda codes: {"000001": 10.5})
-    assert broker.execute_signal(
-        Signal("000001", Direction.SELL, 1.0, "queued exit"), "t") is True
-    assert db.list_orders(limit=10, status="pending")
+    _in_session(monkeypatch, False)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "queued exit"), "t") == "pending"
     _in_session(monkeypatch, True)
-    assert broker.sell_at_market("000001")["filled"] is True
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "exit now"), "t") == "filled"
     assert db.list_orders(limit=10, status="pending") == []
+    assert db.list_positions() == []
+
+
+def test_partial_t1_full_exit_fills_settled_and_queues_frozen_rest(setup, monkeypatch):
+    """Settled 1000 + 400 frozen today, full exit in-session: the settled
+    shares fill now at the mark; the frozen remainder is re-queued so the
+    exit intent still lands at the next open (never silently stranded)."""
+    db, provider, _ = setup
+    db.upsert_position("000001", 1400, 10.0, 10.0, date(2020, 1, 1),
+                       frozen_qty=400, frozen_date=date.today())
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.8})
+    _in_session(monkeypatch, True)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "exit"), "t") == "filled"
+    sells = [t for t in db.list_trades() if t["direction"] == "sell"]
+    assert sells and sells[0]["quantity"] == 1000
+    assert db.list_positions()[0]["quantity"] == 400
+    pending = db.list_orders(limit=10, status="pending")
+    assert [o for o in pending if o["direction"] == "sell"]
+
+
+def test_trim_partial_sell_leaves_resting_full_exit_alone(setup, monkeypatch):
+    """A 削峰 trim is a partial-intent sell: it must NOT cancel a resting
+    full-exit order (which still owns the remainder's exit tomorrow)."""
+    from quanti.risk.manager import DRIFT_TRIM_STRATEGY
+    db, provider, _ = setup
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.5})
+    _in_session(monkeypatch, False)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "full exit"), "t") == "pending"
+    _in_session(monkeypatch, True)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 0.5, "trim"),
+        DRIFT_TRIM_STRATEGY) == "filled"
+    # Trim sold half; the resting full-exit order survives for the rest.
+    assert db.list_positions()[0]["quantity"] == 500
+    assert [o for o in db.list_orders(limit=10, status="pending")
+            if o["direction"] == "sell"]
+
+
+def test_sublot_trim_reject_preserves_resting_order(setup, monkeypatch):
+    """A trim that lot-rounds to zero rejects WITHOUT destroying the resting
+    full-exit order (the old code cancelled first, then rejected)."""
+    from quanti.risk.manager import DRIFT_TRIM_STRATEGY
+    db, provider, _ = setup
+    db.upsert_position("000001", 100, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.5})
+    _in_session(monkeypatch, False)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "full exit"), "t") == "pending"
+    _in_session(monkeypatch, True)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 0.3, "trim"),
+        DRIFT_TRIM_STRATEGY) == "rejected"
+    assert [o for o in db.list_orders(limit=10, status="pending")
+            if o["direction"] == "sell"]
+    assert db.list_positions()[0]["quantity"] == 100
+
+
+def test_market_sell_respects_b1_participation_cap(setup, monkeypatch):
+    """In-session fills honor the B1 single-bar 25% participation cap
+    (yesterday's turnover as proxy); the un-filled remainder re-queues."""
+    db, provider, _ = setup
+    db.upsert_position("000001", 300_000, 10.0, 10.0, date(2020, 1, 1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.8})
+    _in_session(monkeypatch, True)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "exit"), "t") == "filled"
+    sells = [t for t in db.list_trades() if t["direction"] == "sell"]
+    qty = sells[0]["quantity"]
+    remaining = db.list_positions()[0]["quantity"]
+    assert 0 < qty < 300_000 and qty + remaining == 300_000
+    assert [o for o in db.list_orders(limit=10, status="pending")
+            if o["direction"] == "sell"]
+
+
+def test_st_stock_uses_5pct_limit_down_band(setup, monkeypatch):
+    """ST names lock at -5%: a -6% quote must fall back to the queue even
+    though the main-board band (-10%) would have let it fill."""
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    db.upsert_stock("000001", "ST平安", "SZ", date(1991, 4, 3), "银行")
+    db.upsert_position("000001", 1000, 10.0, 10.0, date(2020, 1, 1))
+    raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
+    broker = _mk_broker(db, provider,
+                        lambda codes: {"000001": raw_close * 0.94})
+    _in_session(monkeypatch, True)
+    assert broker.execute_signal_ex(
+        Signal("000001", Direction.SELL, 1.0, "exit"), "t") == "pending"
+    assert db.list_positions()[0]["quantity"] == 1000

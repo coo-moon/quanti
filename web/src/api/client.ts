@@ -354,10 +354,8 @@ export const fetchPendingOrders = () =>
   api.get<PendingOrderDetail[]>("/orders/pending");
 export const fetchTrades = (limit = 100) => api.get<unknown[]>("/trades", { params: { limit } });
 export const manualOrder = (data: { code: string; direction: "buy" | "sell"; strength?: number; reason?: string }) =>
-  api.post<{ filled: boolean; snapshot: Portfolio }>("/orders/manual", data);
-export const sellAtMarket = (code: string) =>
-  api.post<{ filled: boolean; price: number; snapshot: Portfolio }>(
-    `/positions/${code}/sell-market`);
+  api.post<{ filled: boolean; status: "filled" | "pending" | "rejected"; snapshot: Portfolio }>(
+    "/orders/manual", data);
 
 export const agentStart = () => api.post<{ status: string }>("/agent/start");
 export const agentStop = () => api.post<{ status: string }>("/agent/stop");

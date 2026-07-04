@@ -304,9 +304,9 @@
               <td :class="p.pnl_pct >= 0 ? 'up' : 'down'">{{ formatPct(p.pnl_pct) }}</td>
               <td>{{ p.entry_strategy || "—" }}</td>
               <td>
-                <button class="btn-link" :disabled="busy || !liveStatus.guard.in_session"
-                        :title="liveStatus.guard.in_session ? '按当前实时价立即成交' : '仅交易时段可用'"
-                        @click="sellMarket(p.code, p.current_price)">实时卖出</button>
+                <button class="btn-link" :disabled="busy"
+                        :title="liveStatus.guard.in_session ? '交易时段:按当前实时价立即成交' : '非交易时段:挂单,次日开盘成交'"
+                        @click="sellOne(p.code)">卖出</button>
               </td>
             </tr>
           </tbody>
@@ -359,11 +359,10 @@
             <td :title="p.score == null ? '已掉出候选池(换仓视作最弱)' : ''">
               {{ p.score == null ? "—" : p.score.toFixed(2) }}
             </td>
-            <td class="nowrap">
-              <button class="btn-link" @click="sellOne(p.code)">挂单卖出</button>
-              <button class="btn-link" v-if="liveStatus?.guard.in_session" :disabled="busy"
-                      title="按当前实时价立即成交"
-                      @click="sellMarket(p.code, p.current_price)">实时卖出</button>
+            <td>
+              <button class="btn-link" :disabled="busy"
+                      :title="liveStatus?.guard.in_session ? '交易时段:按当前实时价立即成交' : '非交易时段:挂单,次日开盘成交'"
+                      @click="sellOne(p.code)">卖出</button>
             </td>
           </tr>
         </tbody>
@@ -623,7 +622,6 @@ import {
   fetchScreeners,
   fetchStrategies,
   manualOrder,
-  sellAtMarket,
   resetPortfolio,
   updateGoal,
   runOptimizeAsync,
@@ -1225,30 +1223,22 @@ async function placeManual() {
 }
 
 async function sellOne(code: string) {
-  if (!confirm(`确认全部卖出 ${code} ?(挂单,次日开盘成交)`)) return;
+  const inSession = liveStatus.value?.guard.in_session;
+  const how = inSession ? "交易时段内将按当前实时价立即成交"
+    : "非交易时段,挂单次日开盘成交";
+  if (!confirm(`确认全部卖出 ${code} ?(${how})`)) return;
   busy.value = true;
   try {
     const r = await manualOrder({ code, direction: "sell", reason: "manual sell" });
-    setMessage(r.data.filled ? "已卖出" : "卖出失败", !r.data.filled);
-    portfolio.value = r.data.snapshot;
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function sellMarket(code: string, price?: number) {
-  const hint = price ? ` ≈¥${price.toFixed(2)}` : "";
-  if (!confirm(`确认按当前实时价${hint} 市价卖出 ${code} 全部可卖数量?(立即成交)`)) return;
-  busy.value = true;
-  try {
-    const r = await sellAtMarket(code);
     setMessage(
-      r.data.filled ? `已按 ¥${r.data.price.toFixed(2)} 实时卖出 ${code}`
-        : "实时卖出被拒(T+1 冻结/无可卖数量)", !r.data.filled);
+      r.data.status === "filled" ? `已按当前实时价卖出 ${code}`
+        : r.data.status === "pending" ? `卖出已提交 ${code},尚未成交(挂单)`
+          : "卖出被拒(T+1 冻结/无持仓/风控)",
+      r.data.status === "rejected");
     portfolio.value = r.data.snapshot;
     await loadStatus();
   } catch (e: any) {
-    setMessage("实时卖出失败: " + (e?.response?.data?.detail ?? e?.message ?? e), true);
+    setMessage("卖出失败: " + (e?.response?.data?.detail ?? e?.message ?? e), true);
   } finally {
     busy.value = false;
   }

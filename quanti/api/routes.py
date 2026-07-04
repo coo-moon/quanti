@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from datetime import date, timedelta
 
@@ -961,23 +962,6 @@ async def live_status(request: Request):
     }
 
 
-@router.post("/positions/{code}/sell-market")
-async def sell_position_at_market(code: str, request: Request):
-    """Manual in-session market sell at the realtime mark (paper). 409 when
-    off-session / no quote / limit-down locked; brokers without the
-    capability (live QMT for now) get 501."""
-    broker = request.app.state.broker
-    fn = getattr(broker, "sell_at_market", None)
-    if fn is None:
-        raise HTTPException(status_code=501,
-                            detail="当前账户的 broker 不支持实时市价卖出")
-    try:
-        result = fn(code)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    return {**result, "snapshot": broker.snapshot_portfolio()}
-
-
 @router.post("/portfolio/reset")
 async def reset_portfolio(request: Request, initial_cash: float = 1_000_000.0):
     request.app.state.db.reset_portfolio(initial_cash)
@@ -1030,8 +1014,25 @@ async def manual_order(body: ManualOrderBody, request: Request):
         strength=max(min(body.strength, 1.0), 0.05),
         reason=body.reason,
     )
-    filled = broker.execute_signal(signal, strategy_name="manual")
-    return {"filled": filled, "snapshot": broker.snapshot_portfolio()}
+    # Manual orders can now move money synchronously (paper in-session
+    # market sell) — serialize with the guard/tick threads via the runtime's
+    # broker lock, same as every other mutation path.
+    lock = getattr(request.app.state.agent, "_broker_lock", None)
+    with (lock if lock is not None else contextlib.nullcontext()):
+        # Rich status when the broker offers it (paper: "filled" = in-session
+        # realtime fill, "pending" = queued for next open). QmtBroker has no
+        # execute_signal_ex — derive from its BrokerResult instead of the
+        # bool, which reads venue-accepted-but-resting as if it had filled.
+        ex = getattr(broker, "execute_signal_ex", None)
+        if ex is not None:
+            status = ex(signal, strategy_name="manual")
+        else:
+            r = broker.execute_signals([signal], strategy_name="manual")
+            status = ("filled" if r.filled
+                      else "pending" if r.pending else "rejected")
+        snapshot = broker.snapshot_portfolio()
+    return {"filled": status != "rejected", "status": status,
+            "snapshot": snapshot}
 
 
 @router.post("/agent/mine-factors/async")

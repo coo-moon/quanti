@@ -8,12 +8,21 @@ fingerprint-blocks python outright (curl passes, requests fails with any UA,
 direct or proxied), and tushare `stk_mins` is rate-limited to 1 call/HOUR on
 the 2000-credit tier. Live stays on xtdata via the qmt-bridge; this module is
 paper-only by wiring (see execution.factory).
+
+Freshness guarantee: only quotes PRINTED TODAY (Beijing) are returned — the
+endpoint reports a suspended/halted name's LAST trade, which can be days old,
+so each line's last-trade timestamp (field 30) is checked against today.
+Absent codes make marks fall back to the daily close and market sells fall
+back to the queue: a fill can never happen at a previous day's price.
 """
 
 from __future__ import annotations
 
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
+
+_BEIJING = timezone(timedelta(hours=8))
 
 _URL = "https://qt.gtimg.cn/q="
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -44,28 +53,38 @@ def _qt_symbol(code: str) -> str:
     return ("sh" if code[0] in "69" else "sz") + code
 
 
-def _parse(text: str) -> dict[str, float]:
-    """`v_sh600519="1~贵州茅台~600519~1194.45~..."` lines → {code: last}."""
+def _parse(text: str, require_date: str | None = None) -> dict[str, float]:
+    """`v_sh600519="1~贵州茅台~600519~1194.45~..."` lines → {code: last}.
+
+    Field 3 = last price; field 30 = last-trade timestamp (YYYYMMDDHHMMSS).
+    With `require_date` ("YYYYMMDD"), lines whose print is from any other
+    day are dropped — a suspended name reports its last trade, days old.
+    """
     out: dict[str, float] = {}
     for line in text.splitlines():
         parts = line.split("~")
-        if len(parts) > 3:
-            try:
-                out[parts[2]] = float(parts[3])
-            except ValueError:
-                continue
+        if len(parts) <= 3:
+            continue
+        if require_date is not None and (
+                len(parts) <= 30 or not parts[30].startswith(require_date)):
+            continue
+        try:
+            out[parts[2]] = float(parts[3])
+        except ValueError:
+            continue
     return out
 
 
 def fetch_last_prices(codes: list[str]) -> dict[str, float]:
-    """Batch realtime last prices for bare 6-digit codes.
+    """Batch realtime last prices for bare 6-digit codes — today's prints
+    only (see module docstring).
 
     Raises on HTTP failure — callers own the fallback (PaperBroker degrades
     to daily-close marks with a warning). After a failure, calls within the
     backoff window fail fast without touching the network, so an outage
-    costs one timeout per backoff window instead of one per caller. Unknown
-    codes are absent from the result; suspended ones may come back 0.0 —
-    callers filter non-positive.
+    costs one timeout per backoff window instead of one per caller. Unknown,
+    suspended, and not-yet-traded codes are absent from the result;
+    a 0.0 price is possible in principle — callers filter non-positive.
     """
     global _cache, _last_fail
     wanted = frozenset(codes)
@@ -75,6 +94,7 @@ def fetch_last_prices(codes: list[str]) -> dict[str, float]:
     if (_last_fail is not None
             and time.monotonic() - _last_fail < _FAIL_BACKOFF_SEC):
         raise ConnectionError("qt.gtimg.cn: backing off after recent failure")
+    today = datetime.now(_BEIJING).strftime("%Y%m%d")
     valid = [c for c in codes if len(c) == 6 and c.isdigit()]
     out: dict[str, float] = {}
     try:
@@ -84,7 +104,8 @@ def fetch_last_prices(codes: list[str]) -> dict[str, float]:
                 _URL + ",".join(_qt_symbol(c) for c in batch),
                 headers={"User-Agent": _UA})
             with _OPENER.open(req, timeout=_TIMEOUT_SEC) as resp:
-                out.update(_parse(resp.read().decode("gbk", errors="replace")))
+                out.update(_parse(resp.read().decode("gbk", errors="replace"),
+                                  require_date=today))
     except Exception:
         _last_fail = time.monotonic()
         raise
