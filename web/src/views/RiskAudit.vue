@@ -240,6 +240,44 @@
           </table>
         </div>
       </div>
+
+      <!-- 历史股票盈亏(已平仓) -->
+      <div class="card">
+        <div class="card-header">
+          <h2>历史股票盈亏</h2>
+          <span class="card-header-hint" v-if="data.stock_pnl.length">
+            已平仓 FIFO 配对 · 含佣金 · 合计
+            <span :class="stockPnlTotal >= 0 ? 'pos' : 'neg'">{{ fmtPnl(stockPnlTotal) }}</span>
+          </span>
+        </div>
+        <div v-if="!data.stock_pnl.length" class="empty-state">
+          <p>暂无已平仓交易</p>
+          <p class="empty-hint">有卖出成交(平仓)后,这里按股票汇总历史盈亏</p>
+        </div>
+        <div v-else class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>股票</th><th>已平仓</th><th>累计盈亏</th><th>平均收益</th><th>胜率</th><th>最近一笔</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="s in data.stock_pnl" :key="s.code">
+                <td class="td-name">
+                  <span class="code-badge">{{ s.code }}</span>
+                  <span v-if="s.name && s.name !== s.code" class="stock-name">{{ s.name }}</span>
+                </td>
+                <td>{{ s.trips }} 笔</td>
+                <td :class="s.total_pnl >= 0 ? 'pos' : 'neg'">{{ fmtPnl(s.total_pnl) }}</td>
+                <td :class="s.avg_return >= 0 ? 'pos' : 'neg'">{{ signedPct(s.avg_return) }}</td>
+                <td>{{ (s.win_rate * 100).toFixed(0) }}%</td>
+                <td class="td-muted">
+                  <span :class="s.last_return >= 0 ? 'pos' : 'neg'">{{ signedPct(s.last_return) }}</span>
+                  <template v-if="s.last_sell_date"> · {{ s.last_sell_date }}</template>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </template>
 
     <div v-else-if="!err" class="empty-state"><p>加载中…</p></div>
@@ -257,9 +295,15 @@ const err = ref("");
 let timer: ReturnType<typeof setInterval> | null = null;
 
 const pct = (x: number | null) => (x == null ? "—" : (x * 100).toFixed(1) + "%");
+const signedPct = (x: number) => (x >= 0 ? "+" : "") + (x * 100).toFixed(1) + "%";
 const fmtMoney = (x: number | null) =>
   x == null ? "—" : "¥" + Math.round(x).toLocaleString("zh-CN");
+const fmtPnl = (x: number) =>
+  (x >= 0 ? "+¥" : "-¥") + Math.abs(Math.round(x)).toLocaleString("zh-CN");
 const fmtTime = (ts: string) => (ts ? new Date(ts).toLocaleString("zh-CN") : "—");
+
+const stockPnlTotal = computed(() =>
+  (data.value?.stock_pnl ?? []).reduce((sum, s) => sum + s.total_pnl, 0));
 
 // How far drawdown has eaten into the breaker budget, 0–100%.
 const cbPct = computed(() => {
@@ -537,6 +581,11 @@ tbody tr:last-child td { border-bottom: none; }
   padding: 2px 8px;
   background: var(--color-bg);
   border-radius: 6px;
+}
+.stock-name {
+  margin-left: 8px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
 }
 .dot {
   display: inline-block;

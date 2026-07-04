@@ -64,6 +64,21 @@ class TestRealizedTrips:
         ])
         assert trips[0]["realized_return"] < 0
 
+    def test_realized_pnl_amount(self):
+        trips = realized_trips([
+            _t("600000", "buy", 100, 10.0, "2026-01-01"),
+            _t("600000", "sell", 100, 12.0, "2026-01-11"),
+        ])
+        assert trips[0]["realized_pnl"] == pytest.approx(200.0)
+
+    def test_realized_pnl_nets_commission(self):
+        # (9.9 - 10.1) × 100 = -20 — a flat price round-trip loses the fees
+        trips = realized_trips([
+            _t("X", "buy", 100, 10.0, "2026-01-01", comm=10.0),
+            _t("X", "sell", 100, 10.0, "2026-01-02", comm=10.0),
+        ])
+        assert trips[0]["realized_pnl"] == pytest.approx(-20.0)
+
     def test_open_position_yields_no_trip(self):
         assert realized_trips([_t("X", "buy", 100, 10.0, "2026-01-01")]) == []
 
