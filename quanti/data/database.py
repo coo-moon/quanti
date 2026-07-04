@@ -1535,13 +1535,19 @@ class Database:
         )
         self.conn.commit()
 
-    def list_trades(self, limit: int = 200) -> list[dict]:
-        rows = self.conn.execute(
+    def list_trades(self, limit: int | None = 200) -> list[dict]:
+        """Trades newest-first. limit=None returns the full history — FIFO
+        consumers (reflection round-trips) need it: a recent-N window cuts
+        off the oldest buy legs and mismatches the sells against later lots."""
+        sql = (
             "SELECT trade_id, order_id, code, direction, quantity, price, commission, "
             "strategy_name, trade_date, created_at FROM trades "
-            "ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+            "ORDER BY created_at DESC"
+        )
+        if limit is None:
+            rows = self.conn.execute(sql).fetchall()
+        else:
+            rows = self.conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
         return [
             {
                 "trade_id": r[0], "order_id": r[1], "code": r[2],

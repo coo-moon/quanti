@@ -16,7 +16,9 @@ env/
 *.db-wal
 *.db.bak
 *.sqlite3
-data/
+# Runtime artifacts at the repo root only — an unanchored `data/` would also
+# ignore the quanti/data/ source package.
+/data/
 node_modules/
 web/dist/
 .pytest_cache/
