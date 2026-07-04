@@ -247,7 +247,7 @@
           <h2>历史股票盈亏</h2>
           <span class="card-header-hint" v-if="data.stock_pnl.length">
             已平仓 FIFO 配对 · 含佣金 · 合计
-            <span :class="stockPnlTotal >= 0 ? 'pos' : 'neg'">{{ fmtPnl(stockPnlTotal) }}</span>
+            <span :class="pnlClass(stockPnlTotal)">{{ fmtPnl(stockPnlTotal) }}</span>
           </span>
         </div>
         <div v-if="!data.stock_pnl.length" class="empty-state">
@@ -266,11 +266,11 @@
                   <span v-if="s.name && s.name !== s.code" class="stock-name">{{ s.name }}</span>
                 </td>
                 <td>{{ s.trips }} 笔</td>
-                <td :class="s.total_pnl >= 0 ? 'pos' : 'neg'">{{ fmtPnl(s.total_pnl) }}</td>
-                <td :class="s.avg_return >= 0 ? 'pos' : 'neg'">{{ signedPct(s.avg_return) }}</td>
+                <td :class="pnlClass(s.total_pnl)">{{ fmtPnl(s.total_pnl) }}</td>
+                <td :class="pnlClass(s.avg_return)">{{ signedPct(s.avg_return) }}</td>
                 <td>{{ (s.win_rate * 100).toFixed(0) }}%</td>
                 <td class="td-muted">
-                  <span :class="s.last_return >= 0 ? 'pos' : 'neg'">{{ signedPct(s.last_return) }}</span>
+                  <span :class="pnlClass(s.last_return)">{{ signedPct(s.last_return) }}</span>
                   <template v-if="s.last_sell_date"> · {{ s.last_sell_date }}</template>
                 </td>
               </tr>
@@ -301,6 +301,9 @@ const fmtMoney = (x: number | null) =>
 const fmtPnl = (x: number) =>
   (x >= 0 ? "+¥" : "-¥") + Math.abs(Math.round(x)).toLocaleString("zh-CN");
 const fmtTime = (ts: string) => (ts ? new Date(ts).toLocaleString("zh-CN") : "—");
+
+// A-share convention: gains red, losses green, flat neutral.
+const pnlClass = (x: number) => (x > 0 ? "gain" : x < 0 ? "loss" : "muted");
 
 const stockPnlTotal = computed(() =>
   (data.value?.stock_pnl ?? []).reduce((sum, s) => sum + s.total_pnl, 0));
@@ -484,6 +487,10 @@ onUnmounted(() => {
 .stat-value.neg, .neg { color: #ff3b30; }
 .stat-value.pos, .pos { color: #34c759; }
 .stat-value.muted, .muted { color: var(--color-text-tertiary); }
+/* P&L direction — A-share convention (红涨绿跌), distinct from the risk
+   .pos/.neg above where green/red mean good/bad rather than up/down. */
+.gain { color: var(--color-red); }
+.loss { color: var(--color-green); }
 
 .two-col {
   display: grid;
