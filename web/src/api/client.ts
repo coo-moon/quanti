@@ -411,6 +411,17 @@ export interface RiskAudit {
     headroom: number | null;
   };
   recent_exits: RiskExitEvent[];
+  stock_pnl: StockPnlItem[];
+}
+export interface StockPnlItem {
+  code: string;
+  name: string;
+  trips: number;
+  total_pnl: number;
+  avg_return: number;
+  win_rate: number;
+  last_sell_date: string | null;
+  last_return: number;
 }
 export const fetchRiskAudit = (exitsLimit = 50) =>
   api.get<RiskAudit>("/risk/audit", { params: { exits_limit: exitsLimit } });
