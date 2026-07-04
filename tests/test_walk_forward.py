@@ -395,8 +395,8 @@ class TestDSRGate:
             strategy_name=name, annual_return=0.1, max_drawdown=-0.05,
             sharpe=ann, total_trades=len(r), score=0.0,
             oos_annual_return=0.1, oos_max_drawdown=-0.05, oos_sharpe=ann,
-            oos_consistency=0.0, n_folds=3, oos_trades=len(r),
-            n_obs=len(r), oos_returns=r)
+            oos_consistency=0.0, n_folds=3, n_populated_folds=3,
+            oos_trades=len(r), n_obs=len(r), oos_returns=r)
 
     @classmethod
     def _noise_ranking(cls, seed: int, n: int = 20):
@@ -442,12 +442,54 @@ class TestDSRGate:
             n_folds=3, oos_trades=30, n_obs=200)
         assert StrategySelector._per_obs_sharpe(scalar, wf_enabled=True) == \
             pytest.approx(1.0)
-        # Returns path uses the series directly (no ÷√252 double-count).
+        # Returns path uses the series directly (no ÷√252 double-count) — but
+        # only once the independent-sample guardrail is cleared (≥2 populated).
         series = StrategyEvaluation(
-            "s2", 0.1, -0.05, 0.0, 30, 0.0, n_folds=3, oos_trades=30,
-            oos_returns=[0.01, -0.005, 0.008, 0.002, 0.01])
+            "s2", 0.1, -0.05, 0.0, 30, 0.0, n_folds=3, n_populated_folds=2,
+            oos_trades=30, oos_returns=[0.01, -0.005, 0.008, 0.002, 0.01])
         assert StrategySelector._per_obs_sharpe(series, wf_enabled=True) == \
             pytest.approx(sharpe_per_obs(series.oos_returns))
+
+    def test_per_obs_sharpe_honors_populated_fold_guardrail(self):
+        """The DSR path must respect the same independent-sample guardrail the
+        score path uses. A pooled OOS series from a SINGLE populated fold is one
+        draw/regime — _aggregate zeroes its oos_sharpe — so _per_obs_sharpe must
+        NOT resurrect a nonzero per-obs Sharpe from the raw series. Otherwise DSR
+        diagnoses a Sharpe the score already judged untrustworthy (=0)."""
+        from quanti.backtest.overfit import sharpe_per_obs
+        pooled = [0.02, 0.01, 0.03, 0.015, 0.025]  # >=3 obs, clearly positive
+        single = StrategyEvaluation(
+            "single_fold", 0.1, -0.05, 0.0, 30, 0.0,
+            oos_sharpe=0.0,  # _aggregate already zeroed it (guardrail tripped)
+            n_folds=3, oos_trades=30, n_obs=len(pooled),
+            n_populated_folds=1, oos_returns=pooled)
+        assert StrategySelector._per_obs_sharpe(single, wf_enabled=True) == 0.0
+        # With ≥2 populated folds the same series IS trusted (exact per-obs).
+        multi = StrategyEvaluation(
+            "two_folds", 0.1, -0.05, 0.0, 30, 0.0,
+            oos_sharpe=annualized_sharpe(pooled),
+            n_folds=3, oos_trades=30, n_obs=len(pooled),
+            n_populated_folds=2, oos_returns=pooled)
+        assert StrategySelector._per_obs_sharpe(multi, wf_enabled=True) == \
+            pytest.approx(sharpe_per_obs(pooled))
+
+    def test_winner_dsr_untrusts_single_populated_fold(self):
+        """_winner_dsr must also honor the guardrail: a winner backed by a single
+        populated fold reports sr_observed=0 (routed through the summary-stat path
+        fed the guardrail-zeroed Sharpe), not the raw pooled-series Sharpe."""
+        pooled = [0.02, 0.01, 0.03, 0.015, 0.025]
+        winner = StrategyEvaluation(
+            "single_fold", 0.1, -0.05, 0.0, 30, 0.0, oos_sharpe=0.0,
+            n_folds=3, oos_trades=30, n_obs=len(pooled),
+            n_populated_folds=1, oos_returns=pooled)
+        other = StrategyEvaluation(
+            "healthy", 0.1, -0.05, 0.0, 30, 0.0,
+            oos_sharpe=annualized_sharpe([0.005] * 40),
+            n_folds=3, oos_trades=40, n_obs=40,
+            n_populated_folds=3, oos_returns=[0.005] * 40)
+        dsr = StrategySelector._winner_dsr(winner, [winner, other], wf_enabled=True)
+        assert dsr is not None
+        assert dsr["sr_observed"] == 0.0
 
     # -- wiring: does the gate actually move the weights? -----------------
     def _run_pick_topk(self, monkeypatch, ranking, params):
