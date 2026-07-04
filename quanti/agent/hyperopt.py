@@ -56,11 +56,17 @@ class OptimizeResult:
 
 
 class HyperOptimizer:
-    def __init__(self, engine, *, train_days: int = 365, n_folds: int = 3,
-                 warmup_days: int = 120, test_days: int = 21,
+    def __init__(self, engine, *, train_days: int = 1095, n_folds: int = 6,
+                 warmup_days: int = 120, test_days: int = 126,
                  max_combos: int = 64, accept_margin: float = 0.1,
                  min_folds: int = 2, min_trades_oos: int = 5,
                  seed: int = 42) -> None:
+        # Depth defaults deepened (was train=365d, 3×21d OOS ≈ 63 OOS days) so
+        # tuning validates over more history: 6×126d ≈ 2y OOS across regimes,
+        # preceded by a 3y train window. Unlike the Selector, hyperopt CANNOT
+        # eat the *full* history — it grid-searches params on a TRAIN window
+        # that must sit strictly before the OOS folds, so the folds stay bounded
+        # to leave room for training.
         self._engine = engine
         self.train_days = train_days
         self.n_folds = n_folds

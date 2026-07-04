@@ -116,6 +116,12 @@ class AgentRuntime:
         # reuse the cached pick — saves running a 6-strategy backtest sweep
         # on every 4h tick (~9× faster ticks once cache is warm).
         self._selector_cache: tuple[float, str, list[dict]] | None = None
+        # Ensemble/LLM top-K selection cache: (timestamp, [(name, weight)],
+        # evaluations). Same purpose and cadence as _selector_cache but for the
+        # fused-candidate path — pick_topk runs a per-strategy walk-forward
+        # sweep that, spanning the full history, is far too heavy to repeat on
+        # every tick. The per-tick signal fusion downstream still runs fresh.
+        self._topk_cache: tuple[float, list[tuple[str, float]], list[dict]] | None = None
         # Universe cache: (today, config_key, filtered_codes). Liquidity /
         # age / name filters only change daily, so we cache the filtered
         # list and reuse for ticks within the same trading day. See
@@ -546,10 +552,26 @@ class AgentRuntime:
         sentiment_blend = float(params.get("sentiment_blend", 0.0))
         sentiment_max_codes = int(params.get("sentiment_max_codes", 30))
 
-        selector = StrategySelector(self._db, self._provider,
-                                    self._strategies_dir)
-        pairs, ranking = selector.pick_topk(goal, candidates, k=k)
-        evaluations = [e.as_dict() for e in ranking]
+        # Reuse the cached top-K selection within _reselect_interval (mirrors
+        # the single-strategy _selector_cache). Strategy selection + weights are
+        # a slow-moving, expensive walk-forward result; only recompute it once
+        # per interval. Fresh strategy instances are loaded on a cache hit so no
+        # per-tick state carries across (same discipline as the single path).
+        now_ts = time.time()
+        cached = self._topk_cache
+        if cached is not None and now_ts - cached[0] < self._reselect_interval:
+            name_weights, evaluations = cached[1], cached[2]
+            by_name = {s.name: s
+                       for s in StrategyLoader().load_directory(self._strategies_dir)}
+            pairs = [(by_name[n], w) for n, w in name_weights if n in by_name]
+        else:
+            selector = StrategySelector(self._db, self._provider,
+                                        self._strategies_dir)
+            pairs, ranking = selector.pick_topk(goal, candidates, k=k)
+            evaluations = [e.as_dict() for e in ranking]
+            if pairs:  # only cache a real selection; empty → retry next tick
+                self._topk_cache = (now_ts, [(s.name, w) for s, w in pairs],
+                                    evaluations)
         if not pairs:
             return [], evaluations, {}
 

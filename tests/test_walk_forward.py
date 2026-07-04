@@ -83,6 +83,31 @@ class TestMakeFolds:
         # folds[3] is the oldest
         assert folds[3].test_end < folds[0].test_end
 
+    def test_history_start_tiles_full_span(self):
+        # history_start overrides n_folds: tile [start+warmup, end] with
+        # test_days blocks so walk-forward eats the whole available history.
+        end = date(2026, 7, 3)
+        start = date(2016, 6, 27)  # ~10 years
+        folds = make_folds(end, history_start=start, warmup_days=120,
+                           test_days=126, max_folds=40)
+        span_days = (end - start).days - 120
+        assert len(folds) == span_days // 126
+        assert len(folds) > 20  # ~28 half-year blocks over 10y — far past 3
+        # Newest still ends at `end`; oldest fold's warmup never predates data.
+        assert folds[0].test_end == end
+        assert folds[-1].warmup_start >= start
+
+    def test_history_start_respects_max_folds_cap(self):
+        end = date(2026, 7, 3)
+        start = date(2000, 1, 1)  # absurdly long → cap must bite
+        folds = make_folds(end, history_start=start, test_days=63, max_folds=10)
+        assert len(folds) == 10
+
+    def test_history_start_none_is_backward_compatible(self):
+        end = date(2026, 5, 25)
+        assert make_folds(end) == make_folds(end, history_start=None)
+        assert len(make_folds(end)) == 3  # unchanged default
+
 
 class _LuckyStrategy(BaseStrategy):
     """Emits one BUY on a specific target date, nothing else.
@@ -229,6 +254,27 @@ class TestSelectorWFScoring:
         assert agg.oos_sharpe == 0.0
         assert agg.oos_consistency == 0.0
 
+    def test_single_populated_fold_sharpe_untrusted(self):
+        """Independent-sample guardrail: even with plenty of pooled obs, a
+        Sharpe from a SINGLE populated OOS block is not an independent-cycle
+        signal → reported 0. Needs ≥2 populated folds."""
+        f = Fold(date(2024, 1, 1), date(2024, 2, 1), date(2024, 3, 1))
+        many = [0.01] * 40  # 40 obs, well past _MIN_POOLED_OBS
+        agg = _aggregate([FoldResult(fold=f, metrics={"annual_return": 0.1},
+                                     n_trades_oos=8, oos_returns=many)])
+        assert agg.n_populated_folds == 1
+        assert agg.oos_sharpe == 0.0  # single block → untrusted
+
+    def test_n_populated_folds_counts_only_folds_with_returns(self):
+        f = Fold(date(2024, 1, 1), date(2024, 2, 1), date(2024, 3, 1))
+        good = FoldResult(fold=f, metrics={"annual_return": 0.1},
+                          n_trades_oos=6, oos_returns=[0.01] * 15)
+        empty = FoldResult(fold=f, metrics={}, n_trades_oos=0, oos_returns=[])
+        agg = _aggregate([good, good, empty])
+        assert agg.n_populated_folds == 2
+        assert agg.as_dict()["n_populated_folds"] == 2
+        assert agg.oos_sharpe > 0  # 2 populated blocks, 30 obs → trusted
+
     def test_score_ignores_oos_sharpe_below_min_trades(self):
         """A WF result with too few OOS trades must not earn the Sharpe or
         consistency score components — its Sharpe is sampling noise (E1)."""
@@ -262,13 +308,56 @@ class TestSelectorWFScoring:
                                     strategies_dir="strategies",
                                     training_days=200)
         # Smaller windows so we fit in 300 days of seeded data.
-        goal = Goal(params={"wf_enabled": True, "wf_n_folds": 2,
+        goal = Goal(params={"wf_enabled": True, "wf_full_history": False,
+                            "wf_n_folds": 2,
                             "wf_warmup_days": 60, "wf_test_days": 14})
         ranking = selector.evaluate(goal, codes=["000001"])
         assert len(ranking) > 0
         # At least one strategy should have populated WF data.
         any_wf = any(r.n_folds > 0 for r in ranking)
         assert any_wf, "expected at least one strategy with walk-forward folds"
+
+    def test_full_history_gate_skips_short_span_dead_band(self, tmp_path):
+        """A history too short for ≥2 half-year blocks must NOT take the
+        full-history path (which would yield a single fold the guardrail then
+        zeroes). It falls back to the fixed n_folds path instead — never the
+        degenerate 1-fold result. Regression for the gate/guard mismatch."""
+        db = Database(str(tmp_path / "short.db"))
+        db.initialize()
+        db.upsert_stock("000001", "平安银行", "SZ", date(1991, 4, 3), "银行")
+        # ~200 business days ≈ 280 calendar days: past the old warmup+test gate
+        # (246) but short of warmup+2·test (372) at default 120/126.
+        dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=200)
+        prices = 10 + np.arange(len(dates)) * 0.02
+        db.save_daily_quotes(pd.DataFrame({
+            "code": "000001", "date": [d.date() for d in dates],
+            "open": prices, "high": prices * 1.01, "low": prices * 0.99,
+            "close": prices, "volume": np.full(len(dates), 1e6),
+            "amount": prices * 1e6, "turnover": np.full(len(dates), 1.0)}))
+        provider = DataProvider(db)
+        selector = StrategySelector(db, provider, strategies_dir="strategies",
+                                    training_days=150)
+        ranking = selector.evaluate(Goal(params={"wf_enabled": True}),
+                                    codes=["000001"])
+        db.close()
+        assert ranking
+        # Fixed path → n_folds default (3); the buggy gate gave the degenerate 1.
+        assert all(r.n_folds != 1 for r in ranking)
+
+    def test_evaluate_full_history_spans_many_folds(self, seeded_long):
+        """Default wf_full_history=True tiles the whole seeded span into many
+        OOS blocks instead of the fixed 3 — that's 'eat the full history'."""
+        provider = DataProvider(seeded_long)
+        selector = StrategySelector(seeded_long, provider,
+                                    strategies_dir="strategies",
+                                    training_days=200)
+        # full_history default on; small blocks so the 300-day seed yields many.
+        goal = Goal(params={"wf_enabled": True,
+                            "wf_warmup_days": 40, "wf_test_days": 20})
+        ranking = selector.evaluate(goal, codes=["000001"])
+        assert ranking
+        assert max(r.n_folds for r in ranking) > 3, (
+            "full-history walk-forward should tile far more than the old 3 folds")
 
 
 class TestTopK:

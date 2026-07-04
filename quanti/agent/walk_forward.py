@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 # → reported as 0 ('no signal') and the selector's min-trades guard takes over.
 _MIN_POOLED_OBS = 20
 
+# Independent-sample guardrail: a Sharpe pooled from a SINGLE OOS block is not
+# an independent-cycle signal no matter how many daily obs it holds (one regime,
+# one draw). Require at least this many *populated* folds before trusting the
+# pooled OOS Sharpe; below it → 0 ('no independent-sample signal'), same as the
+# thin-pool guard. Spanning the full history (make_folds history_start) is what
+# makes this bite meaningfully — the blocks then straddle different regimes.
+_MIN_POPULATED_FOLDS = 2
+
 
 @dataclass
 class Fold:
@@ -62,6 +70,7 @@ class WalkForwardResult:
     oos_sharpe: float = 0.0
     oos_consistency: float = 0.0  # 1 - CoV of fold returns; high = stable
     total_trades_oos: int = 0
+    n_populated_folds: int = 0  # folds that actually produced OOS returns
 
     def as_dict(self) -> dict:
         return {
@@ -71,6 +80,7 @@ class WalkForwardResult:
             "oos_consistency": self.oos_consistency,
             "total_trades_oos": self.total_trades_oos,
             "n_folds": len(self.folds),
+            "n_populated_folds": self.n_populated_folds,
         }
 
 
@@ -79,6 +89,8 @@ def make_folds(
     n_folds: int = 3,
     warmup_days: int = 120,
     test_days: int = 21,
+    history_start: date | None = None,
+    max_folds: int = 40,
 ) -> list[Fold]:
     """Build `n_folds` non-overlapping OOS windows, newest first.
 
@@ -90,7 +102,17 @@ def make_folds(
     Newest fold is index 0; oldest is index n_folds-1. This ordering makes
     "fold 0" mean "most recent OOS month", which is the most relevant when
     debugging a recent decision.
+
+    When `history_start` is given, `n_folds` is IGNORED and instead derived so
+    the folds tile the whole available history: as many `test_days` blocks as
+    fit in [history_start + warmup_days, end], capped at `max_folds`. This is
+    how the selector "eats the full 10 years" instead of just the last ~3
+    months — every regime in the sample gets an OOS block. The warmup subtract
+    keeps the oldest fold's warmup tail inside the data (no pre-history reads).
     """
+    if history_start is not None:
+        oos_span_days = (end - history_start).days - warmup_days
+        n_folds = max(1, min(max_folds, oos_span_days // test_days))
     folds: list[Fold] = []
     for i in range(n_folds):
         test_end = end - timedelta(days=i * test_days)
@@ -119,6 +141,8 @@ def run_walk_forward(
     n_folds: int = 3,
     warmup_days: int = 120,
     test_days: int = 21,
+    history_start: date | None = None,
+    max_folds: int = 40,
 ) -> WalkForwardResult:
     """Run k disjoint OOS windows for a single strategy.
 
@@ -137,7 +161,8 @@ def run_walk_forward(
         still gets penalized.
     """
     folds = make_folds(end, n_folds=n_folds,
-                       warmup_days=warmup_days, test_days=test_days)
+                       warmup_days=warmup_days, test_days=test_days,
+                       history_start=history_start, max_folds=max_folds)
     fold_results: list[FoldResult] = []
 
     for fold in folds:
@@ -193,12 +218,20 @@ def _aggregate(fold_results: list[FoldResult]) -> WalkForwardResult:
         consistency = 0.0  # one fold → no cross-fold stability signal
 
     # Sharpe from POOLED OOS daily returns (one estimate over every fold's
-    # observations), NOT a mean of noisy per-fold Sharpes.
+    # observations), NOT a mean of noisy per-fold Sharpes. Two trust gates:
+    #   - enough pooled obs (_MIN_POOLED_OBS), and
+    #   - enough *populated* folds (_MIN_POPULATED_FOLDS) so the estimate spans
+    #     more than one OOS block/regime — an independent-sample guardrail.
+    # Failing either → 0 ('no signal'); the selector's IS fallback takes over.
     pooled: list[float] = []
+    n_populated = 0
     for r in fold_results:
-        pooled.extend(r.oos_returns)
-    pooled_sharpe = (annualized_sharpe(pooled, min_obs=_MIN_POOLED_OBS)
-                     if len(pooled) >= _MIN_POOLED_OBS else 0.0)
+        if r.oos_returns:
+            n_populated += 1
+            pooled.extend(r.oos_returns)
+    trusted = (len(pooled) >= _MIN_POOLED_OBS
+               and n_populated >= _MIN_POPULATED_FOLDS)
+    pooled_sharpe = annualized_sharpe(pooled, min_obs=_MIN_POOLED_OBS) if trusted else 0.0
 
     return WalkForwardResult(
         folds=fold_results,
@@ -207,4 +240,5 @@ def _aggregate(fold_results: list[FoldResult]) -> WalkForwardResult:
         oos_sharpe=pooled_sharpe,
         oos_consistency=consistency,
         total_trades_oos=sum(r.n_trades_oos for r in fold_results),
+        n_populated_folds=n_populated,
     )
