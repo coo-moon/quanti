@@ -155,6 +155,98 @@ class TestRiskAuditEndpoint:
                    for e in exits)
 
 
+class TestRiskAuditStockPnl:
+    """/risk/audit 的 stock_pnl:按股票聚合的历史(已平仓)盈亏。"""
+
+    @staticmethod
+    def _trade(db, tid, code, direction, qty, price, tdate, comm=0.0,
+               created_at=None):
+        db.insert_trade({
+            "trade_id": tid, "order_id": "", "code": code,
+            "direction": direction, "quantity": qty, "price": price,
+            "commission": comm, "strategy_name": "",
+            "trade_date": tdate,
+            "created_at": created_at or f"{tdate}T09:30:00",
+        })
+
+    @pytest.mark.asyncio
+    async def test_empty_without_trades(self, client):
+        r = await client.get("/api/risk/audit")
+        assert r.status_code == 200
+        assert r.json()["stock_pnl"] == []
+
+    @pytest.mark.asyncio
+    async def test_aggregates_per_code(self, client, db):
+        # 000001(已入库,平安银行):两笔已平仓,一赢一亏
+        self._trade(db, "t1", "000001", "buy", 100, 10.0, "2024-01-05")
+        self._trade(db, "t2", "000001", "sell", 100, 12.0, "2024-01-10")  # +200
+        self._trade(db, "t3", "000001", "buy", 100, 10.0, "2024-01-15")
+        self._trade(db, "t4", "000001", "sell", 100, 9.0, "2024-01-22")   # -100
+        # 600999:stocks 表里没有 → name 回退为代码;单笔盈利
+        self._trade(db, "t5", "600999", "buy", 200, 5.0, "2024-01-05")
+        self._trade(db, "t6", "600999", "sell", 200, 6.0, "2024-01-12")  # +200
+        # 未平仓的买入不计入
+        self._trade(db, "t7", "000001", "buy", 100, 11.0, "2024-01-25")
+
+        r = await client.get("/api/risk/audit")
+        rows = r.json()["stock_pnl"]
+        by_code = {x["code"]: x for x in rows}
+        assert set(by_code) == {"000001", "600999"}
+
+        p = by_code["000001"]
+        assert p["name"] == "平安银行"
+        assert p["trips"] == 2
+        assert p["total_pnl"] == pytest.approx(100.0)
+        assert p["avg_return"] == pytest.approx(0.05)
+        assert p["win_rate"] == pytest.approx(0.5)
+        assert p["last_sell_date"] == "2024-01-22"
+        assert p["last_return"] == pytest.approx(-0.1)
+
+        q = by_code["600999"]
+        assert q["name"] == "600999"
+        assert q["trips"] == 1
+        assert q["total_pnl"] == pytest.approx(200.0)
+        assert q["win_rate"] == pytest.approx(1.0)
+
+        # 按累计盈亏降序排列
+        assert [x["code"] for x in rows] == ["600999", "000001"]
+
+    @pytest.mark.asyncio
+    async def test_last_return_same_day_multi_sell(self, client, db):
+        # 同日分批平仓:「最近一笔」应取当天时间最晚的卖出(-10%),
+        # 而不是最早的(+20%)——日期并列时不能靠 max() 的取首行为。
+        self._trade(db, "m1", "000001", "buy", 100, 10.0, "2024-01-05")
+        self._trade(db, "m2", "000001", "buy", 100, 10.0, "2024-01-08")
+        self._trade(db, "m3", "000001", "sell", 100, 12.0, "2024-01-10",
+                    created_at="2024-01-10T09:31:00")
+        self._trade(db, "m4", "000001", "sell", 100, 9.0, "2024-01-10",
+                    created_at="2024-01-10T14:00:00")
+        r = await client.get("/api/risk/audit")
+        p = {x["code"]: x for x in r.json()["stock_pnl"]}["000001"]
+        assert p["last_sell_date"] == "2024-01-10"
+        assert p["last_return"] == pytest.approx(-0.1)
+
+    @pytest.mark.asyncio
+    async def test_fifo_survives_large_trade_history(self, client, db):
+        # FIFO 需要完整历史:最旧的买腿即使排在几千笔成交之前也必须参与配对,
+        # 否则卖单会错配到更晚的买入、盈亏符号可翻转(newest-N 窗口截断回归)。
+        self._trade(db, "old", "000001", "buy", 100, 10.0, "2023-01-05")
+        filler = [
+            (f"f{i}", "", "600999", "buy", 100, 5.0, 0.0, "",
+             "2023-06-01", f"2023-06-01T09:30:{i % 60:02d}.{i:06d}")
+            for i in range(2100)
+        ]
+        db.conn.executemany(
+            "INSERT INTO trades (trade_id, order_id, code, direction, quantity, "
+            "price, commission, strategy_name, trade_date, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", filler)
+        db.conn.commit()
+        self._trade(db, "new", "000001", "sell", 100, 12.0, "2024-01-10")
+        r = await client.get("/api/risk/audit")
+        p = {x["code"]: x for x in r.json()["stock_pnl"]}.get("000001")
+        assert p is not None and p["total_pnl"] == pytest.approx(200.0)
+
+
 def test_exit_kind_classification():
     from quanti.api.routes import _exit_kind
     assert _exit_kind({"reason": "止损 -10% ≤ -8%",

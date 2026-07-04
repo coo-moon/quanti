@@ -1225,6 +1225,44 @@ def _exit_kind(order: dict) -> str:
     return "other"
 
 
+def _stock_pnl_summary(db) -> list[dict]:
+    """Per-stock realized (closed round-trip) P&L history, FIFO-matched from
+    the `trades` table with commissions netted in (reflection.realized_trips).
+    Sorted by total P&L descending — biggest winners first, losers last."""
+    from collections import defaultdict
+
+    from quanti.agent.reflection import realized_trips
+    try:
+        # Full history on purpose: a newest-N window drops the oldest buy
+        # legs and FIFO then mismatches sells against later lots.
+        trades = db.list_trades(limit=None)
+    except Exception:  # noqa: BLE001 - an audit view must never 500
+        return []
+    by_code: dict[str, list[dict]] = defaultdict(list)
+    for t in realized_trips(trades):
+        by_code[t["code"]].append(t)
+    rows: list[dict] = []
+    for code, trips in by_code.items():
+        rets = [t["realized_return"] for t in trips]
+        # Stable sort + [-1]: same-day trips keep realized_trips' chronological
+        # order, so ties resolve to the latest sell (max() would take the first).
+        last = sorted(trips, key=lambda t: t["sell_date"] or date.min)[-1]
+        stock = db.get_stock(code)
+        rows.append({
+            "code": code,
+            "name": stock.name if stock and stock.name else code,
+            "trips": len(trips),
+            "total_pnl": sum(t["realized_pnl"] for t in trips),
+            "avg_return": sum(rets) / len(rets),
+            "win_rate": sum(1 for r in rets if r > 0) / len(rets),
+            "last_sell_date": (last["sell_date"].isoformat()
+                               if last["sell_date"] else None),
+            "last_return": last["realized_return"],
+        })
+    rows.sort(key=lambda r: r["total_pnl"], reverse=True)
+    return rows
+
+
 def build_risk_audit(db, provider, broker, account: str,
                      exits_limit: int = 50) -> dict:
     """Aggregate the risk-control audit view: exit thresholds, three-channel
@@ -1319,7 +1357,8 @@ def build_risk_audit(db, provider, broker, account: str,
 
     return {"account": account, "is_live": account == "live",
             "exits": exits, "channel_parity": channel_parity, "guard": guard,
-            "circuit_breaker": cb, "recent_exits": recent[:exits_limit]}
+            "circuit_breaker": cb, "recent_exits": recent[:exits_limit],
+            "stock_pnl": _stock_pnl_summary(db)}
 
 
 @router.get("/risk/audit")

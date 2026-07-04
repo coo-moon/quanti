@@ -41,9 +41,10 @@ def realized_trips(trades: list[dict]) -> list[dict]:
 
     `trades` is as returned by `db.list_trades` (any order). Buys open lots;
     sells close them oldest-first. Each closed (sell) lot yields one trip with
-    a realized return that nets buy/sell commissions into the cost/proceeds.
+    a realized return/P&L that nets buy/sell commissions into the cost/proceeds.
 
-    Returns [{code, buy_date, sell_date, holding_days, realized_return, qty}].
+    Returns [{code, buy_date, sell_date, holding_days, realized_return,
+    realized_pnl, qty}] where realized_pnl is the trip's yuan amount.
     """
     by_code: dict[str, list[dict]] = defaultdict(list)
     for t in trades:
@@ -90,6 +91,7 @@ def realized_trips(trades: list[dict]) -> list[dict]:
                 trips.append({
                     "code": code, "buy_date": earliest_buy, "sell_date": d,
                     "holding_days": days, "realized_return": ret,
+                    "realized_pnl": (sell_pps - avg_cost) * matched_qty,
                     "qty": matched_qty,
                 })
     return trips
