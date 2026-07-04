@@ -31,7 +31,7 @@ from typing import Iterable
 
 from quanti.agent.goal import Goal, RiskTolerance
 from quanti.agent.params import resolve_params
-from quanti.agent.walk_forward import run_walk_forward
+from quanti.agent.walk_forward import _MIN_POPULATED_FOLDS, run_walk_forward
 from quanti.backtest.engine import BacktestEngine
 from quanti.backtest.overfit import (
     deflated_sharpe_from_stats,
@@ -147,9 +147,31 @@ class StrategySelector:
         wf_enabled = bool(params.get("wf_enabled", True))
         n_folds = int(params.get("wf_n_folds", 3))
         warmup_days = int(params.get("wf_warmup_days", 120))
-        test_days = int(params.get("wf_test_days", 21))
+        # Half-year OOS blocks by default (was 21d): ≥60 trading days so each
+        # fold's annual_return actually annualizes (metrics._MIN_DAYS_TO_ANNUALIZE)
+        # and each block holds enough obs to matter.
+        test_days = int(params.get("wf_test_days", 126))
+        # "Eat the full history": tile OOS blocks across ALL available data
+        # instead of just the last few. The Selector's walk-forward is pure OOS
+        # (strategies have no fittable params, only a warmup tail), so there is
+        # no train window to protect — spanning the whole sample is safe and
+        # lets the OOS Sharpe see multiple regimes/cycles, not one recent quarter.
+        wf_full_history = bool(params.get("wf_full_history", True))
+        wf_max_folds = int(params.get("wf_max_folds", 40))
 
         end = as_of or date.today()
+        history_start = None
+        if wf_full_history:
+            earliest = self._db.get_global_earliest_quote_date()
+            # Require enough span for at least _MIN_POPULATED_FOLDS blocks — the
+            # same floor _aggregate needs to TRUST the pooled Sharpe. Gating on
+            # only warmup+test would admit a span that yields a single fold,
+            # which the guardrail then zeroes: full-history work, no OOS signal,
+            # and worse than the fixed n_folds path. None (empty/short DB) falls
+            # back to that fixed path.
+            min_span_days = warmup_days + _MIN_POPULATED_FOLDS * test_days
+            if earliest is not None and (end - earliest).days > min_span_days:
+                history_start = earliest
         # In-sample window still computed for tie-break and as a fallback.
         is_start = end - timedelta(days=self._training_days)
         # Score strategies under the SAME exit policy they'll trade live
@@ -204,6 +226,7 @@ class StrategySelector:
                         eng, factory, capped, end,
                         n_folds=n_folds, warmup_days=warmup_days,
                         test_days=test_days,
+                        history_start=history_start, max_folds=wf_max_folds,
                     )
                     ev.oos_annual_return = wf.oos_annual_return
                     ev.oos_max_drawdown = wf.oos_max_drawdown

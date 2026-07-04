@@ -259,6 +259,36 @@ class TestRuntimeEnsemble:
         assert broker._sizer is original
         assert agent._equal_weight_active is False
 
+    def test_fused_candidates_cache_topk_within_interval(self, ensemble_db, monkeypatch):
+        """The fused (ensemble/LLM) path must NOT re-run the per-strategy
+        walk-forward sweep on every tick — pick_topk is cached per
+        _reselect_interval, like the single-strategy path. Without this, the
+        full-history walk-forward (up to wf_max_folds backtests per strategy)
+        would land uncached on every 4h tick in ensemble/LLM modes."""
+        from quanti.agent.selector import StrategyEvaluation, StrategySelector
+        from quanti.strategy.loader import StrategyLoader
+
+        provider = DataProvider(ensemble_db)
+        broker = PaperBroker(ensemble_db, provider, initial_cash=1_000_000)
+        agent = AgentRuntime(ensemble_db, provider, broker,
+                             strategies_dir="strategies", screeners_dir="screeners",
+                             selector_reselect_interval_sec=10_000)
+        strat = StrategyLoader().load_directory("strategies")[0]
+        calls = {"n": 0}
+
+        def fake_pick_topk(self, goal, codes, k=3):
+            calls["n"] += 1
+            ev = StrategyEvaluation(strategy_name=strat.name, annual_return=0.1,
+                                    max_drawdown=-0.05, sharpe=1.0,
+                                    total_trades=10, score=1.0)
+            return [(strat, 1.0)], [ev]
+
+        monkeypatch.setattr(StrategySelector, "pick_topk", fake_pick_topk)
+        goal = Goal(params={"ensemble_enabled": True, "signal_threshold": 0.0})
+        agent._compute_fused_candidates(goal, ["000001", "000002"])
+        agent._compute_fused_candidates(goal, ["000001", "000002"])
+        assert calls["n"] == 1, "pick_topk walk-forward must be cached per interval"
+
     def test_legacy_path_unchanged_when_ensemble_disabled(self, ensemble_db):
         """With ensemble_enabled=False (default), runtime should NOT log
         strategy_ensemble — it should go through pick_best like before."""

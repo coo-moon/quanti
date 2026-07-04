@@ -131,3 +131,20 @@ def test_global_latest_quote_date(tmp_path):
     db.conn.commit()
     assert db.get_global_latest_quote_date() == date(2026, 6, 11)
     db.close()
+
+
+def test_global_earliest_quote_date(tmp_path):
+    """Min bar date across all codes (bounds walk-forward's full-history span);
+    None on an empty table."""
+    db = Database(str(tmp_path / "ge.db"))
+    db.initialize()
+    assert db.get_global_earliest_quote_date() is None
+
+    for code, d in (("000001", "2016-06-27"), ("920985", "2020-01-02")):
+        db.conn.execute(
+            "INSERT INTO daily_quotes (code, date, open, high, low, close,"
+            " volume, amount, turnover) VALUES (?,?,?,?,?,?,?,?,?)",
+            (code, d, 1, 1, 1, 1, 1, 1, 1))
+    db.conn.commit()
+    assert db.get_global_earliest_quote_date() == date(2016, 6, 27)
+    db.close()

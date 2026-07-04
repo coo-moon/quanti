@@ -1033,6 +1033,13 @@ class Database:
         row = self.conn.execute("SELECT MAX(date) FROM daily_quotes").fetchone()
         return self._safe_quote_date(row[0]) if row else None
 
+    def get_global_earliest_quote_date(self) -> date | None:
+        """Oldest bar date across the whole daily_quotes table (any code).
+        Bounds walk-forward's full-history span so OOS folds never request
+        dates before any data exists. None on an empty table."""
+        row = self.conn.execute("SELECT MIN(date) FROM daily_quotes").fetchone()
+        return self._safe_quote_date(row[0]) if row else None
+
     def get_market_latest_quote_date(self, min_coverage: float = 0.5,
                                      window: int = 120) -> date | None:
         """Newest bar date backed by a market-wide sync, not a stray per-code
