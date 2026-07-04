@@ -2,13 +2,17 @@
 
 Two fill modes:
 
-  * `fill_mode="pending"` (default, 2026-06-01 onward): every signal is
-    queued as a PENDING order. `try_fill_pending_orders()` later fills
-    them at the OPEN of the next available trading bar — modelling
-    real A-share semantics where orders submitted off-hours go into the
-    next-day open auction. Eliminates the misleading "18:49 卖出"
-    timestamps from before, and forces T+1 by construction (signals
-    can't fill on the same bar they were generated for).
+  * `fill_mode="pending"` (default, 2026-06-01 onward): signals queue as
+    PENDING orders; `try_fill_pending_orders()` later fills them at the
+    OPEN of the next available trading bar — modelling real A-share
+    semantics where orders submitted off-hours go into the next-day open
+    auction. Eliminates the misleading "18:49 卖出" timestamps from
+    before, and forces T+1 by construction. EXCEPTION (live-mirror): an
+    in-session SELL with a usable realtime quote fills immediately at
+    that price, exactly like a live market sell (see execute_signal_ex);
+    T+1 still holds — a wholly-frozen holding falls back to the queue,
+    and a partially-frozen one fills its settled shares now with the
+    frozen remainder re-queued for the next open (_sell_now).
 
   * `fill_mode="immediate"` (legacy): each signal fills synchronously
     against the most-recent close price. Kept for the backtest engine,
@@ -174,14 +178,29 @@ class PaperBroker:
         back to the daily close, so those paths behave exactly as before.
         Immediate mode is excluded on purpose: it prices fills off the latest
         daily bar, so realtime marks would let an exit decide at today's
-        price but fill at yesterday's close. Marks only, never fill prices:
-        pending fills stay at the next bar's open, so a realtime quote hiccup
-        can degrade mark freshness but can never move money at a wrong price.
+        price but fill at yesterday's close.
 
-        NOTE this makes paper stops intraday-touch (like live), not the
-        close-confirmed semantics of the 4h tick / backtest — a name that
-        pierces the stop intraday queues its exit that day even if the close
-        recovers (fills next open, no close re-confirmation).
+        In pending mode these marks price BOTH position marks AND in-session
+        SELL fills (execute_signal_ex → _sell_now — a live market sell, same
+        as xtdata on the live account); BUYs stay bar-based (next open). The
+        quote source only returns prices PRINTED today (tencent_quotes drops
+        stale last-trade timestamps), so a suspended/halted name is simply
+        absent — its mark stays on the daily close and its sells queue; a
+        fill can never price off a previous day. The defense against a
+        glitched same-day quote moving money is the ±35% band filter below.
+
+        Known limits, accepted as the live-mirror tradeoff: quotes are a
+        single source sampled once per guard tick, so a WITHIN-band bad print
+        (say -8%) can fire a stop and become its fill price irreversibly; and
+        on an ex-dividend day the stored adj_factor lags one bar, so the hfq
+        mark dips by the dividend ratio until today's bar lands. If either
+        bites in practice, the fix is two consecutive same-direction samples
+        before selling — state we deliberately don't carry yet.
+
+        NOTE this makes paper stops intraday-touch AND same-day-filled (like
+        live), not the close-confirmed semantics of the 4h tick / backtest —
+        a name that pierces the stop intraday exits that day at the realtime
+        price even if the close recovers.
         """
         if (self._realtime_quote_fn is None or not codes
                 or self._fill_mode != "pending"):
@@ -279,27 +298,48 @@ class PaperBroker:
 
     # ------------------------------------------------------------ execution
     def execute_signal(self, signal: Signal, strategy_name: str = "") -> bool:
-        """Process one signal. Returns True iff the signal landed (either
-        filled in immediate mode, or successfully queued in pending mode).
+        """Process one signal. Returns True iff the signal landed (filled or
+        successfully queued). Callers that need to know which, use
+        `execute_signal_ex` / `execute_signals`."""
+        return self.execute_signal_ex(signal, strategy_name) != "rejected"
 
-        Pending mode does NOT count as a "fill" in the legacy semantic —
-        callers that only care about real fills should consult `BrokerResult`
-        from `execute_signals` and check `filled` rather than the bool.
+    def execute_signal_ex(self, signal: Signal, strategy_name: str = "") -> str:
+        """Process one signal → "filled" | "pending" | "rejected".
+
+        Pending mode mirrors a live venue: an in-session SELL with a usable
+        realtime quote fills NOW at that price (as a live market sell would);
+        it falls back to the queue (fill at next open — an order resting at
+        the venue) when there's no quote, the name is limit-down locked, or
+        the whole holding is still T+1-frozen today. BUYs and off-session
+        signals queue as before.
         """
         if self._fill_mode == "immediate":
-            return self._execute_signal_immediate(signal, strategy_name)
-        return self._queue_pending_signal(signal, strategy_name)
+            return ("filled"
+                    if self._execute_signal_immediate(signal, strategy_name)
+                    else "rejected")
+        if signal.direction == Direction.SELL:
+            price = self._intraday_marks([signal.stock_code]).get(signal.stock_code)
+            if price and not self._limit_down_locked(signal.stock_code, price):
+                pos = next((p for p in self._db.list_positions()
+                            if p["code"] == signal.stock_code), None)
+                if pos is None or self._sellable_qty(pos, date.today()) > 0:
+                    # pos None → _sell_now records the "no position" reject
+                    # now, instead of parking a doomed pending order.
+                    return ("filled"
+                            if self._sell_now(signal, strategy_name, price)
+                            else "rejected")
+        landed = self._queue_pending_signal(signal, strategy_name)
+        return "pending" if landed else "rejected"
 
     def execute_signals(self, signals: list[Signal],
                         strategy_name: str = "") -> BrokerResult:
         out = BrokerResult()
         for s in signals:
             out.accepted += 1
-            landed = self.execute_signal(s, strategy_name)
-            if not landed:
+            status = self.execute_signal_ex(s, strategy_name)
+            if status == "rejected":
                 out.rejected += 1
-                continue
-            if self._fill_mode == "immediate":
+            elif status == "filled":
                 out.filled += 1
             else:
                 out.pending += 1
@@ -640,36 +680,50 @@ class PaperBroker:
                      "filled": result.filled, "pending": result.pending})
         return acted
 
-    def sell_at_market(self, code: str, reason: str = "手动实时卖出") -> dict:
-        """Manual in-session market sell: fill NOW at the realtime mark (hfq
-        axis, slippage/commission/T+1 all via the normal _fill_sell path)
-        instead of queueing for the next open — mirrors a live market order.
-
-        Fails loudly (ValueError) without an in-session realtime quote or
-        into a limit-down lock; off-session sells go through the normal
-        pending path (`execute_signal`). A pending SELL already queued for
-        the code is cancelled first so it can't double-fill tomorrow.
-        """
-        marks = self._intraday_marks([code])
-        price = marks.get(code)
-        if not price:
-            raise ValueError("无盘中实时报价(非交易时段/无行情源/报价异常),请用挂单卖出")
-        # Limit-down lock: a market sell can't fill into a locked-down name.
-        # Judge on the raw quote vs the last raw close with the board's band.
+    def _limit_down_locked(self, code: str, hfq_price: float) -> bool:
+        """A market sell can't fill into a limit-down lock. Judge on the raw
+        quote (hfq mark ÷ factor) vs the last raw close with the stock's band
+        — ST names (±5%) by name prefix, else the board band by code."""
         ref = self._db.get_latest_quote_before(code, date.today() + timedelta(days=1))
-        if ref is not None and ref[0] > 0:
-            raw_close, factor = ref
-            raw_now = price / (factor if factor > 0 else 1.0)
-            if raw_now <= raw_close * (1 - board_limit_pct(code)) + 1e-9:
-                raise ValueError("跌停锁死,当前无法市价卖出")
-        for o in self._db.list_orders(limit=1000, status="pending"):
-            if o["code"] == code and o["direction"] == "sell":
-                self._db.update_order_status(o["order_id"], "cancelled",
-                                             reason="superseded by market sell")
-        sig = Signal(stock_code=code, direction=Direction.SELL,
-                     strength=1.0, reason=reason)
-        filled = self._fill_sell(sig, price, date.today(), "manual")
-        return {"filled": filled, "price": price}
+        if ref is None or ref[0] <= 0:
+            return False
+        raw_close, factor = ref
+        raw_now = hfq_price / (factor if factor > 0 else 1.0)
+        stock = self._db.get_stock(code)
+        band = (0.05 if stock and "ST" in (stock.name or "")
+                else board_limit_pct(code))
+        return raw_now <= raw_close * (1 - band) + 1e-9
+
+    def _sell_now(self, signal: Signal, strategy_name: str,
+                  price: float) -> bool:
+        """Fill a SELL immediately at the given in-session realtime mark (hfq
+        axis; slippage/commission/T+1 via the normal _fill_sell path) — what a
+        live market sell does. Yesterday's bar turnover proxies today's B1
+        participation cap (there's no intraday turnover feed here).
+
+        Full-exit sells (anything but the 削峰 trim) that fill also supersede
+        SELLs resting in the queue (no double-fill tomorrow) and re-queue any
+        remainder the fill couldn't take (T+1-frozen lot / B1 cap), so the
+        exit intent still lands at the next open — the kill-switch/breaker
+        must never silently strand part of a position. Partial-intent trims
+        leave resting orders alone, like a live market trim would.
+        """
+        bar = self._latest_bar(signal.stock_code)
+        filled = self._fill_sell(signal, price, date.today(), strategy_name,
+                                 bar_amount=float(bar.amount or 0) if bar else 0.0)
+        full_exit = (strategy_name != DRIFT_TRIM_STRATEGY
+                     and signal.strength >= 1.0)
+        if filled and full_exit:
+            for o in self._db.list_orders(limit=1000, status="pending"):
+                if o["code"] == signal.stock_code and o["direction"] == "sell":
+                    self._db.update_order_status(
+                        o["order_id"], "cancelled",
+                        reason="superseded by market sell")
+            left = next((p for p in self._db.list_positions()
+                         if p["code"] == signal.stock_code), None)
+            if left is not None and left["quantity"] > 0:
+                self._queue_pending_signal(signal, strategy_name)
+        return filled
 
     def enforce_portfolio_stop(self) -> bool:
         """Portfolio drawdown circuit breaker: if equity is down past

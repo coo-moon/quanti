@@ -52,8 +52,9 @@ def create_app(
     # circuit breaker on a ~1min cadence). Live rides xtdata realtime quotes
     # via the bridge; paper rides free Tencent quotes (execution.factory) so
     # intraday stop hits are caught the day they happen instead of after the
-    # next daily bar lands. Paper exits still FILL at the next bar's open —
-    # realtime prices are marks only.
+    # next daily bar lands. In-session paper SELLs fill immediately at the
+    # realtime quote (live-mirror); BUYs and off-session signals queue for
+    # the next open as before.
     agent = AgentRuntime(
         db=db, provider=provider, broker=broker,
         strategies_dir=strategies_dir or "strategies",

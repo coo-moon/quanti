@@ -29,3 +29,28 @@ def test_parse_real_payload_shape():
 
 def test_parse_skips_malformed_price():
     assert _parse('v_sh600000="1~浦发银行~600000~~1.0~2.0";') == {}
+
+
+def test_parse_with_require_date_keeps_today_prints_only():
+    """Suspended names report their LAST trade (possibly days old) — with
+    require_date only same-day prints survive, so a fill can never price
+    off a previous day."""
+    base = ("1~贵州茅台~600519~1194.45~1203.00~1205.24~34268~14380~19887"
+            + "~x" * 22)  # pad so the timestamp lands at field 30
+    parts_fresh = base.split("~")
+    parts_fresh[30] = "20260703152224"
+    parts_stale = list(parts_fresh)
+    parts_stale[2], parts_stale[3] = "600000", "8.88"
+    parts_stale[30] = "20260630150000"  # suspended since 06-30
+    text = ('v_sh600519="' + "~".join(parts_fresh) + '";\n'
+            + 'v_sh600000="' + "~".join(parts_stale) + '";')
+    assert _parse(text, require_date="20260703") == {"600519": 1194.45}
+    # Without the date requirement both parse (display/backtest use).
+    assert set(_parse(text)) == {"600519", "600000"}
+
+
+def test_parse_with_require_date_drops_short_lines():
+    """A line without the timestamp field can't prove freshness → dropped."""
+    text = 'v_sh600519="1~贵州茅台~600519~1194.45~1203.00";'
+    assert _parse(text, require_date="20260703") == {}
+    assert _parse(text) == {"600519": 1194.45}

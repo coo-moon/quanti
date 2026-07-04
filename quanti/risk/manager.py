@@ -251,8 +251,8 @@ class RiskManager:
             marks, PaperBroker._intraday_marks) feeds realtime prices here,
             making stops intraday-touch on that path — a deliberate
             live-fidelity divergence from the backtest's close-confirmed model
-            (a name that pierces the stop intraday queues its exit that day
-            even if the close recovers).
+            (a name that pierces the stop intraday exits that day at the
+            realtime price even if the close recovers).
           • peaks[code] is the post-entry highest HIGH (intraday) since entry.
             So the trailing TP measures an intraday peak vs a close retrace by
             design (a deliberate close-confirmed trail), NOT a bug.
