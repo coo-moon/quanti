@@ -137,6 +137,33 @@ class TestBuildReflections:
                                 final_score=0.5, industry="银行")]
         assert build_reflections(db, cands) == []
 
+    def test_fifo_survives_large_trade_history(self, db):
+        # Regression: build_reflections used to FIFO-match over only the
+        # newest 500 trades (ORDER BY created_at DESC LIMIT). Once history
+        # grew past the window, the oldest buy legs were cut off and sells
+        # matched a later lot — or nothing — so the avg/last returns fed to
+        # the LLM were wrong. FIFO needs the full history.
+        db.upsert_stock("600000", "浦发", "SH", date(1999, 11, 10), "银行")
+        _insert_trade(db, "t-buy", "600000", "buy", 100, 10.0, "2026-01-01")
+        # 600 filler buys on another name push the buy leg out of any
+        # recent-N window (distinct created_at keeps DESC order stable).
+        db.conn.executemany(
+            "INSERT INTO trades (trade_id, order_id, code, direction, quantity, "
+            "price, commission, strategy_name, trade_date, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(f"f{i}", "", "000002", "buy", 100, 5.0, 0.0, "", "2026-01-02",
+              f"2026-01-02T10:00:00.{i:06d}") for i in range(600)])
+        db.conn.commit()
+        _insert_trade(db, "t-sell", "600000", "sell", 100, 11.0, "2026-01-05")
+
+        cands = [FusedCandidate(code="600000", strategy_score=0.5, factor_score=0.0,
+                                final_score=0.5, industry="银行")]
+        items = build_reflections(db, cands)
+        code_items = [i for i in items if i["scope"] == "code"
+                      and i["key"] == "600000"]
+        assert code_items, "sell must still match its buy lot beyond 500 trades"
+        assert code_items[0]["avg_return"] == pytest.approx(0.1)
+
 
 # ----- context rendering -------------------------------------------------
 

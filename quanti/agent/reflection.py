@@ -102,7 +102,6 @@ def build_reflections(
     candidates: list,
     *,
     max_items: int = 8,
-    max_trades: int = 500,
 ) -> list[dict]:
     """Relevant, outcome-keyed lessons for the current candidate set.
 
@@ -111,8 +110,11 @@ def build_reflections(
     with a templated `text`, ranked code-level first, then industry-level,
     then by how notable the average outcome was.
     """
+    # FIFO matching needs the FULL trade history: a recent-N window drops the
+    # oldest buy legs once total trades exceed N, so in-window sells match
+    # later lots (or nothing) and the avg/win-rate lessons come out wrong.
     try:
-        trades = db.list_trades(limit=max_trades)
+        trades = db.list_trades(limit=None)
     except Exception as e:
         logger.debug("list_trades failed: %s", e)
         return []

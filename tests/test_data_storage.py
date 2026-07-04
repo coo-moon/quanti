@@ -50,6 +50,31 @@ class TestStockStorage:
         assert db.get_stock("000001").industry == "综合金融"
 
 
+class TestTradeStorage:
+    @staticmethod
+    def _trade(i):
+        return {"trade_id": f"t{i}", "order_id": "", "code": "000001",
+                "direction": "buy", "quantity": 100, "price": 10.0,
+                "commission": 0.0, "trade_date": "2026-01-02",
+                "created_at": f"2026-01-02T10:00:00.{i:06d}"}
+
+    def test_list_trades_respects_limit(self, db):
+        for i in range(5):
+            db.insert_trade(self._trade(i))
+        assert len(db.list_trades(limit=3)) == 3
+
+    def test_list_trades_limit_none_returns_full_history(self, db):
+        """limit=None must return every trade — FIFO consumers (reflection
+        round-trips) break if the oldest buy legs are silently cut off."""
+        for i in range(250):
+            db.insert_trade(self._trade(i))
+        trades = db.list_trades(limit=None)
+        assert len(trades) == 250
+        # Newest-first order is part of the contract callers rely on.
+        assert trades[0]["trade_id"] == "t249"
+        assert trades[-1]["trade_id"] == "t0"
+
+
 class TestDailyQuoteStorage:
     def test_save_and_get_daily_quotes(self, db):
         import pandas as pd
