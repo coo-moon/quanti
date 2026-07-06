@@ -14,7 +14,11 @@ produces the subset that's actually worth evaluating each cycle:
 
   1. Stock-metadata filter (cheap, runs first):
      - age ≥ min_age_days (default 90)
-     - name does NOT match `exclude_name_keywords` ("ST", "退" etc.)
+     - not yet delisted as of the reference date (point-in-time via
+       delist_date — keeps future-delisted names in historical replay)
+     - name does NOT match `exclude_name_keywords` ("ST", "退" etc.) —
+       LIVE path only; see `_filter_metadata` for why the current name is
+       not point-in-time on historical replay.
   2. Liquidity filter (needs recent bars):
      - ADV20 ≥ min_adv20_yuan (default 5000 万)
      - active trading days in last 60 ≥ min_active_days_60 (default 40)
@@ -154,8 +158,42 @@ class UniverseBuilder:
     # ----- filters -----
 
     def _filter_metadata(self, codes: list[str], as_of: date) -> list[str]:
-        """Stock-info-only filter. Cheap: one DB hit per code, no bars."""
+        """Stock-info-only filter. Cheap: one DB hit per code, no bars.
+
+        Age and delisting are point-in-time; the ST/退 name rule cannot be:
+
+          * Age: uses list_date (never changes) → always point-in-time.
+          * Delisting: uses delist_date. A delisting is only *known* on and
+            after that date, so a stock stays in the universe for any
+            ``as_of < delist_date`` (it was actively trading then) and is
+            dropped once ``as_of >= delist_date``. Same delist_date column
+            `Database.point_in_time_universe` already trusts. This is the
+            honest fix for the dominant survivorship leak: a currently
+            "退"-named stock that was a normal, tradeable name at a past
+            ``as_of`` must NOT be dropped just because it delisted later.
+            Its delisting-cleanup crash is then captured for real, and once
+            quotes stop the liquidity gate (min_active_days_60) evicts it —
+            no look-ahead, no missed loss.
+          * ST/退 name keywords: `stocks.name` is overwritten to the LATEST
+            name on every `sync_stock_list` (upsert_stock uses
+            ``ON CONFLICT DO UPDATE SET name=excluded.name``), so it is NOT
+            point-in-time. On historical replay (``as_of`` in the past) we
+            therefore do NOT filter on it — doing so drops future losers
+            (optimistic) and keeps past-ST rebounders (also optimistic). We
+            trust the name match only on the live path (``as_of >= today``),
+            where the current name IS the point-in-time name.
+
+        Residual: replay no longer excludes historically-ST names at all.
+        Impact is small at the shipped cap (measured 0-2 of the top-100 ADV
+        pool, 0 future-losers); it only reaches ~4% at cap>=500. A true
+        point-in-time ST membership would need a namechange-backed name
+        history, deliberately NOT built (rigor theater at cap<=100, and the
+        namechange feed has its own PIT traps: NaN-end duplicate intervals,
+        BJ code renumbering, off-by-one boundaries). `resolve_tradable_universe`
+        warns when cap>300.
+        """
         cfg = self._config
+        is_live = as_of >= date.today()
         out: list[str] = []
         for code in codes:
             stock = self._db.get_stock(code)
@@ -164,10 +202,14 @@ class UniverseBuilder:
             # Age check
             if stock.list_date and (as_of - stock.list_date).days < cfg.min_age_days:
                 continue
-            # Name-blocklist check. We check NAME not CODE because A-share
-            # ST status is reflected in the company name (e.g. "*ST华源"),
-            # not the numeric code.
-            if cfg.exclude_name_keywords and any(
+            # Point-in-time delisting check (all paths). Drop once the
+            # delisting is known (on/after delist_date), keep before.
+            if stock.delist_date and as_of >= stock.delist_date:
+                continue
+            # Name-blocklist check — LIVE only (see docstring). We check NAME
+            # not CODE because A-share ST status is reflected in the company
+            # name (e.g. "*ST华源"), not the numeric code.
+            if is_live and cfg.exclude_name_keywords and any(
                 kw in (stock.name or "") for kw in cfg.exclude_name_keywords
             ):
                 continue
@@ -274,11 +316,25 @@ def resolve_tradable_universe(
          take the top `max(20, selector_max_universe)` (default 100). The
          floor preserves the old `max(20, N)` guard — never tune on a handful.
 
-    `as_of` keeps the liquidity view point-in-time: optimizing over a past
-    `end` ranks by liquidity *as known then*, never with hindsight.
+    `as_of` keeps the view point-in-time: optimizing over a past `end` ranks
+    by liquidity *as known then*, and the metadata filter keeps names that had
+    not yet delisted at `as_of` (via delist_date) while dropping the current
+    ST/退 name match on replay (the stored name is the latest, not point-in-time).
+    See `UniverseBuilder._filter_metadata` for the residual ST caveat.
     """
     params = params or {}
     cap = max(20, int(params.get("selector_max_universe", 100)))
+
+    # Wide-cap survivorship tripwire. The ST/退 name filter is dropped on
+    # historical replay (not point-in-time — see UniverseBuilder._filter_metadata),
+    # leaving an uncorrected optimistic bias that is <1% of the top-100 ADV pool
+    # but ~4% at cap>=500. Flag it so a wide-cap factor sweep feeding factor
+    # adoption isn't read as clean. (Narrow default cap=100 is effectively unbiased.)
+    if cap > 300:
+        logger.warning(
+            "tradable universe cap=%d (>300): residual current-name ST bias on "
+            "replay is un-corrected (~4%% pollution at this width); treat wide-cap "
+            "sweeps feeding factor adoption as optimistically biased.", cap)
 
     if pool:
         codes = [s.code for s in db.get_pool_stocks(pool)]
