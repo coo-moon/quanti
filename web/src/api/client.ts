@@ -435,6 +435,7 @@ export interface RiskControl {
   strategy_exit_enabled: boolean;
   atr_stop_k: number;
   atr_stop_n: number;
+  extreme_gap_up_block_pct: number;
   drift_trim_enabled: boolean;
   drift_trim_to_pct: number;
   drift_trim_band: number;

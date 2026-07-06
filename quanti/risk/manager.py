@@ -83,6 +83,16 @@ class RiskConfig:
     atr_stop_n: int = 14
     """Lookback (trading days) for the ATR behind atr_stop_k."""
 
+    # --- Extreme gap-up entry guard ---
+    extreme_gap_up_block_pct: float = 0.10
+    """Abandon a pending BUY when the fill price gaps up >= this fraction above
+    the prior close (chasing a blow-off open). A 5y study showed the >= +10%
+    gap-up bucket is a lottery (median T+5 ≈ -4.4%, p5 ≈ -20%, negative mean in
+    the recent regime) and waiting for a pullback has no edge. Near-no-op on the
+    main board (a +10% gap is a limit-up open the tradability gate already
+    blocks); it primarily protects the 20cm/30cm boards, where mean forward
+    return flips negative at exactly 10%. 0 disables. SELLs are never blocked."""
+
     # --- Concentration trim (削峰) — opt-in, default OFF ---
     drift_trim_enabled: bool = False
     """When True, a holding whose weight drifts above

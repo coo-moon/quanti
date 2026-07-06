@@ -243,6 +243,28 @@ def tradable_at_close(direction: Direction, bar: BarData,
     return _within_limit(direction, bar.code, bar.close, prev_close)
 
 
+def extreme_gap_up_blocked(fill_price: float, prev_close: float | None,
+                           block_pct: float) -> bool:
+    """True when a BUY should be ABANDONED because the fill price has gapped up
+    ``block_pct`` or more above the prior close — chasing a blow-off open.
+
+    Backed by a 5y study (scripts/entry_timing_study + gap_guard_sensitivity):
+    the >= +10% gap-up bucket is a lottery — median T+5 return ≈ -4.4%, p5
+    ≈ -20%, negative mean in the recent regime — and waiting for a pullback has
+    no edge either, so the right move is to skip the entry entirely. On the main
+    board a +10% gap IS a limit-up open the ``tradable_at_open`` gate already
+    blocks, so this newly protects only the 20cm/30cm boards (where +10% is a
+    big-but-tradable gap and mean forward return flips negative at exactly 10%).
+
+    block_pct <= 0 disables the guard. SELLs are never blocked (an exit must
+    always be free to leave)."""
+    if block_pct is None or block_pct <= 0:
+        return False
+    if not prev_close or prev_close <= 0 or fill_price <= 0:
+        return False
+    return (fill_price / prev_close - 1.0) >= block_pct
+
+
 def prev_bar_close(provider: DataProvider, code: str,
                    before_date: date) -> float | None:
     """Close of the most recent bar strictly before `before_date` — the prior

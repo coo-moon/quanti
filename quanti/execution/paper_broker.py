@@ -49,6 +49,7 @@ from quanti.risk.sizer import Sizer, compute_buy_target_value
 from quanti.utils.market import (
     board_limit_pct,
     count_trading_days_between,
+    extreme_gap_up_blocked,
     lot_round_strength,
     max_fill_shares,
     next_trading_bar,
@@ -462,6 +463,7 @@ class PaperBroker:
         state seen by today's new signal generation.
         """
         out = PendingFillResult()
+        self._sync_risk_config()  # pick up live extreme_gap_up_block_pct edits
         pending = self._db.list_orders(limit=1000, status="pending")
         out.scanned = len(pending)
         today = date.today()
@@ -556,6 +558,25 @@ class PaperBroker:
             # Pick the price.
             ref_price = float(bar.open if self._fill_basis == "open"
                               else bar.close)
+
+            # Extreme-gap-up guard: abandon a BUY that gaps up past the
+            # threshold vs the prior close (chasing a blow-off open — a
+            # lottery with a toxic tail; see extreme_gap_up_blocked). Cancel
+            # rather than defer: waiting for a pullback has no edge either.
+            if (sig.direction == Direction.BUY and extreme_gap_up_blocked(
+                    ref_price, pc, self._risk.config.extreme_gap_up_block_pct)):
+                self._db.update_order_status(
+                    o["order_id"], "cancelled",
+                    reason=f"extreme gap-up {(ref_price/pc-1):.1%}, abandoned")
+                self._db.log_decision(
+                    "order_gap_abandoned",
+                    f"放弃追高 买入 {o['code']}: 开盘跳涨 {(ref_price/pc-1):.1%} "
+                    f"≥ {self._risk.config.extreme_gap_up_block_pct:.0%}",
+                    code=o["code"],
+                    details={"order_id": o["order_id"], "gap": ref_price/pc-1})
+                out.expired += 1
+                continue
+
             filled = self._fill_pending(sig, ref_price, bar.date, o,
                                         bar_amount=float(bar.amount or 0))
             if filled:

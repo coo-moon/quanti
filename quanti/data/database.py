@@ -261,6 +261,9 @@ class Database:
             # backfill to the dataclass defaults (20% / 30%).
             ("risk_config", "max_position_pct", "REAL DEFAULT 0.20"),
             ("risk_config", "max_industry_pct", "REAL DEFAULT 0.30"),
+            # Extreme gap-up entry guard — abandon a BUY gapping up >= this
+            # fraction. Legacy rows backfill to the dataclass default (10%).
+            ("risk_config", "extreme_gap_up_block_pct", "REAL DEFAULT 0.10"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -1435,6 +1438,27 @@ class Database:
         )
         self.conn.commit()
 
+    def update_order_submitted(self, order_id: str, *, status: str,
+                               quantity: int, venue_order_id: str,
+                               filled_price: float = 0.0,
+                               filled_quantity: int = 0,
+                               reason: str = "") -> None:
+        """Write a venue submit's outcome back onto an overnight-queued order
+        row (QmtBroker): the row was inserted with quantity=0 and no venue id
+        at queue time; sizing + the venue order id only exist at submit time.
+        `entry_strategy` is the venue-id mirror column (see QmtBroker)."""
+        from datetime import datetime
+        self.conn.execute(
+            "UPDATE orders SET status=?, quantity=?, entry_strategy=?, "
+            "filled_price=?, filled_quantity=?, reason=?, filled_at=? "
+            "WHERE order_id=?",
+            (status, quantity, venue_order_id, filled_price, filled_quantity,
+             reason,
+             datetime.now().isoformat() if status == "filled" else None,
+             order_id),
+        )
+        self.conn.commit()
+
     def update_order_filled(self, order_id: str, status: str,
                             filled_price: float, filled_quantity: int) -> None:
         from datetime import datetime
@@ -1673,7 +1697,8 @@ class Database:
     _RISK_CONFIG_FIELDS = (
         "stop_loss_pct", "portfolio_stop_loss_pct", "take_profit_activate_pct",
         "take_profit_trail_pct", "strategy_exit_enabled", "atr_stop_k",
-        "atr_stop_n", "max_position_pct", "max_industry_pct",
+        "atr_stop_n", "extreme_gap_up_block_pct",
+        "max_position_pct", "max_industry_pct",
     )
 
     def get_risk_config(self) -> dict:
@@ -1685,7 +1710,7 @@ class Database:
             "strategy_exit_enabled, atr_stop_k, atr_stop_n, "
             "drift_trim_enabled, drift_trim_to_pct, drift_trim_band, "
             "rotation_enabled, rotation_margin, "
-            "max_position_pct, max_industry_pct "
+            "max_position_pct, max_industry_pct, extreme_gap_up_block_pct "
             "FROM risk_config WHERE id=1"
         ).fetchone()
         if row is None:
@@ -1699,6 +1724,7 @@ class Database:
             "drift_trim_to_pct": row[8], "drift_trim_band": row[9],
             "rotation_enabled": bool(row[10]), "rotation_margin": row[11],
             "max_position_pct": row[12], "max_industry_pct": row[13],
+            "extreme_gap_up_block_pct": row[14],
         }
 
     def upsert_risk_config(self, cfg: dict) -> None:
@@ -1714,8 +1740,9 @@ class Database:
                 strategy_exit_enabled, atr_stop_k, atr_stop_n,
                 drift_trim_enabled, drift_trim_to_pct, drift_trim_band,
                 rotation_enabled, rotation_margin,
-                max_position_pct, max_industry_pct, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                max_position_pct, max_industry_pct,
+                extreme_gap_up_block_pct, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 stop_loss_pct=excluded.stop_loss_pct,
                 portfolio_stop_loss_pct=excluded.portfolio_stop_loss_pct,
@@ -1731,6 +1758,7 @@ class Database:
                 rotation_margin=excluded.rotation_margin,
                 max_position_pct=excluded.max_position_pct,
                 max_industry_pct=excluded.max_industry_pct,
+                extreme_gap_up_block_pct=excluded.extreme_gap_up_block_pct,
                 updated_at=excluded.updated_at
             """,
             (cfg["stop_loss_pct"], cfg["portfolio_stop_loss_pct"],
@@ -1742,6 +1770,7 @@ class Database:
              int(bool(cfg.get("rotation_enabled", False))),
              cfg.get("rotation_margin", 0.15),
              cfg.get("max_position_pct", 0.20), cfg.get("max_industry_pct", 0.30),
+             cfg.get("extreme_gap_up_block_pct", 0.10),
              now),
         )
         self.conn.commit()

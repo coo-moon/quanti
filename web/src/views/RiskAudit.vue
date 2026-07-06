@@ -80,6 +80,10 @@
           <label>ATR 周期 n
             <input type="number" step="1" min="1" v-model.number="form.atr_stop_n" />
           </label>
+          <label>极端高开熔断 (%,0=关闭)
+            <input type="number" step="1" min="0" max="50"
+                   v-model.number="form.extreme_gap_up_block_pct" />
+          </label>
           <label class="chk">
             <input type="checkbox" v-model="form.strategy_exit_enabled" />
             启用策略离场
@@ -346,6 +350,8 @@ const form = reactive({
   stop_loss_pct: -15, portfolio_stop_loss_pct: -30,
   take_profit_activate_pct: 15, take_profit_trail_pct: 10,
   strategy_exit_enabled: true, atr_stop_k: 0, atr_stop_n: 14,
+  // 极端高开熔断(占比以 % 显示;后端存分数;0=关闭)
+  extreme_gap_up_block_pct: 10,
   // 单票/行业上限(占比以 % 显示;后端存分数)
   max_position_pct: 20, max_industry_pct: 30,
   // 削峰减仓(占比以 % 显示;后端存分数)
@@ -369,6 +375,7 @@ async function toggleEdit() {
     form.strategy_exit_enabled = c.strategy_exit_enabled;
     form.atr_stop_k = c.atr_stop_k;
     form.atr_stop_n = c.atr_stop_n;
+    form.extreme_gap_up_block_pct = +(c.extreme_gap_up_block_pct * 100).toFixed(2);
     form.max_position_pct = +(c.max_position_pct * 100).toFixed(2);
     form.max_industry_pct = +(c.max_industry_pct * 100).toFixed(2);
     form.drift_trim_enabled = c.drift_trim_enabled;
@@ -395,6 +402,7 @@ async function save() {
       strategy_exit_enabled: form.strategy_exit_enabled,
       atr_stop_k: form.atr_stop_k,
       atr_stop_n: form.atr_stop_n,
+      extreme_gap_up_block_pct: form.extreme_gap_up_block_pct / 100,
       max_position_pct: form.max_position_pct / 100,
       max_industry_pct: form.max_industry_pct / 100,
       drift_trim_enabled: form.drift_trim_enabled,

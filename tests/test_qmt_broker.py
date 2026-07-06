@@ -70,6 +70,9 @@ class RecordingBridge(InProcBridge):
 
 
 def _make(db, provider, client=None, **kw):
+    # Default to in-session so submit-path tests are wall-clock-free; the
+    # overnight-queue tests override session_fn=lambda: False.
+    kw.setdefault("session_fn", lambda: True)
     return QmtBroker(db, provider, client=client or InProcBridge(),
                      initial_cash=1_000_000, **kw)
 
@@ -528,3 +531,84 @@ def test_raise_hwm_is_monotone_and_reset_clears_it(env):
     assert db.get_peak_total_value() == pytest.approx(2_000_000)
     db.reset_portfolio(1_000_000)
     assert db.get_peak_total_value() == 0.0
+
+
+# --- overnight queue → submit at open (A 股 no night session) --------------
+
+def test_offhours_order_queues_then_submits_at_open(env):
+    """The 16:00 daily cycle runs off-hours: an order must QUEUE locally (no
+    venue call — off-hours submits are guaranteed 废单) and only hit the venue
+    when the guard advances it in-session, matching paper/backtest next-open."""
+    from quanti.utils.market import prev_bar_close
+    db, provider = env
+    pc = prev_bar_close(provider, "000001", date.today())
+
+    class FlatBridge(InProcBridge):
+        # Realtime quote ≈ prior close (no gap) so the gap guard stays quiet;
+        # the plain mock quote is a fixed synthetic ~24 that would false-trip it.
+        def get(self, path, params=None):
+            if path == "/data/quote":
+                return {"last": pc, "open": pc}
+            return super().get(path, params)
+
+    sess = {"open": False}
+    broker = _make(db, provider, client=FlatBridge(),
+                   session_fn=lambda: sess["open"])
+    landed = broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s")
+    assert landed is True
+    pend = db.list_orders(status="pending")
+    assert len(pend) == 1
+    assert (pend[0]["entry_strategy"] or "") == ""   # no venue id yet
+    assert db.list_trades() == []                    # nothing hit the venue
+    assert any(d["kind"] == "order_queued" for d in db.list_decisions(limit=10))
+
+    sess["open"] = True                              # market opens
+    out = broker.try_fill_pending_orders()
+    assert out.filled == 1
+    filled = [o for o in db.list_orders() if o["status"] == "filled"]
+    assert len(filled) == 1
+    assert filled[0]["entry_strategy"].startswith("mock-")  # venue id now set
+    assert filled[0]["quantity"] >= 100
+    held = [p for p in broker.snapshot_portfolio()["positions"]
+            if p["code"] == "000001"]
+    assert held and held[0]["quantity"] >= 100
+
+
+def test_offhours_queue_deduped(env):
+    """A repeated off-hours BUY for the same code doesn't stack a second
+    queued order."""
+    db, provider = env
+    broker = _make(db, provider, session_fn=lambda: False)
+    assert broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s")
+    assert broker.execute_signal(
+        Signal("000001", Direction.BUY, 0.5, "b"), "s") is False
+    assert len(db.list_orders(status="pending")) == 1
+
+
+def test_extreme_gap_up_abandoned_at_open(env):
+    """A queued BUY whose open has gapped up past the guard threshold is
+    ABANDONED at submit time — never sent to the venue."""
+    from quanti.utils.market import prev_bar_close
+    db, provider = env
+    pc = prev_bar_close(provider, "000001", date.today())
+    assert pc and pc > 0
+
+    class GapBridge(InProcBridge):
+        def get(self, path, params=None):
+            if path == "/data/quote":
+                return {"last": round(pc * 1.12, 2), "open": round(pc * 1.12, 2)}
+            return super().get(path, params)
+
+    sess = {"open": False}
+    broker = _make(db, provider, client=GapBridge(),
+                   session_fn=lambda: sess["open"])
+    assert broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s")
+    sess["open"] = True
+    out = broker.try_fill_pending_orders()
+    assert out.filled == 0
+    assert db.list_trades() == []                    # never reached the venue
+    o = db.list_orders()[0]
+    assert o["status"] == "cancelled"
+    assert "gap-up" in o["reason"].lower()
+    assert any(d["kind"] == "order_gap_abandoned"
+               for d in db.list_decisions(limit=10))
