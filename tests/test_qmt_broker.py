@@ -164,6 +164,7 @@ def test_buy_submits_and_reconciles_from_broker(env):
     snap = broker.snapshot_portfolio()
     held = [p for p in snap["positions"] if p["code"] == "000001"]
     assert held and held[0]["quantity"] >= 100
+    assert held[0]["industry"] == "银行"   # industry surfaced for the UI
     assert snap["cash"] < snap["initial_cash"]
     orders = db.list_orders()
     assert orders and orders[0]["entry_strategy"].startswith("mock-")

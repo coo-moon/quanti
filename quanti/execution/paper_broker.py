@@ -263,6 +263,7 @@ class PaperBroker:
             enriched.append({
                 **pos,
                 "name": stock.name if stock else pos["code"],
+                "industry": stock.industry if stock else "",
                 "current_price": price,
                 # Market date the current_price reflects (the bar we marked
                 # to), NOT the DB row's updated_at. None when we have no bar
@@ -626,6 +627,7 @@ class PaperBroker:
                 "order_id": o["order_id"],
                 "code": o["code"],
                 "name": stock.name if stock else o["code"],
+                "industry": stock.industry if stock else "",
                 "direction": o["direction"],
                 "quantity": o["quantity"],
                 "reason": o.get("reason", "") or "",

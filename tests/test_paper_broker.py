@@ -354,6 +354,7 @@ def test_intraday_marks_override_daily_close_in_session(setup, monkeypatch):
     snap = broker.snapshot_portfolio()
     pos = snap["positions"][0]
     assert pos["current_price"] == pytest.approx(12.34)  # adj_factor 1.0
+    assert pos["industry"] == "银行"   # industry surfaced for the UI
     assert pos["price_date"] == date.today().isoformat()
     assert snap["market_value"] == pytest.approx(12.34 * 1000)
 

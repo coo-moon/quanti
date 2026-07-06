@@ -332,6 +332,7 @@
           <tr>
             <th>代码</th>
             <th>名称</th>
+            <th>行业</th>
             <th>数量</th>
             <th>成本</th>
             <th>买入时间</th>
@@ -348,6 +349,7 @@
           <tr v-for="p in portfolio.positions" :key="p.code">
             <td>{{ p.code }}</td>
             <td>{{ p.name }}</td>
+            <td>{{ p.industry || "—" }}</td>
             <td>{{ p.quantity }}</td>
             <td>{{ p.avg_cost.toFixed(2) }}</td>
             <td class="nowrap">{{ p.buy_date ?? "—" }}</td>
@@ -383,6 +385,7 @@
           <tr>
             <th>代码</th>
             <th>名称</th>
+            <th>行业</th>
             <th>方向</th>
             <th>数量</th>
             <th>加入队列</th>
@@ -397,6 +400,7 @@
           <tr v-for="o in pendingOrders" :key="o.order_id">
             <td>{{ o.code }}</td>
             <td>{{ o.name }}</td>
+            <td>{{ o.industry || "—" }}</td>
             <td :class="o.direction === 'buy' ? 'up' : 'down'">
               {{ o.direction === "buy" ? "买入" : "卖出" }}
             </td>
