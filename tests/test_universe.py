@@ -200,3 +200,57 @@ class TestCandidateRestriction:
         codes = builder.build(candidates=["000001", "600001"])
         # Only 000001 should survive (600001 is ST, rejected).
         assert codes == ["000001"]
+
+
+class TestPointInTimeMetadata:
+    """Survivorship / look-ahead fix (see UniverseBuilder._filter_metadata).
+
+    On historical replay the stored `stocks.name` is the LATEST name (upsert
+    overwrites it every sync), so the ST/退 match is not point-in-time and is
+    dropped; delisting is judged by the point-in-time delist_date instead. On
+    the live path (as_of >= today) the current name IS point-in-time, so the
+    name match stays exactly as before — this class locks both behaviors.
+    """
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        db = Database(str(tmp_path / "pit.db"))
+        db.initialize()
+        long_ago = date(2010, 1, 1)
+        db.upsert_stock("000001", "平安银行", "SZ", long_ago, "银行")  # clean control
+        db.upsert_stock("000010", "*ST美丽", "SZ", long_ago, "环保")  # ST now, still listed
+        # Clean name today, delisted 2023-06-26 — name never trips the filter,
+        # so this isolates the delist_date boundary. Dates safely in the past.
+        db.upsert_stock("600421", "华嵘控股", "SH", long_ago, "综合",
+                        delist_date=date(2023, 6, 26))
+        # "退"-named today, delisted 2024-01-01 — the dominant survivorship case:
+        # was a normal tradeable name in 2022, only later delisted.
+        db.upsert_stock("600002", "某某退", "SH", long_ago, "其他",
+                        delist_date=date(2024, 1, 1))
+        yield db
+        db.close()
+
+    def _meta(self, db, as_of):
+        b = UniverseBuilder(db, DataProvider(db))
+        return set(b._filter_metadata(
+            ["000001", "000010", "600421", "600002"], as_of))
+
+    def test_delist_boundary(self, db):
+        """Kept the day before delisting (still trading), dropped on/after."""
+        assert "600421" in self._meta(db, date(2023, 6, 25))
+        assert "600421" not in self._meta(db, date(2023, 6, 26))
+        assert "600421" not in self._meta(db, date(2023, 12, 31))
+
+    def test_replay_keeps_future_delisted_and_st(self, db):
+        """At a past as_of, names that are ST/退 or delisted TODAY but were
+        active then must all be kept — no look-ahead removal."""
+        survivors = self._meta(db, date(2022, 6, 30))
+        assert survivors == {"000001", "000010", "600421", "600002"}
+
+    def test_live_filters_current_name(self, db):
+        """Live (as_of=today): current name is point-in-time, so ST/退 are
+        dropped exactly as before — locks the live agent against regression."""
+        survivors = self._meta(db, date.today())
+        assert "000010" not in survivors  # *ST dropped by name (live)
+        assert "600002" not in survivors  # 退 dropped by name + delisted
+        assert "000001" in survivors      # clean name kept
