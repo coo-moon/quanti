@@ -244,6 +244,7 @@ export interface AgentStatus {
 export interface PortfolioPosition {
   code: string;
   name: string;
+  industry: string;
   quantity: number;
   avg_cost: number;
   current_price: number;
@@ -311,6 +312,7 @@ export interface PendingOrderDetail {
   order_id: string;
   code: string;
   name: string;
+  industry: string;
   direction: string;
   quantity: number;
   reason: string;

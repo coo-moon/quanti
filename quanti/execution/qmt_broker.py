@@ -192,6 +192,7 @@ class QmtBroker:
             enriched.append({
                 "code": p["code"],
                 "name": stock.name if stock else p["code"],
+                "industry": stock.industry if stock else "",
                 "quantity": vol, "avg_cost": avg, "current_price": cur,
                 "price_date": None, "market_value": cur * vol,
                 "sellable": int(p.get("can_use_volume", 0)),  # T+1-free qty
@@ -656,6 +657,7 @@ class QmtBroker:
             out.append({
                 "order_id": o["order_id"], "code": o["code"],
                 "name": stock.name if stock else o["code"],
+                "industry": stock.industry if stock else "",
                 "direction": o.get("direction", ""),
                 "quantity": o.get("volume", 0),
                 # venue 的挂单回报不带策略归属(mirror 的 entry_strategy 列被挪用
@@ -675,6 +677,7 @@ class QmtBroker:
             out.append({
                 "order_id": o["order_id"], "code": o["code"],
                 "name": stock.name if stock else o["code"],
+                "industry": stock.industry if stock else "",
                 "direction": o.get("direction", ""),
                 "quantity": o.get("quantity", 0),
                 "entry_strategy": o.get("strategy_name", "") or "",

@@ -638,6 +638,7 @@ class TestPendingDetail:
         d = detail[0]
         assert d["code"] == "AAA"
         assert d["name"] == "alpha"          # resolved from stocks table
+        assert d["industry"] == "test"       # industry surfaced for the UI
         assert d["direction"] == "buy"
         assert d["reason"] == "排队测试"
         assert d["bar_available"] is False   # today's bar not in DB
