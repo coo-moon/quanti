@@ -226,6 +226,47 @@ def test_risk_config_from_dict():
     assert c.take_profit_trail_pct == RiskConfig().take_profit_trail_pct
 
 
+def test_extreme_gap_up_block_pct_persists_and_loads(tmp_path):
+    """The gap-up guard threshold round-trips through the risk_config table and
+    rebuilds via risk_config_from_dict (so live UI edits reach the brokers)."""
+    from quanti.data.database import Database
+    from quanti.risk.manager import risk_config_from_dict
+    db = Database(str(tmp_path / "rc.db"))
+    db.initialize()
+    # Default (no row): dataclass default 0.10.
+    assert RiskConfig().extreme_gap_up_block_pct == 0.10
+    cfg = _full_risk_dict(extreme_gap_up_block_pct=0.0)  # disable
+    db.upsert_risk_config(cfg)
+    loaded = db.get_risk_config()
+    assert loaded["extreme_gap_up_block_pct"] == 0.0
+    assert risk_config_from_dict(loaded).extreme_gap_up_block_pct == 0.0
+    db.close()
+
+
+def _full_risk_dict(**over):
+    """A complete risk_config dict (all NOT-NULL columns) with overrides."""
+    base = dict(
+        stop_loss_pct=-0.15, portfolio_stop_loss_pct=-0.30,
+        take_profit_activate_pct=0.15, take_profit_trail_pct=0.10,
+        strategy_exit_enabled=True, atr_stop_k=2.0, atr_stop_n=14,
+        max_position_pct=0.20, max_industry_pct=0.30,
+        extreme_gap_up_block_pct=0.10)
+    base.update(over)
+    return base
+
+
+def test_extreme_gap_up_blocked_helper():
+    """Pure gate: BUY fill price >= block_pct above prior close is blocked;
+    below it, missing data, or block_pct<=0 are not."""
+    from quanti.utils.market import extreme_gap_up_blocked
+    assert extreme_gap_up_blocked(11.0, 10.0, 0.10) is True    # +10% exactly
+    assert extreme_gap_up_blocked(11.5, 10.0, 0.10) is True    # +15%
+    assert extreme_gap_up_blocked(10.9, 10.0, 0.10) is False   # +9% < 10%
+    assert extreme_gap_up_blocked(11.5, 10.0, 0.0) is False    # guard disabled
+    assert extreme_gap_up_blocked(11.5, None, 0.10) is False   # no prior close
+    assert extreme_gap_up_blocked(11.5, 0.0, 0.10) is False    # bad prior close
+
+
 def test_check_portfolio_stop():
     rm = RiskManager(RiskConfig(portfolio_stop_loss_pct=-0.15))
     assert rm.check_portfolio_stop(85_000, 100_000) is True    # -15% exactly

@@ -30,7 +30,8 @@ from quanti.risk.manager import (
 from quanti.risk.protections import ProtectionContext, ProtectionManager
 from quanti.risk.sizer import Sizer, compute_buy_target_value
 from quanti.strategy.base import BaseStrategy
-from quanti.utils.market import lot_round_strength, max_fill_shares, tradable_at_open
+from quanti.utils.market import (
+    extreme_gap_up_blocked, lot_round_strength, max_fill_shares, tradable_at_open)
 
 # A signal waits at most this many trading bars for a fillable (tradable, has a
 # bar) day before being abandoned — mirrors PaperBroker's pending TTL.
@@ -387,6 +388,14 @@ class BacktestEngine:
                 if not expired:
                     survivors.append(p)
                 continue
+            # Extreme-gap-up guard: abandon a BUY gapping up past the threshold
+            # vs prior close (chasing a blow-off open). Cancel, don't defer —
+            # matches paper/live so the three chains agree (extreme_gap_up_blocked).
+            gap_pct = (self._risk.config.extreme_gap_up_block_pct
+                       if self._risk is not None else 0.0)
+            if sig.direction == Direction.BUY and extreme_gap_up_blocked(
+                    bar.open, pc, gap_pct):
+                continue  # dropped (not a survivor) — order abandoned
             filled = self._process_signal(sig, bar, portfolio, trades,
                                           current_date, p["strategy_name"])
             # Drop the post-entry peak only on a FULL exit; a partial 削峰 trim

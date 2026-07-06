@@ -13,6 +13,13 @@ decision/risk pipeline. The difference is where truth lives:
 The ``RiskManager`` hard limits still run **before** every submit — the same
 floor PaperBroker enforces; a live order can't bypass it.
 
+Order timing (A 股 has no night session): a signal decided off-hours — e.g. the
+16:00 daily agent cycle — CANNOT submit (it would be a guaranteed 废单), so it
+QUEUES as a local pending order. The in-session intraday guard's
+``try_fill_pending_orders`` then submits it at the next session's open, matching
+the paper/backtest next-open fill model so the three chains agree. In-session
+signals (e.g. a stop-loss the guard raises) submit to the venue immediately.
+
 Skeleton status (phase ② → ③): this talks to the bridge over the agreed HTTP
 contract and is fully exercised against the bridge's *mock* gateway in tests.
 The parts that need the real venue are marked ``# NOTE``:
@@ -29,7 +36,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import date, datetime
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 from quanti.bridge_client import BridgeClient, DEFAULT_BRIDGE_URL, HttpBridgeClient
 from quanti.data.database import Database
@@ -46,7 +53,9 @@ from quanti.risk.manager import (
 )
 from quanti.risk.sizer import compute_buy_target_value
 from quanti.utils.market import (
-    board_limit_pct, lot_round_strength, prev_bar_close, session_closed_for_day)
+    board_limit_pct, count_trading_days_between, in_trading_session,
+    lot_round_strength, next_trading_day, order_decision_date, prev_bar_close,
+    session_closed_for_day)
 
 if TYPE_CHECKING:
     from quanti.risk.protections import ProtectionConfig
@@ -75,6 +84,8 @@ class QmtBroker:
         slippage: float = 0.001,
         strategies_dir: str = "strategies",
         require_live: bool = False,
+        pending_ttl_trading_days: int = 3,
+        session_fn: "Callable[[], bool] | None" = None,
     ) -> None:
         self._db = db
         self._provider = provider
@@ -91,6 +102,10 @@ class QmtBroker:
             else ProtectionConfig())
         self._slippage = slippage
         self._strategies_dir = strategies_dir
+        self._pending_ttl_days = pending_ttl_trading_days
+        # In-session gate: off-hours signals queue (A 股 no night session),
+        # in-session ones submit now. Injectable so tests are wall-clock free.
+        self._session_fn = session_fn
         self._strategy_cache: dict | None = None  # name → strategy class
 
     # ----------------------------------------------------------- health
@@ -235,16 +250,64 @@ class QmtBroker:
 
     def _submit_signal(self, signal: Signal,
                        strategy_name: str) -> tuple[bool, str, str]:
+        """Route one signal: outside a trading session it queues locally
+        (A 股无夜市委托 — an off-hours submit is a guaranteed 废单, so the
+        16:00 agent cycle's orders must wait for the next session's open,
+        matching the paper/backtest next-open fill semantics); in-session it
+        submits to the venue now. Returns (landed, status, reason)."""
+        if not self._in_session():
+            return self._queue_overnight(signal, strategy_name)
+        return self._send_now(signal, strategy_name)
+
+    def _in_session(self) -> bool:
+        """Whether the market is open right now (injectable for tests)."""
+        if self._session_fn is not None:
+            return self._session_fn()
+        return in_trading_session(datetime.now(), self._provider)
+
+    def _queue_overnight(self, signal: Signal,
+                         strategy_name: str) -> tuple[bool, str, str]:
+        """Park an off-hours signal as a local pending order (no venue call).
+        `try_fill_pending_orders` (intraday guard / next cycle) submits it in
+        the next session. Sizing/risk run at submit time against that day's
+        reconciled account — not against tonight's stale state. Dedup mirrors
+        PaperBroker: one queued order per (code, direction)."""
+        for o in self._db.list_orders(limit=500, status="pending"):
+            if (o["code"] == signal.stock_code
+                    and o["direction"] == signal.direction.value
+                    and not (o.get("entry_strategy") or "")):
+                return False, "rejected", "duplicate queued order"
+        order_id = self._mirror_order(signal, strategy_name, status="pending",
+                                      reason=signal.reason)
+        self._db.log_decision(
+            "order_queued",
+            f"排队(实盘) {signal.direction.value} {signal.stock_code} "
+            f"(待下一交易时段开盘提交)",
+            code=signal.stock_code,
+            details={"venue": "qmt", "order_id": order_id,
+                     "strategy": strategy_name,
+                     "signal_reason": signal.reason,
+                     "queued_strength": signal.strength})
+        return True, "pending", ""
+
+    def _send_now(self, signal: Signal, strategy_name: str,
+                  queued_order_id: str | None = None) -> tuple[bool, str, str]:
         """Risk-check → size → submit. Returns (landed, status, reason) with
         status in {'filled','pending','rejected'}.
 
         RiskManager runs BEFORE every submit (red line). SELL volume is capped
         at the T+1-sellable quantity (`can_use_volume`) so a lot bought today
-        is never over-sold — a frozen position is skipped, not submitted."""
+        is never over-sold — a frozen position is skipped, not submitted.
+
+        With `queued_order_id`, the submit outcome updates that overnight-
+        queued row instead of inserting a fresh mirror row."""
         # Live red line: never submit (nor mirror as filled) against a bridge
         # that isn't truly live — a mock fallback would book phantom real
         # trades (audit G1). No-op when require_live is off (dev/mock/tests).
         if self._require_live and not self.is_connected():
+            if queued_order_id:
+                # Transient: keep the queued row pending, retry next guard tick.
+                return False, "pending", "bridge not live"
             self._mirror_order(signal, strategy_name, status="rejected",
                                reason="bridge not live (mock fallback?)")
             self._db.log_decision(
@@ -258,7 +321,7 @@ class QmtBroker:
         ok, reason, kind = self._entry_allowed(signal, portfolio)
         if not ok:
             self._mirror_order(signal, strategy_name, status="rejected",
-                               reason=reason)
+                               reason=reason, reuse_order_id=queued_order_id)
             self._db.log_decision(
                 kind,
                 f"{'风控' if kind == 'risk_reject' else '保护层'}拒绝(实盘) "
@@ -272,19 +335,20 @@ class QmtBroker:
             if volume < 100:
                 r = "cash/position cap too tight"
                 self._mirror_order(signal, strategy_name, status="rejected",
-                                   reason=r)
+                                   reason=r, reuse_order_id=queued_order_id)
                 return False, "rejected", r
         else:  # SELL — only the T+1-sellable portion can leave today
             pos = portfolio.positions.get(signal.stock_code)
             if pos is None or pos.quantity <= 0:
                 self._mirror_order(signal, strategy_name, status="rejected",
-                                   reason="no position")
+                                   reason="no position",
+                                   reuse_order_id=queued_order_id)
                 return False, "rejected", "no position"
             can_sell = min(pos.quantity, sellable.get(signal.stock_code, 0))
             if can_sell <= 0:
                 r = "T+1: no sellable quantity today"
                 self._mirror_order(signal, strategy_name, status="rejected",
-                                   reason=r)
+                                   reason=r, reuse_order_id=queued_order_id)
                 self._db.log_decision(
                     "order_skipped_t1",
                     f"跳过(实盘) 卖出 {signal.stock_code}: 当日买入 T+1 不可卖",
@@ -298,6 +362,10 @@ class QmtBroker:
             if strategy_name == DRIFT_TRIM_STRATEGY:
                 volume = lot_round_strength(can_sell, signal.strength)
                 if volume < 100:
+                    if queued_order_id:  # don't leave the queued row pending
+                        self._db.update_order_status(
+                            queued_order_id, "rejected",
+                            reason="trim below one lot (no-op)")
                     return False, "rejected", "trim below one lot (no-op)"
             else:
                 volume = can_sell
@@ -395,11 +463,22 @@ class QmtBroker:
 
     # ------------------------------------------------ pending / reconcile
     def try_fill_pending_orders(self) -> PendingFillResult:
-        """Reconcile the local order mirror against the venue's order book.
+        """Advance the local pending queue. Two kinds of rows coexist:
+
+          1. Un-submitted overnight orders (entry_strategy empty): queued by
+             `_queue_overnight` when the 16:00 agent cycle ran off-hours (A 股
+             no night session — an off-hours submit is a guaranteed 废单).
+             Submit them NOW at the session open (matching paper/backtest
+             next-open semantics), applying TTL + the extreme-gap-up guard.
+          2. Already-submitted orders (entry_strategy = venue id): reconcile
+             their fill status against the venue order book.
+
+        Only submits inside a trading session; off-hours it just reconciles
+        (the queued rows wait). Sizing/risk run at submit time via `_send_now`
+        against that session's reconciled account — never tonight's stale one.
 
         NOTE: real fills arrive via xtquant callbacks (bridge phase ③); this
-        poller reads the bridge's reconciled order list. In mock mode orders
-        fill at submit, so there's typically nothing pending to advance."""
+        poller reads the bridge's reconciled order list."""
         out = PendingFillResult()
         try:
             venue = {o["order_id"]: o
@@ -407,10 +486,19 @@ class QmtBroker:
         except Exception as e:  # noqa: BLE001
             logger.warning("reconcile failed (bridge down?): %s", e)
             return out
+        self._sync_risk_config()  # pick up live extreme_gap_up_block_pct
+        in_session = self._in_session()
         local_pending = self._db.list_orders(limit=1000, status="pending")
         out.scanned = len(local_pending)
         for o in local_pending:
             vid = (o.get("entry_strategy") or "")  # venue id mirrored here
+            if not vid:
+                # Un-submitted overnight order: submit at open (in-session only).
+                if in_session:
+                    self._advance_queued(o, out)
+                else:
+                    out.still_pending += 1
+                continue
             v = venue.get(vid)
             if v is None:
                 out.still_pending += 1
@@ -428,6 +516,71 @@ class QmtBroker:
             else:
                 out.still_pending += 1
         return out
+
+    def _advance_queued(self, o: dict, out: PendingFillResult) -> None:
+        """Submit one un-submitted overnight order at the session open, or
+        cancel it on TTL / extreme-gap-up. Updates the same row in place."""
+        try:
+            created_date = order_decision_date(
+                datetime.fromisoformat(o.get("created_at", "")), self._provider)
+        except (ValueError, TypeError):
+            self._db.update_order_status(o["order_id"], "cancelled",
+                                         reason="malformed created_at")
+            out.expired += 1
+            return
+        td = count_trading_days_between(created_date, date.today())
+        if td > self._pending_ttl_days:
+            self._db.update_order_status(
+                o["order_id"], "cancelled",
+                reason=f"expired after {td} trading days")
+            self._db.log_decision(
+                "order_expired_pending",
+                f"排队超时取消(实盘) {o['direction']} {o['code']} "
+                f"({td} 个交易日未提交成交)",
+                code=o["code"], details={"venue": "qmt",
+                                         "order_id": o["order_id"],
+                                         "trading_days_pending": td})
+            out.expired += 1
+            return
+        sig = Signal(
+            stock_code=o["code"], direction=Direction(o["direction"]),
+            strength=1.0, reason=o.get("reason", "") or "queued fill",
+            entry_strategy="")
+        strat = o.get("strategy_name", "") or ""
+        # Extreme-gap-up guard (BUY only): if the open has gapped up past the
+        # threshold vs the prior close, ABANDON the chase — the 5y study shows
+        # the >=10% gap-up bucket is a lottery (median -486bps, p5 -19%,
+        # negative mean in the recent regime), and waiting for a pullback has
+        # no edge either. On the main board a >=10% gap is a limit-up open the
+        # venue can't fill anyway; this newly protects 20cm/30cm boards.
+        if sig.direction == Direction.BUY:
+            g = self._risk.config.extreme_gap_up_block_pct
+            if g and g > 0:
+                pc = prev_bar_close(self._provider, o["code"], date.today())
+                last = self._latest_price(o["code"])
+                if pc and pc > 0 and last > 0 and (last / pc - 1.0) >= g:
+                    self._db.update_order_status(
+                        o["order_id"], "cancelled",
+                        reason=f"extreme gap-up {(last/pc-1):.1%} >= {g:.0%}, abandoned")
+                    self._db.log_decision(
+                        "order_gap_abandoned",
+                        f"放弃追高(实盘) 买入 {o['code']}: 开盘跳涨 "
+                        f"{(last/pc-1):.1%} ≥ {g:.0%}",
+                        code=o["code"], details={"venue": "qmt",
+                                                 "order_id": o["order_id"],
+                                                 "gap": last / pc - 1.0})
+                    out.expired += 1
+                    return
+        landed, status, _reason = self._send_now(sig, strat,
+                                                  queued_order_id=o["order_id"])
+        if status == "filled":
+            out.filled += 1
+        elif landed:  # accepted, resting at venue
+            out.still_pending += 1
+        elif status == "pending":  # transient (bridge not live) — retry next tick
+            out.still_pending += 1
+        else:
+            out.rejected += 1
 
     def check_exits(self) -> int:
         """All three exits against reconciled (venue-truth) positions: stop-loss,
@@ -488,12 +641,14 @@ class QmtBroker:
         return self._strategy_cache
 
     def pending_orders_detail(self) -> list[dict]:
-        """Open orders at the venue, shaped for the UI."""
+        """Pending orders for the UI: open venue orders PLUS locally-queued
+        off-hours orders not yet submitted (they'll go to the venue at the
+        next session open)."""
+        out = []
         try:
             orders = self._client.get("/trader/orders").get("orders", [])
         except Exception:  # noqa: BLE001
-            return []
-        out = []
+            orders = []
         for o in orders:
             if o.get("status") not in ("pending", "accepted"):
                 continue
@@ -510,6 +665,24 @@ class QmtBroker:
                 "expected_fill_date": None, "fill_price_basis": "venue",
                 "bar_available": True, "trading_days_pending": None,
                 "ttl_trading_days": None})
+        # Locally-queued off-hours orders (entry_strategy empty = no venue id
+        # yet). These rest in the DB until the next session's open, when
+        # try_fill_pending_orders submits them.
+        for o in self._db.list_orders(limit=1000, status="pending"):
+            if (o.get("entry_strategy") or ""):
+                continue  # already submitted — reflected in the venue list
+            stock = self._db.get_stock(o["code"])
+            out.append({
+                "order_id": o["order_id"], "code": o["code"],
+                "name": stock.name if stock else o["code"],
+                "direction": o.get("direction", ""),
+                "quantity": o.get("quantity", 0),
+                "entry_strategy": o.get("strategy_name", "") or "",
+                "reason": o.get("reason", "") or "",
+                "created_at": o.get("created_at", ""),
+                "expected_fill_date": None, "fill_price_basis": "next-open",
+                "bar_available": False, "trading_days_pending": None,
+                "ttl_trading_days": self._pending_ttl_days})
         return out
 
     # -------------------------------------------------------- order control
@@ -592,11 +765,21 @@ class QmtBroker:
                       status: str, reason: str = "",
                       venue_order_id: str = "", filled_price: float = 0,
                       filled_quantity: int = 0,
-                      quantity: int = 0) -> str:
+                      quantity: int = 0,
+                      reuse_order_id: str | None = None) -> str:
         """Persist a local mirror row (audit/UI only — broker is truth).
 
         The venue order id is stashed in ``entry_strategy`` so the reconciler
-        can match local rows to the venue book without a schema change."""
+        can match local rows to the venue book without a schema change.
+        `reuse_order_id` updates an existing overnight-queued row in place
+        (its submit outcome) instead of inserting a second row."""
+        if reuse_order_id:
+            self._db.update_order_submitted(
+                reuse_order_id, status=status, quantity=quantity,
+                venue_order_id=venue_order_id, filled_price=filled_price,
+                filled_quantity=filled_quantity,
+                reason=reason or signal.reason)
+            return reuse_order_id
         order_id = "q_" + uuid.uuid4().hex[:10]
         self._db.insert_order({
             "order_id": order_id, "code": signal.stock_code,

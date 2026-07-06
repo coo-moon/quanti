@@ -530,6 +530,64 @@ class TestLimitTradabilityGate:
         assert result.filled == 1
         assert result.still_pending == 0
 
+    def test_extreme_gap_up_abandons_pending_buy(self, tmp_path):
+        """A pending BUY whose next open gaps up >= the guard threshold is
+        ABANDONED (cancelled), not filled — chasing a blow-off open. Uses a
+        20cm (创业板 300xxx) code so the +15% open is tradable (< 20% limit),
+        i.e. the limit-up gate does NOT already block it — this is the zone the
+        guard newly protects."""
+        db = Database(str(tmp_path / "gap.db"))
+        db.initialize()
+        db.upsert_stock("300001", "cyb", "SZ", date(2010, 1, 1), "test")
+        today = pd.Timestamp.today().normalize()
+        prev = (today - pd.Timedelta(days=1)).date()
+        db.save_daily_quotes(pd.DataFrame([{
+            "code": "300001", "date": prev, "open": 9.9, "high": 10.1,
+            "low": 9.8, "close": 10.0, "volume": 5e6, "amount": 5e7,
+            "turnover": 1.0}]))
+        provider = DataProvider(db)
+        # Default RiskConfig → extreme_gap_up_block_pct = 0.10 (guard ON).
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending", slippage=0.0)
+        broker.execute_signal(Signal("300001", Direction.BUY, 0.5, "q"), "test")
+        _backdate_pending(db)
+        # Today opens +15% (11.5) vs prev close 10.0 — tradable (< 20% limit),
+        # but >= 10% guard → abandoned.
+        _append_new_bar(db, "300001", 0, open_price=11.50, close_price=11.60)
+        result = broker.try_fill_pending_orders()
+        assert result.filled == 0
+        assert result.expired == 1          # abandoned counts under expired
+        assert db.list_trades() == []
+        o = db.list_orders()[0]
+        assert o["status"] == "cancelled"
+        assert "gap-up" in o["reason"].lower()
+        assert len(db.list_decisions(kind="order_gap_abandoned")) == 1
+        db.close()
+
+    def test_gap_guard_off_lets_big_gap_fill(self, tmp_path):
+        """Control: with the guard disabled (0), the same +15% open fills —
+        proving the abandonment above is the guard, not some other gate."""
+        db = Database(str(tmp_path / "gap0.db"))
+        db.initialize()
+        db.upsert_stock("300001", "cyb", "SZ", date(2010, 1, 1), "test")
+        today = pd.Timestamp.today().normalize()
+        prev = (today - pd.Timedelta(days=1)).date()
+        db.save_daily_quotes(pd.DataFrame([{
+            "code": "300001", "date": prev, "open": 9.9, "high": 10.1,
+            "low": 9.8, "close": 10.0, "volume": 5e6, "amount": 5e7,
+            "turnover": 1.0}]))
+        provider = DataProvider(db)
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending", slippage=0.0,
+                             risk_config=RiskConfig(extreme_gap_up_block_pct=0.0))
+        broker.execute_signal(Signal("300001", Direction.BUY, 0.5, "q"), "test")
+        _backdate_pending(db)
+        _append_new_bar(db, "300001", 0, open_price=11.50, close_price=11.60)
+        result = broker.try_fill_pending_orders()
+        assert result.filled == 1
+        assert result.expired == 0
+        db.close()
+
     def test_immediate_buy_blocked_by_limit_up_close(self, seeded_pending):
         db, provider = seeded_pending
         broker = PaperBroker(db, provider, initial_cash=200_000,
