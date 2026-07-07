@@ -313,7 +313,7 @@ def test_reconciled_current_price_uses_live_quote_not_cost(env):
     broker = _make(db, provider)
     broker._client.gw._mock_positions["000001"] = {
         "volume": 1000, "can_use": 1000, "avg_price": 30.0}
-    pf, _ = broker._reconciled_portfolio()
+    pf, _, _ = broker._reconciled_portfolio()
     pos = pf.positions["000001"]
     # Mock live quote for 000001 (~24.43) ≠ cost 30.0 → a real (negative) pnl.
     assert pos.current_price != pytest.approx(pos.avg_cost)
@@ -532,6 +532,106 @@ def test_raise_hwm_is_monotone_and_reset_clears_it(env):
     assert db.get_peak_total_value() == pytest.approx(2_000_000)
     db.reset_portfolio(1_000_000)
     assert db.get_peak_total_value() == 0.0
+
+
+# --- H1: live order-price band is on the RAW axis (dividend/split safe) ------
+
+def test_order_price_band_uses_raw_axis_on_dividend_stock(tmp_path):
+    """Regression (H1): _order_price clamps a raw live order into the RAW
+    price-limit band, not the hfq (back-adjusted) one. On a dividend/split stock
+    (adj_factor>1) the hfq prev-close is inflated, so an hfq band would clamp
+    every raw order outside the ±10% cage → the venue 废单s ALL orders, incl. the
+    forced stop-loss/flatten floor (the stop can't get out on real money)."""
+    db = Database(str(tmp_path / "d.db"))
+    db.initialize()
+    db.upsert_stock("600000", "浦发银行", "SH", date(1999, 11, 10), "银行")
+    today = pd.Timestamp.today().normalize()
+    # Prior bar: RAW close 10.0, adj_factor 1.25 → hfq close 12.5.
+    db.save_daily_quotes(pd.DataFrame([
+        {"code": "600000", "date": (today - pd.Timedelta(days=1)).date(),
+         "open": 9.9, "high": 10.1, "low": 9.8, "close": 10.0,
+         "volume": 1e6, "amount": 1e7, "turnover": 1.0, "adj_factor": 1.25},
+    ]))
+    provider = DataProvider(db)
+    broker = _make(db, provider)
+    try:
+        # RAW band = [9.0, 11.0]. A raw limit-up order (11.0) stays 11.0.
+        # (The old hfq band [11.25, 13.75] would wrongly clamp it UP to 11.25 →
+        # above the venue's raw ±10% cage → 废单.)
+        assert broker._order_price("600000", 11.0) == pytest.approx(11.0)
+        # Forced-exit floor lands on the RAW 跌停 (9.0), where a sell can fill —
+        # not hfq 11.25 (above market, unfillable on a fast drop).
+        assert broker._order_price("600000", 0.01) == pytest.approx(9.0)
+    finally:
+        db.close()
+
+
+# --- H2: live stale-quote must not silently disable the stop-loss -----------
+
+class StaleFeedBridge:
+    """A 'live' (vnpy-mode, connected, datafeed_ok) bridge whose held position
+    has NO realtime price when `last_price=0` — a per-stock 停牌 / dead feed while
+    the gateway itself is alive. Records submitted orders."""
+
+    def __init__(self, last_price: float = 0.0) -> None:
+        self.last_price = last_price
+        self.orders: list[dict] = []
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        if path == "/health":
+            return {"ok": True, "mode": "vnpy", "trader_connected": True,
+                    "datafeed_ok": True}
+        if path == "/trader/asset":
+            return {"cash": 100_000.0, "market_value": 0.0,
+                    "total_asset": 100_000.0}
+        if path == "/trader/positions":
+            mv = 1000 * self.last_price  # 0 when the feed is down
+            return {"positions": [{"code": "000001", "volume": 1000,
+                                   "can_use_volume": 1000, "avg_price": 30.0,
+                                   "last_price": self.last_price,
+                                   "market_value": mv}]}
+        if path == "/trader/orders":
+            return {"orders": []}
+        if path == "/data/quote":
+            return {"last": self.last_price}
+        return {}
+
+    def post(self, path: str, json: dict | None = None) -> dict:
+        if path == "/trader/order":
+            self.orders.append(json or {})
+            return {"ok": True, "status": "filled", "order_id": "x1",
+                    "filled_price": (json or {}).get("price", 0),
+                    "filled_volume": (json or {}).get("volume", 0)}
+        return {"ok": True}
+
+
+def test_check_exits_skips_and_alerts_on_stale_quote(env):
+    """H2: in live, a held position with no realtime price must NOT be exit-
+    evaluated on a fabricated (cost-basis) price — that pinned pnl≡0 and silently
+    disabled its stop-loss. check_exits skips it and logs a `stale_quote` alert
+    instead of firing a bogus (or missing) stop."""
+    db, provider = env
+    bridge = StaleFeedBridge(last_price=0.0)          # feed down for 000001
+    broker = QmtBroker(db, provider, client=bridge, require_live=True,
+                       session_fn=lambda: True)
+    assert broker.check_exits() == 0                  # no fabricated stop fired
+    assert bridge.orders == []                        # nothing submitted
+    assert any(d["kind"] == "stale_quote"
+               for d in db.list_decisions(limit=10))  # human alerted
+
+
+def test_check_exits_fires_stop_when_quote_is_fresh(env):
+    """Contrast: with a REAL realtime price past the stop, the same live path
+    DOES fire — proving the stale skip is specific to a missing quote, not a
+    blanket 'never stop in live'."""
+    db, provider = env
+    bridge = StaleFeedBridge(last_price=24.0)         # real price, -20% vs cost 30
+    broker = QmtBroker(db, provider, client=bridge, require_live=True,
+                       session_fn=lambda: True)
+    assert broker.check_exits() == 1
+    assert any(o["direction"] == "sell" for o in bridge.orders)
+    assert not any(d["kind"] == "stale_quote"
+                   for d in db.list_decisions(limit=10))
 
 
 # --- overnight queue → submit at open (A 股 no night session) --------------

@@ -23,9 +23,11 @@ def dbp(tmp_path):
     db.close()
 
 
-def test_make_broker_picks_account(dbp):
+def test_make_broker_picks_account(dbp, monkeypatch):
     db, provider = dbp
     assert isinstance(make_broker(db, provider, account="paper"), PaperBroker)
+    # Live requires the explicit real-money acknowledgment (H3).
+    monkeypatch.setenv("QUANTI_LIVE_ACK", "I_KNOW_REAL_MONEY")
     live = make_broker(db, provider, account="live")
     assert isinstance(live, QmtBroker) and live._require_live is True  # real-money guard on
 

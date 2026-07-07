@@ -266,11 +266,20 @@ def extreme_gap_up_blocked(fill_price: float, prev_close: float | None,
 
 
 def prev_bar_close(provider: DataProvider, code: str,
-                   before_date: date) -> float | None:
+                   before_date: date, adjust: str = "hfq") -> float | None:
     """Close of the most recent bar strictly before `before_date` — the prior
-    close the daily price-limit is computed from. None when unavailable."""
+    close the daily price-limit is computed from. None when unavailable.
+
+    ``adjust`` MUST match the axis of the price this close is compared against:
+    backtest/paper mark on the hfq (back-adjusted) axis, so it defaults to hfq;
+    LIVE order pricing is on the RAW quote axis (xtdata realtime is 不复权), so
+    the QmtBroker passes ``adjust="none"``. Mixing axes silently breaks the
+    limit band — on a dividend/split stock the hfq factor grows >1, so an hfq
+    prev-close clamps a raw order price outside the ±10% price cage and the
+    venue 废单s every order, including forced stop-loss/flatten sells."""
     bars = provider.get_daily_bars(
-        code, before_date - timedelta(days=20), before_date - timedelta(days=1))
+        code, before_date - timedelta(days=20), before_date - timedelta(days=1),
+        adjust=adjust)
     return bars[-1].close if bars else None
 
 

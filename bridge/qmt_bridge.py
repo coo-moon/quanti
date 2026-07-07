@@ -106,12 +106,23 @@ class QmtGateway:
 
     # ------------------------------------------------------------ health
     def health(self) -> dict:
+        connected = bool(
+            self._backend and getattr(self._backend, "connected", False))
+        # datafeed_ok: coarse liveness the sticky `connected` bool can't give —
+        # in vnpy mode it's whether a gateway event arrived recently (a dead feed
+        # even while `connected` stays True); mock is always fresh. QmtBroker.
+        # is_connected() gates real money on this (H2).
+        if self.mock:
+            datafeed_ok = True
+        else:
+            df = getattr(self._backend, "data_fresh", None)
+            datafeed_ok = bool(connected and df and df())
         return {
             "ok": True,
             "xtquant": XTQUANT_AVAILABLE,
             "vnpy": VnpyBackend.available(),
-            "trader_connected": bool(
-                self._backend and getattr(self._backend, "connected", False)),
+            "trader_connected": connected,
+            "datafeed_ok": datafeed_ok,
             "mode": "mock" if self.mock else "vnpy",
             "version": BRIDGE_VERSION,
         }

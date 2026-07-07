@@ -101,8 +101,8 @@ QMT 客户端**只有 Windows 版**，没有 Mac/Linux 版。三选一：
 ## 6. 切换流程（满 3 个月评估通过后）
 
 1. [ ] 在 Windows 机器上跑 `quanti up --no-agent`（仍走 PaperBroker），确认 Web 能开
-2. [ ] 安装好 QMT 客户端并登录券商账户
-3. [ ] `quanti up --no-agent --live --broker qmt`，**仅启服务不启 Agent**
+2. [ ] 安装好 QMT 客户端并登录券商账户，起好 `bridge/qmt_bridge.py` 并确认 `/health` 的 `mode==vnpy && trader_connected && datafeed_ok`
+3. [ ] 切实盘用**环境变量**（不是 CLI flag）：`QUANTI_ACCOUNT=live QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY quanti up`；实盘默认**不自动拉起 Agent**（须手动 `agent_start`），故这一步只起服务
 4. [ ] 用 Web "手动下单" 测一笔 100 股最便宜的标的，确认下单/成交/撤单全流程
 5. [ ] 调小目标资金（比如先只放 5 万到这个账户），观察一周
 6. [ ] 在 Web 上 `agent_start`，观察一周
