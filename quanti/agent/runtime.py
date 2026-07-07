@@ -37,6 +37,7 @@ from quanti.agent.signal_pipeline import (
     fuse_buy_signals,
     industry_cap,
     select_rotation_sells,
+    trending_holdings,
 )
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
@@ -753,11 +754,16 @@ class AgentRuntime:
         held_mv = {p["code"]: float(p.get("market_value", 0.0) or 0.0)
                    for p in snap.get("positions", [])}
         score_by_code = {c.code: c.final_score for c in fused}
+        # Buy/hold spread: retain a still-trending holding even when it's no
+        # longer a fresh candidate (it would otherwise score 0 = weakest and be
+        # sold first). See trending_holdings.
+        protected = trending_holdings(self._provider, list(held_mv))
         sells = select_rotation_sells(
             intended_buys, score_by_code, held_mv,
             float(snap.get("cash", 0.0) or 0.0),
             float(snap.get("total_value", 0.0) or 0.0),
-            margin=rc.rotation_margin, max_position_pct=rc.max_position_pct)
+            margin=rc.rotation_margin, max_position_pct=rc.max_position_pct,
+            exclude=protected)
         if not sells:
             return
         self._broker.execute_signals(sells, strategy_name="rotation")

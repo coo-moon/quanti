@@ -22,6 +22,7 @@ from quanti.agent.signal_pipeline import (
     fuse_buy_signals,
     industry_cap,
     select_rotation_sells,
+    trending_holdings,
 )
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
@@ -374,3 +375,53 @@ def test_rotation_never_sells_an_intended_buy():
 
 def test_rotation_empty_when_no_holdings():
     assert _rot(["NEW"], {"NEW": 0.9}, {}, cash=0, total=10_000) == []
+
+
+# -------------------- trending_holdings (buy/hold spread) -----------------
+
+class _FakeProvider:
+    """Minimal provider returning a fixed close series per code."""
+
+    def __init__(self, series: dict[str, list[float]]):
+        self._series = series
+
+    def get_daily_bars(self, code, start, end, adjust="hfq"):
+        from datetime import timedelta
+
+        from quanti.models import BarData
+        closes = self._series.get(code, [])
+        return [BarData(code=code, date=date(2020, 1, 1) + timedelta(days=i),
+                        open=c, high=c, low=c, close=c,
+                        volume=1e6, amount=1e7, turnover=1.0)
+                for i, c in enumerate(closes)]
+
+
+def test_trending_holdings_protects_uptrend_not_downtrend():
+    fp = _FakeProvider({
+        "UP": [10 + 0.1 * i for i in range(30)],    # rising → last ≥ MA20
+        "DOWN": [25 - 0.1 * i for i in range(30)],   # falling → last < MA20
+        "SHORT": [10, 11, 12],                       # < 20 bars → protect (fail-safe)
+    })
+    prot = trending_holdings(fp, ["UP", "DOWN", "SHORT"], ma_days=20)
+    assert "UP" in prot and "SHORT" in prot
+    assert "DOWN" not in prot
+
+
+def test_trending_holdings_no_provider_protects_nothing():
+    assert trending_holdings(None, ["A", "B"]) == set()
+    assert trending_holdings(_FakeProvider({}), []) == set()
+
+
+def test_rotation_retains_trending_holding_via_exclude():
+    """End-to-end of the fix: a trending holding scored 0 (dropped out of
+    candidates) would be the weakest and sold — but passing it in `exclude`
+    (as _maybe_rotate now does via trending_holdings) protects it, so a fading
+    holding is sold instead."""
+    # STALE_UP and STALE_DOWN both dropped out of candidates (score 0). Without
+    # protection the sort is arbitrary; with STALE_UP protected, only the
+    # fading one is eligible.
+    sells = select_rotation_sells(
+        ["NEW"], {"NEW": 0.9}, {"STALE_UP": 5_000, "STALE_DOWN": 5_000},
+        0, 10_000, margin=0.15, max_position_pct=0.20,
+        exclude={"STALE_UP"})
+    assert [s.stock_code for s in sells] == ["STALE_DOWN"]

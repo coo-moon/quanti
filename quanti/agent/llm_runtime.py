@@ -38,7 +38,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from quanti.agent.goal import Goal
-from quanti.agent.signal_pipeline import FusedCandidate, select_rotation_sells
+from quanti.agent.signal_pipeline import (
+    FusedCandidate, select_rotation_sells, trending_holdings)
 from quanti.data.database import Database
 from quanti.execution.base import Broker
 from quanti.models import Direction, Signal
@@ -699,11 +700,17 @@ def _rotation_sells_if_enabled(
         pf = broker.snapshot_portfolio()
         held_mv = {p["code"]: float(p.get("market_value", 0.0) or 0.0)
                    for p in pf.get("positions", [])}
+        # Buy/hold spread: retain a still-trending holding even when it's no
+        # longer a fresh candidate (else it scores 0 = weakest and is sold
+        # first). Provider comes off the broker (both brokers store it).
+        protected = trending_holdings(getattr(broker, "_provider", None),
+                                      list(held_mv))
         return select_rotation_sells(
             buy_codes, score_by_code, held_mv,
             float(pf.get("cash", 0.0) or 0.0),
             float(pf.get("total_value", 0.0) or 0.0),
-            margin=rc.rotation_margin, max_position_pct=rc.max_position_pct)
+            margin=rc.rotation_margin, max_position_pct=rc.max_position_pct,
+            exclude=protected)
     except Exception as e:  # noqa: BLE001 - rotation must never break a tick
         logger.warning(f"rotation skipped: {e}")
         return []
