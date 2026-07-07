@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -19,6 +20,8 @@ from quanti.execution.factory import make_broker
 # Resolve web/dist relative to project root
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _DIST_DIR = _PROJECT_ROOT / "web" / "dist"
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -109,7 +112,16 @@ def create_app(
         from quanti.agent.goal import load_goal
         try:
             goal = load_goal(db)
-            if autostart_agent or goal.enabled:
+            # Live never auto-starts the agent on boot — real money must not be
+            # traded by merely starting the process (or auto-resuming across a
+            # restart). The operator explicitly hits agent_start (Web/MCP/CLI)
+            # each session. Paper keeps the boot-time autostart. (H3)
+            if account == "live":
+                if autostart_agent or goal.enabled:
+                    logger.warning(
+                        "实盘模式:不在启动时自动拉起 Agent,请手动 agent_start "
+                        "(goal.enabled=%s 被忽略)", goal.enabled)
+            elif autostart_agent or goal.enabled:
                 agent.start()
         except Exception:
             pass

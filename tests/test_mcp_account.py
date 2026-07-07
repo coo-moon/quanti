@@ -24,6 +24,7 @@ def test_mcp_live_uses_qmt_and_live_db(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data").mkdir()
     monkeypatch.setenv("QUANTI_ACCOUNT", "live")
+    monkeypatch.setenv("QUANTI_LIVE_ACK", "I_KNOW_REAL_MONEY")  # H3: real-money ack
     ctx = QuantiContext()
     try:
         assert isinstance(ctx.broker, QmtBroker)          # live broker, not paper

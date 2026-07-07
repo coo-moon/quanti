@@ -72,6 +72,7 @@ class TestMetaEndpoint:
     @pytest.mark.asyncio
     async def test_meta_reflects_live_account(self, db, monkeypatch):
         monkeypatch.setenv("QUANTI_ACCOUNT", "live")
+        monkeypatch.setenv("QUANTI_LIVE_ACK", "I_KNOW_REAL_MONEY")  # H3: real-money ack
         app = create_app(db=db, provider=DataProvider(db),
                          strategies_dir="strategies")
         async with AsyncClient(transport=ASGITransport(app=app),

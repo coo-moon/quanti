@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 
 logger = logging.getLogger("qmt-bridge.vnpy")
@@ -122,6 +123,22 @@ class VnpyBackend:
         self._engine = None
         self._main = None
         self.connected = False
+        # Monotonic timestamp of the last gateway event. `connected` alone was a
+        # sticky bool that never flipped false on a mid-session disconnect; the
+        # gateway pushes account/position events continuously while live, so a
+        # stalled clock here means the feed is dead even if `connected` is True.
+        self._last_event_at: float | None = None
+
+    def _touch(self) -> None:
+        self._last_event_at = time.monotonic()
+
+    def data_fresh(self, max_age: float = 30.0) -> bool:
+        """True iff a gateway event arrived within `max_age` seconds — the live
+        liveness signal `connected` can't give (it never flips on disconnect).
+        Best-effort: verify the real cadence on the QMT box (# VERIFY, H2)."""
+        with self._lock:
+            ts = self._last_event_at
+        return ts is not None and (time.monotonic() - ts) < max_age
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:  # pragma: no cover - QMT box only
@@ -150,18 +167,22 @@ class VnpyBackend:
     def _on_account(self, event) -> None:  # pragma: no cover
         with self._lock:
             self._accounts[event.data.accountid] = event.data
+            self._touch()
 
     def _on_position(self, event) -> None:  # pragma: no cover
         with self._lock:
             self._positions[event.data.vt_positionid] = event.data
+            self._touch()
 
     def _on_order(self, event) -> None:  # pragma: no cover
         with self._lock:
             self._orders[event.data.vt_orderid] = event.data
+            self._touch()
 
     def _on_trade(self, event) -> None:  # pragma: no cover
         with self._lock:
             self._trades[event.data.vt_tradeid] = event.data
+            self._touch()
 
     # ------------------------------------------------------------ trading
     def asset(self) -> dict:  # pragma: no cover - QMT box only

@@ -54,7 +54,7 @@ from quanti.risk.manager import (
 from quanti.risk.sizer import compute_buy_target_value
 from quanti.utils.market import (
     board_limit_pct, count_trading_days_between, in_trading_session,
-    lot_round_strength, next_trading_day, order_decision_date, prev_bar_close,
+    lot_round_strength, order_decision_date, prev_bar_close,
     session_closed_for_day)
 
 if TYPE_CHECKING:
@@ -122,42 +122,74 @@ class QmtBroker:
         if not h.get("ok"):
             return False
         if self._require_live:
-            return h.get("mode") == "vnpy" and bool(h.get("trader_connected"))
+            # Real money: require real vnpy mode + a connected trader AND a fresh
+            # datafeed. `trader_connected` alone was a sticky bool that never
+            # flipped false on a mid-session disconnect, so the guard would keep
+            # firing orders into a dead gateway; the bridge now reports
+            # datafeed_ok from recent gateway events (H2). A bridge that predates
+            # this field omits it → default True so we don't regress older bridges.
+            return (h.get("mode") == "vnpy"
+                    and bool(h.get("trader_connected"))
+                    and h.get("datafeed_ok", True) is not False)
         return True
 
     def _order_price(self, code: str, price: float) -> float:
         """Round to the A-share tick (0.01) and clamp into today's price-limit
         band, so the venue can't reject an illegal/over-limit price (audit G4)."""
         p = round(float(price), 2)
-        pc = prev_bar_close(self._provider, code, date.today())
+        # RAW prev close: the live order price is a raw (不复权) quote, so the
+        # limit band MUST be raw too. The hfq default clamps a dividend/split
+        # stock's raw order outside the ±10% cage → venue 废单s every order,
+        # incl. the forced stop-loss/flatten floor below (H1).
+        pc = prev_bar_close(self._provider, code, date.today(), adjust="none")
         if pc and pc > 0:
             lim = board_limit_pct(code)
             p = min(max(p, round(pc * (1 - lim), 2)), round(pc * (1 + lim), 2))
         return p
 
     # ------------------------------------------------------- reconciliation
-    def _reconciled_portfolio(self) -> tuple[Portfolio, dict[str, int]]:
+    def _reconciled_portfolio(
+            self) -> tuple[Portfolio, dict[str, int], set[str]]:
         """Build a Portfolio from the *broker* account — the source of truth —
-        plus a per-code sellable (T+1 `can_use_volume`) map. A lot bought today
-        is frozen, so SELLs must be capped at the sellable amount, not the total
-        held; callers read the second element for that."""
+        plus a per-code sellable (T+1 `can_use_volume`) map and a set of codes
+        whose realtime price is stale/unavailable. A lot bought today is frozen,
+        so SELLs must be capped at the sellable amount, not the total held;
+        callers read the second element for that.
+
+        The third element (``stale``) matters for exits: in live, a code with no
+        realtime quote falls back to cost basis (pnl≡0) which would silently
+        disable its stop-loss (audit C5). `check_exits` skips + alerts on those
+        instead of evaluating a fabricated price."""
         asset = self._client.get("/trader/asset")
         rows = self._client.get("/trader/positions").get("positions", [])
         pf = Portfolio(cash=float(asset.get("cash", 0.0)))
         sellable: dict[str, int] = {}
+        stale: set[str] = set()
         for p in rows:
             vol = int(p.get("volume", 0))
             if vol <= 0:
                 continue
             avg = float(p.get("avg_price", 0.0))
             cur = self._current_price(p, vol, avg)
+            if self._realtime_stale(p):
+                stale.add(p["code"])
             stock = self._db.get_stock(p["code"])
             pf.positions[p["code"]] = Position(
                 stock_code=p["code"], quantity=vol, avg_cost=avg,
                 current_price=cur, buy_date=None,
                 industry=stock.industry if stock else "")
             sellable[p["code"]] = int(p.get("can_use_volume", 0))
-        return pf, sellable
+        return pf, sellable, stale
+
+    def _realtime_stale(self, p: dict) -> bool:
+        """True when a live position has NO realtime price (feed down / 停牌 /
+        thread stall) so its current_price fell back to cost basis. Only flagged
+        under require_live — dev/mock/paper price off stored bars by design."""
+        if not self._require_live:
+            return False
+        last = float(p.get("last_price", 0) or 0)
+        mv = float(p.get("market_value", 0) or 0)
+        return last <= 0 and mv <= 0
 
     @staticmethod
     def _current_price(p: dict, vol: int, avg: float) -> float:
@@ -318,7 +350,7 @@ class QmtBroker:
                 code=signal.stock_code, details={"venue": "qmt"})
             return False, "rejected", "bridge not live"
 
-        portfolio, sellable = self._reconciled_portfolio()
+        portfolio, sellable, _ = self._reconciled_portfolio()
         ok, reason, kind = self._entry_allowed(signal, portfolio)
         if not ok:
             self._mirror_order(signal, strategy_name, status="rejected",
@@ -557,7 +589,12 @@ class QmtBroker:
         if sig.direction == Direction.BUY:
             g = self._risk.config.extreme_gap_up_block_pct
             if g and g > 0:
-                pc = prev_bar_close(self._provider, o["code"], date.today())
+                # RAW axis: `last` is a raw realtime quote, so the prev close the
+                # gap is measured against must be raw too — an hfq prev-close
+                # (default) makes last/pc≈1/f<1 on dividend stocks, so the gap
+                # reads negative and the guard silently never fires (H1).
+                pc = prev_bar_close(self._provider, o["code"], date.today(),
+                                    adjust="none")
                 last = self._latest_price(o["code"])
                 if pc and pc > 0 and last > 0 and (last / pc - 1.0) >= g:
                     self._db.update_order_status(
@@ -594,7 +631,19 @@ class QmtBroker:
         stop-loss. Triggering is still per-tick on the last price, not intraday
         (phase ⑤)."""
         self._sync_risk_config()
-        portfolio, _ = self._reconciled_portfolio()
+        portfolio, _, stale = self._reconciled_portfolio()
+        # A stale/absent realtime price fell back to cost basis (pnl≡0), which
+        # would silently disable the stop-loss (audit C5). We CANNOT evaluate an
+        # exit on a price we don't have — and must not fabricate one (avg → no
+        # stop; 0 → a false -100% stop that dumps the book). Drop the name from
+        # exit evaluation and raise a decision-log alert so a human can act.
+        for code in stale:
+            portfolio.positions.pop(code, None)
+            self._db.log_decision(
+                "stale_quote",
+                f"实时行情缺失,跳过离场判定并告警: {code} "
+                f"(止损/止盈本轮未评估,请检查行情源/是否停牌)",
+                code=code, details={"venue": "qmt", "reason": "no realtime price"})
         positions = self._db.list_positions()
         # raw_axis: venue prices (last_price/avg_price) are raw, not hfq.
         peaks = compute_peaks(self._db, positions, raw_axis=True)
@@ -719,8 +768,12 @@ class QmtBroker:
 
         Each SELL goes through `_submit_signal`, which caps at the T+1-sellable
         quantity and skips fully-frozen lots — so `acted` counts only positions
-        an exit was actually submitted for (the contract in base.py)."""
-        pf, _ = self._reconciled_portfolio()
+        an exit was actually submitted for (the contract in base.py).
+
+        Kill-switch SELLs price at the 跌停 floor (not the live quote), so a
+        stale-quote name is still flattened — no stale skip here (unlike the
+        stop-loss path in check_exits, which needs a real price to decide)."""
+        pf, _, _ = self._reconciled_portfolio()
         acted = 0
         for code, pos in pf.positions.items():
             if pos.quantity <= 0:
