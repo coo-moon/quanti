@@ -281,6 +281,47 @@ def select_rotation_sells(
     return sells
 
 
+def trending_holdings(provider: DataProvider | None, codes: list[str],
+                      ma_days: int = 20) -> set[str]:
+    """Codes still in a short-term uptrend (latest hfq close ≥ their `ma_days`
+    moving average) — a buy/hold spread RETAINS these even when they're no
+    longer a fresh entry candidate.
+
+    Rotation ranks incumbents by their *entry* score and treats a name that
+    stopped generating a fresh BUY signal as score 0 (weakest → first sold).
+    But most held winners stop re-triggering entry while still trending, so
+    that would force-sell them. This is the "continued membership ≠ addition"
+    rule used by index reconstitution (Russell/MSCI banding) and factor funds
+    (AQR/Novy-Marx buy/hold spread): keep a holding on a looser criterion than
+    you'd require to buy it fresh. Callers add the result to `exclude`.
+
+    Fail-safe: a name with no provider or < ``ma_days`` of history is treated
+    as trending (protected) — don't churn a position we can't assess. ma_days
+    ponytail: fixed 20-session (~1mo) trend filter; lift to config if tuning is
+    ever needed.
+    """
+    if provider is None or not codes:
+        return set()
+    # ~ma_days trading bars need more calendar days (weekends/holidays); 2× + a
+    # pad is comfortably enough without an unbounded lookback.
+    start = date.today() - timedelta(days=ma_days * 2 + 30)
+    out: set[str] = set()
+    for code in codes:
+        try:
+            bars = provider.get_daily_bars(code, start, date.today())
+        except Exception:  # noqa: BLE001 - a bad code must not break rotation
+            out.add(code)  # can't assess → protect
+            continue
+        closes = [float(b.close) for b in bars if b.close]
+        if len(closes) < ma_days:
+            out.add(code)  # insufficient history → protect (fail-safe)
+            continue
+        ma = sum(closes[-ma_days:]) / ma_days
+        if closes[-1] >= ma:
+            out.add(code)  # still above its MA → uptrend intact → retain
+    return out
+
+
 # ---------------------------------------------------------- runtime helper
 
 def collect_signals_per_strategy(
