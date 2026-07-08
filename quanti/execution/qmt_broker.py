@@ -176,6 +176,15 @@ class QmtBroker:
                     and h.get("datafeed_ok", True) is not False)
         return True
 
+    def bridge_health(self) -> dict:
+        """Raw /health dict from the bridge (mode / trader_connected /
+        datafeed_ok / orders_allowed), or {} if unreachable. For the live-control
+        UI panel — never raises."""
+        try:
+            return self._client.get("/health") or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
     def _order_price(self, code: str, price: float) -> float:
         """Round to the A-share tick (0.01) and clamp into today's price-limit
         band, so the venue can't reject an illegal/over-limit price (audit G4)."""
@@ -407,6 +416,19 @@ class QmtBroker:
             return False, "rejected", reason
 
         if signal.direction == Direction.BUY:
+            # Live-order arm switch (UI-toggled, DB-backed). DISARMED = observation:
+            # reject new BUYs (never blocks exits — a SELL/stop-loss/flatten still
+            # gets out). Real BUYs need this armed AND the bridge's own
+            # QMT_BRIDGE_ALLOW_ORDERS gate. No-op off the live path (require_live).
+            if self._require_live and not self._db.get_live_orders_armed():
+                r = "实盘下单未布防(观察模式):在 UI「实盘下单」开关打开才放行买入"
+                self._mirror_order(signal, strategy_name, status="rejected",
+                                   reason=r, reuse_order_id=queued_order_id)
+                self._db.log_decision(
+                    "order_disarmed",
+                    f"拒单(实盘·观察) 买入 {signal.stock_code}: 下单开关未布防",
+                    code=signal.stock_code, details={"venue": "qmt"})
+                return False, "rejected", r
             volume, price = self._size_buy(signal, portfolio)
             if volume < 100:
                 r = "cash/position cap too tight"

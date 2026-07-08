@@ -923,3 +923,52 @@ def test_reconcile_leaves_unmatched_submitting(env):
     _make(db, provider, client=InProcBridge()).try_fill_pending_orders()  # venue empty
     row = next(o for o in db.list_orders() if o["order_id"] == "q_x")
     assert row["status"] == "submitting"        # untouched
+
+
+# --- live-order arm/disarm switch (UI-toggled, DB-backed) -------------------
+
+class _LiveRecordingBridge(RecordingBridge):
+    """Reports a live (xt) /health so require_live's is_connected() passes, but
+    otherwise delegates to the in-proc mock gateway (records /trader/order)."""
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        if path == "/health":
+            return {"ok": True, "mode": "xt", "trader_connected": True,
+                    "datafeed_ok": True, "orders_allowed": True}
+        return super().get(path, params)
+
+
+def test_disarmed_rejects_live_buy(env):
+    """Live + DISARMED (default) → BUY rejected as observation; nothing reaches
+    the venue; an order_disarmed alert is logged."""
+    db, provider = env
+    rec = _LiveRecordingBridge()
+    broker = _make(db, provider, client=rec, require_live=True)
+    assert db.get_live_orders_armed() is False              # default disarmed
+    landed = broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s")
+    assert landed is False
+    assert rec.orders == []                                  # never submitted
+    assert any(d["kind"] == "order_disarmed" for d in db.list_decisions(limit=10))
+
+
+def test_armed_lets_live_buy_through(env):
+    """Once armed, the live BUY reaches the venue."""
+    db, provider = env
+    rec = _LiveRecordingBridge()
+    broker = _make(db, provider, client=rec, require_live=True)
+    db.set_live_orders_armed(True)
+    landed = broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s")
+    assert landed is True
+    assert len(rec.orders) == 1                              # reached the venue
+
+
+def test_disarm_never_blocks_sell(env):
+    """The arm gate is BUY-only — a SELL is never rejected for being disarmed
+    (an exit/stop-loss must always get out)."""
+    db, provider = env
+    rec = _LiveRecordingBridge()
+    broker = _make(db, provider, client=rec, require_live=True)  # disarmed
+    # No position → SELL rejected as 'no position', NOT 'order_disarmed'.
+    landed = broker.execute_signal(Signal("000001", Direction.SELL, 1.0, "x"), "s")
+    assert landed is False
+    assert not any(d["kind"] == "order_disarmed" for d in db.list_decisions(limit=10))

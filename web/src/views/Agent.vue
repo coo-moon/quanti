@@ -261,6 +261,64 @@
       </details>
     </div>
 
+    <!-- Live order control: the LAST safety gate before real money.
+         Only shown on a live account. A single arm/disarm switch flips
+         阶段C(观察) ↔ 阶段D(下单); it gates BUYs only — exits always pass. -->
+    <div class="card live-control" v-if="liveControl && liveControl.is_live">
+      <div class="card-header">
+        <h2>
+          实盘控制
+          <span class="live-badge">● 实盘 · {{ liveControl.account }}</span>
+        </h2>
+        <div class="muted">
+          下单闸
+          <span :class="liveControl.orders_armed ? 'bad' : 'ok'">{{
+            liveControl.orders_armed ? "已布防 · 放行真钱买入" : "已撤防 · 观察模式"
+          }}</span>
+        </div>
+      </div>
+
+      <!-- Bridge health (read-only): mirrors the broker→bridge→券商 chain. -->
+      <div class="live-gate-row">
+        <span class="gate-label">券商桥接</span>
+        <span v-if="liveControl.bridge" class="muted">
+          {{ liveControl.bridge.mode || "—" }}
+          · 交易
+          <span :class="liveControl.bridge.trader_connected ? 'ok' : 'bad'">{{
+            liveControl.bridge.trader_connected ? "已连通" : "未连通"
+          }}</span>
+          · 行情
+          <span :class="liveControl.bridge.datafeed_ok ? 'ok' : 'bad'">{{
+            liveControl.bridge.datafeed_ok ? "正常" : "异常"
+          }}</span>
+          · 部署闸
+          <span :class="liveControl.bridge.orders_allowed ? 'ok' : 'bad'">{{
+            liveControl.bridge.orders_allowed ? "已放行" : "已锁定"
+          }}</span>
+        </span>
+        <span v-else class="bad">桥接不可达（券商网关未运行 / 未连上）</span>
+      </div>
+
+      <div class="live-arm-row">
+        <button
+          :class="liveControl.orders_armed ? 'btn-danger' : 'btn-success'"
+          :disabled="busy || !liveControl.live_capable"
+          @click="toggleArm">
+          {{ liveControl.orders_armed ? "撤防下单（回到观察）" : "布防实盘下单" }}
+        </button>
+        <span v-if="!liveControl.live_capable" class="bad asof">
+          进程未带 <code>QUANTI_LIVE_ACK</code>：即便布防也不会真的下单，按此环境变量重启后端才可布防。
+        </span>
+      </div>
+
+      <p class="muted live-control-note">
+        此开关只拦<b>买入</b>：撤防时 Agent / 手动买入按「观察模式」拒单，
+        卖出 / 止损 / 清仓<b>始终放行</b>。真实买入还需券商侧<b>部署闸</b>
+        （bridge <code>orders_allowed</code>）与 <code>QUANTI_LIVE_ACK</code> 同时满足——
+        本开关是这几道闸里唯一能在 UI 里实时切换的一道。
+      </p>
+    </div>
+
     <!-- Live status: intraday guard + per-holding stop price -->
     <div class="card" v-if="liveStatus">
       <div class="card-header">
@@ -636,6 +694,8 @@ import {
   fetchMineStatus,
   fetchGeneratedFactors,
   setFactorEnabled,
+  fetchLiveControl,
+  setLiveOrdersArmed,
   type AgentStatus,
   type DecisionRecord,
   type GeneratedFactor,
@@ -645,6 +705,7 @@ import {
   type PendingOrderDetail,
   type Portfolio,
   type LiveStatus,
+  type LiveControl,
   type ScreenerInfo,
   type StrategyInfo,
 } from "../api/client";
@@ -783,6 +844,7 @@ function applyPreset(mode: AgentMode) {
 
 const portfolio = ref<Portfolio | null>(null);
 const liveStatus = ref<LiveStatus | null>(null);
+const liveControl = ref<LiveControl | null>(null);
 function stopDistance(p: { current_price: number; stop_price: number }): number {
   if (!p.current_price) return 0;
   return (p.current_price - p.stop_price) / p.current_price;  // headroom to stop
@@ -1097,7 +1159,7 @@ function kindClass(kind: string) {
 // Does NOT touch goalDraft/advParams, so the background timer never overwrites
 // the parameters the user is editing.
 async function loadStatus() {
-  const [p, a, d, str, scr, pend, ord, live] = await Promise.all([
+  const [p, a, d, str, scr, pend, ord, live, lc] = await Promise.all([
     fetchPortfolio(),
     fetchAgentStatus(),
     fetchAgentDecisions(50),
@@ -1106,6 +1168,7 @@ async function loadStatus() {
     fetchPendingOrders(),
     fetchOrders(200),
     fetchLiveStatus().catch(() => null),
+    fetchLiveControl().catch(() => null),
   ]);
   portfolio.value = p.data;
   agent.value = a.data;
@@ -1115,6 +1178,7 @@ async function loadStatus() {
   pendingOrders.value = pend.data;
   orders.value = ord.data;
   liveStatus.value = live?.data ?? null;
+  liveControl.value = lc?.data ?? null;
 }
 
 // Loads the editable goal form FROM the server. Call only on mount and right
@@ -1201,6 +1265,28 @@ async function reset() {
     await resetPortfolio(cash);
     await loadStatus();
     setMessage("组合已重置");
+  } finally {
+    busy.value = false;
+  }
+}
+
+// 实盘下单 arm/disarm switch (阶段 C 观察 ↔ 阶段 D 下单). Arming is real money —
+// confirm first; disarming is always allowed (never blocks exits).
+async function toggleArm() {
+  const lc = liveControl.value;
+  if (!lc) return;
+  const next = !lc.orders_armed;
+  if (next && !confirm(
+    "确认【布防实盘下单】？之后 Agent / 手动买入会向券商提交真钱订单。\n" +
+    "（卖出 / 止损 / 清仓不受此开关影响，始终放行。）")) return;
+  busy.value = true;
+  try {
+    const r = await setLiveOrdersArmed(next);
+    liveControl.value = { ...lc, orders_armed: r.data.orders_armed };
+    setMessage(r.data.orders_armed
+      ? "已布防：放行真钱买入" : "已撤防：观察模式，拒绝买入", !r.data.orders_armed);
+  } catch (e: any) {
+    setMessage("切换失败: " + (e?.message ?? e), true);
   } finally {
     busy.value = false;
   }
@@ -1604,6 +1690,54 @@ onUnmounted(() => {
   background: rgba(245, 158, 11, 0.06);
   border-left: 3px solid rgba(245, 158, 11, 0.5);
   padding-left: 10px;
+}
+
+/* Live control card: the real-money arm/disarm surface. Red-tinted frame so
+   it reads as "danger zone" and never blends into the ordinary cards. */
+.card.live-control {
+  border: 1px solid rgba(192, 57, 43, 0.28);
+  background: rgba(192, 57, 43, 0.03);
+}
+.live-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 9px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 9px;
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.10);
+  vertical-align: middle;
+}
+.live-gate-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 0.5px solid rgba(0, 0, 0, 0.06);
+  font-size: 13px;
+}
+.gate-label {
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  min-width: 64px;
+}
+.live-arm-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 12px 0 6px;
+}
+.live-control-note {
+  margin: 6px 0 0;
+  line-height: 1.6;
+}
+.live-control-note code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
 }
 
 /* Mode picker pills: three radio-like clickable cards. */

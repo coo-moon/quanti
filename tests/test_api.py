@@ -73,12 +73,40 @@ class TestMetaEndpoint:
     async def test_meta_reflects_live_account(self, db, monkeypatch):
         monkeypatch.setenv("QUANTI_ACCOUNT", "live")
         monkeypatch.setenv("QUANTI_LIVE_ACK", "I_KNOW_REAL_MONEY")  # H3: real-money ack
+        monkeypatch.setenv("QUANTI_ALLOW_NON_CN_TZ", "1")           # tz-independent test
         app = create_app(db=db, provider=DataProvider(db),
                          strategies_dir="strategies")
         async with AsyncClient(transport=ASGITransport(app=app),
                                base_url="http://test") as c:
             body = (await c.get("/api/meta")).json()
         assert body == {"account": "live", "is_live": True}
+
+
+class TestLiveControlEndpoints:
+    @pytest.mark.asyncio
+    async def test_paper_status_and_arm_refused(self, client):
+        """Paper: not live-capable, disarmed, no bridge; arming is refused."""
+        s = (await client.get("/api/live/status")).json()
+        assert s["is_live"] is False and s["live_capable"] is False
+        assert s["orders_armed"] is False and s["bridge"] is None
+        r = await client.post("/api/live/orders-armed", json={"armed": True})
+        assert r.status_code == 400                     # can't arm on paper
+
+    @pytest.mark.asyncio
+    async def test_live_arm_toggle(self, db, monkeypatch):
+        monkeypatch.setenv("QUANTI_ACCOUNT", "live")
+        monkeypatch.setenv("QUANTI_LIVE_ACK", "I_KNOW_REAL_MONEY")
+        monkeypatch.setenv("QUANTI_ALLOW_NON_CN_TZ", "1")
+        app = create_app(db=db, provider=DataProvider(db),
+                         strategies_dir="strategies")
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://test") as c:
+            s = (await c.get("/api/live/status")).json()
+            assert s["is_live"] is True and s["live_capable"] is True
+            assert s["orders_armed"] is False           # disarmed by default
+            r = (await c.post("/api/live/orders-armed", json={"armed": True})).json()
+            assert r["ok"] is True and r["orders_armed"] is True
+            assert (await c.get("/api/live/status")).json()["orders_armed"] is True
 
 
 class TestStockEndpoints:

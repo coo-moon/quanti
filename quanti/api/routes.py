@@ -280,6 +280,53 @@ async def meta(request: Request):
     return {"account": account, "is_live": account == "live"}
 
 
+class OrdersArmedBody(BaseModel):
+    armed: bool
+
+
+@router.get("/live/status")
+async def live_status(request: Request):
+    """Live-control panel state: mode badge (read-only), whether this process is
+    live-capable (started with the QUANTI_LIVE_ACK ack), the runtime order
+    arm/disarm switch, and the bridge's own gate/health (read-only)."""
+    import os
+
+    from quanti.execution.factory import LIVE_ACK_ENV, LIVE_ACK_TOKEN
+    db = request.app.state.db
+    account = getattr(request.app.state, "account", "paper")
+    is_live = account == "live"
+    broker = getattr(request.app.state, "broker", None)
+    bridge = None
+    if is_live and hasattr(broker, "bridge_health"):
+        bridge = broker.bridge_health() or None
+    return {
+        "account": account,
+        "is_live": is_live,
+        # Deliberate deployment ack (env); without it the UI must not let you arm.
+        "live_capable": os.environ.get(LIVE_ACK_ENV, "") == LIVE_ACK_TOKEN,
+        "orders_armed": db.get_live_orders_armed(),
+        "bridge": bridge,  # {mode, trader_connected, datafeed_ok, orders_allowed} | null
+    }
+
+
+@router.post("/live/orders-armed")
+async def set_live_orders_armed_endpoint(body: OrdersArmedBody, request: Request):
+    """Arm/disarm live BUYs at runtime (the UI switch). Only meaningful on a live
+    account; disarming is always allowed (it never blocks exits). Real BUYs also
+    require the bridge's own QMT_BRIDGE_ALLOW_ORDERS gate."""
+    account = getattr(request.app.state, "account", "paper")
+    if account != "live":
+        raise HTTPException(status_code=400,
+                            detail="仅实盘账户可切换下单开关(当前为模拟盘)")
+    db = request.app.state.db
+    db.set_live_orders_armed(body.armed)
+    db.log_decision(
+        "live_orders_armed" if body.armed else "live_orders_disarmed",
+        f"实盘下单开关:{'布防——放行真钱买入' if body.armed else '撤防——观察模式,拒绝买入'}",
+        details={"armed": body.armed})
+    return {"ok": True, "orders_armed": db.get_live_orders_armed()}
+
+
 @router.get("/sync/background/status")
 async def background_sync_status(request: Request):
     """Read the live status of the BackgroundQuoteSyncer daemon.

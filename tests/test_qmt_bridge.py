@@ -233,3 +233,20 @@ def test_mock_no_coid_not_deduped():
     gw.submit_order(dict(body))
     gw.submit_order(dict(body))
     assert len(gw._mock_orders) == 2
+
+
+def test_health_exposes_orders_allowed():
+    """/health surfaces the bridge-level order gate for the UI panel."""
+    gw = QmtGateway()  # mock → always allowed
+    assert route(gw, "GET", "/health", {}, None)[1]["orders_allowed"] is True
+
+    class _Gated:
+        connected = True
+        mode = "xt"
+        _allow_orders = False
+
+        def data_fresh(self, max_age: float = 30.0) -> bool:
+            return True
+
+    h = route(QmtGateway(backend=_Gated()), "GET", "/health", {}, None)[1]
+    assert h["orders_allowed"] is False and h["mode"] == "xt"

@@ -89,3 +89,13 @@ def test_paper_agent_takes_no_singleton(db):
     rt2._acquire_live_singleton()                       # no exclusion for paper
     assert rt1._singleton_owner is None
     assert rt2._singleton_owner is None
+
+
+# ---- live-order arm/disarm flag (DB round-trip) ----------------------------
+
+def test_live_orders_armed_default_and_toggle(db):
+    assert db.get_live_orders_armed() is False   # disarmed by default (observation)
+    db.set_live_orders_armed(True)
+    assert db.get_live_orders_armed() is True
+    db.set_live_orders_armed(False)
+    assert db.get_live_orders_armed() is False
