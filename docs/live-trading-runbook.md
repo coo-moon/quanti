@@ -162,7 +162,7 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 |---|---|---|---|
 | HIGH | 服务器时区断言 | ✅ 已修 | make_broker(live) 启动断言主机 UTC+8，否则拒建（`QUANTI_ALLOW_NON_CN_TZ=1` 可跳过）|
 | HIGH | 观察期敞口硬闸 — 单笔 + 总敞口 | ✅ 已修 | `QUANTI_MAX_ORDER_NOTIONAL`（单笔名义额）+ `QUANTI_MAX_LIVE_EXPOSURE`（总持仓市值上限）；均 0=关、仅拦 BUY、永不拦 exit |
-| HIGH | 订单幂等（client-order-id + 去重）+ mirror-before-POST | ✅ 已修 | 每单带 client-order-id，bridge 按它去重（写进券商 order remark，跨重启仍认）+ 先写镜像再 POST + POST 异常标 submitting（不盲目重发、不被误撤）。**全量启动对账**（把 submitting/孤儿单主动拉平）仍待做 |
+| HIGH | 订单幂等（client-order-id + 去重）+ mirror-before-POST + 对账 | ✅ 已修 | 每单带 client-order-id，bridge 按它去重（写进券商 order remark，跨重启仍认）+ 先写镜像再 POST + POST 异常标 submitting（不盲目重发、不被误撤）+ 每 tick 对账把 submitting 行按券商 remark 拉平（正向匹配、无匹配则保留不误撤） |
 | MEDIUM | F3：pending 排队成交持久化 strength | ✅ 已修 | orders 表加 strength 列，入队持久化、成交按原始 conviction 定仓（不再硬编码 1.0）|
 | MEDIUM | G2：日内下单计数重启回种（从 /trader/trades） | ✅ 已修 | 实盘 QmtBroker 启动时从 /trader/trades 回种当日买入计数，重启不再清零 |
 | MEDIUM | 跨进程下单锁 | ✅ 已修 | 实盘 agent 启动取 DB 心跳单例锁；已有实盘进程在跑则第二个拒启（心跳失效自动可被接管） |

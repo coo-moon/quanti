@@ -464,6 +464,9 @@ class XtDirectBackend:
                 "filled_volume": int(getattr(o, "traded_volume", 0)),
                 "filled_price": float(getattr(o, "traded_price", 0.0)),
                 "created_at": _fmt_ts(getattr(o, "order_time", 0)),
+                # The client_order_id we stamped into the remark at submit — lets
+                # QmtBroker reconcile 'submitting' rows back to their venue order.
+                "client_order_id": str(getattr(o, "order_remark", "")),
             })
         self._touch()
         return {"orders": out}
