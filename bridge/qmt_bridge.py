@@ -173,6 +173,11 @@ class QmtGateway:
             "trader_connected": connected,
             "datafeed_ok": datafeed_ok,
             "mode": "mock" if self.mock else getattr(self._backend, "mode", "vnpy"),
+            # Deployment-level order gate (QMT_BRIDGE_ALLOW_ORDERS on this bridge
+            # process). The UI shows it read-only next to its own arm switch: a
+            # real BUY needs both this AND the UI arm on. Mock always allows.
+            "orders_allowed": True if self.mock else bool(
+                getattr(self._backend, "_allow_orders", True)),
             "version": BRIDGE_VERSION,
         }
 

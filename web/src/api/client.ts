@@ -451,6 +451,24 @@ export const fetchRiskControl = () =>
 export const saveRiskControl = (cfg: RiskControl) =>
   api.post<RiskControl & { ok: boolean }>("/config/risk-control", cfg);
 
+// --- Live-order arm/disarm control (UI switch for 阶段 C→D) ---
+export interface BridgeHealth {
+  mode?: string;
+  trader_connected?: boolean;
+  datafeed_ok?: boolean;
+  orders_allowed?: boolean;
+}
+export interface LiveControl {
+  account: string;
+  is_live: boolean;
+  live_capable: boolean; // process started with QUANTI_LIVE_ACK
+  orders_armed: boolean; // runtime arm switch (this endpoint toggles it)
+  bridge: BridgeHealth | null;
+}
+export const fetchLiveControl = () => api.get<LiveControl>("/live/status");
+export const setLiveOrdersArmed = (armed: boolean) =>
+  api.post<{ ok: boolean; orders_armed: boolean }>("/live/orders-armed", { armed });
+
 // --- Hyperopt / tuned params ---
 export interface OptimizeResultItem {
   strategy_name: string;

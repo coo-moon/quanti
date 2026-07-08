@@ -493,6 +493,16 @@ class Database:
                 heartbeat_at TEXT NOT NULL
             );
 
+            -- Runtime live-order arm/disarm switch (UI-toggled). DISARMED by
+            -- default = observation: the live QmtBroker rejects new BUYs (never
+            -- blocks exits). Real BUYs require this armed AND the bridge's own
+            -- QMT_BRIDGE_ALLOW_ORDERS gate. Single row id=1.
+            CREATE TABLE IF NOT EXISTS live_control (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                orders_armed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT
+            );
+
             -- Agent / goal -----------------------------------------------
 
             CREATE TABLE IF NOT EXISTS app_config (
@@ -1675,6 +1685,24 @@ class Database:
         """Release the singleton iff we hold it (no-op otherwise)."""
         self.conn.execute(
             "DELETE FROM live_singleton WHERE id = 1 AND owner = ?", (owner,))
+        self.conn.commit()
+
+    # ---- live-order arm/disarm (UI-toggled runtime gate) ------------------
+    def get_live_orders_armed(self) -> bool:
+        """Whether live BUYs are currently armed. DISARMED (False) by default —
+        observation mode. The live QmtBroker reads this before every BUY."""
+        row = self.conn.execute(
+            "SELECT orders_armed FROM live_control WHERE id = 1").fetchone()
+        return bool(row[0]) if row else False
+
+    def set_live_orders_armed(self, armed: bool) -> None:
+        """Arm/disarm live BUYs (UI switch). Persisted so it survives restarts."""
+        from datetime import datetime
+        self.conn.execute(
+            "INSERT INTO live_control (id, orders_armed, updated_at) "
+            "VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "orders_armed = excluded.orders_armed, updated_at = excluded.updated_at",
+            (1 if armed else 0, datetime.now().isoformat()))
         self.conn.commit()
 
     def save_portfolio_snapshot(self, snapshot_date: date, cash: float,
