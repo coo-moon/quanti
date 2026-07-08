@@ -105,7 +105,9 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 
 ### 阶段 E：小额跑 Agent
 1. 先只放**约 5 万**资金到该账户。
-2. **建议开观察期单笔名义额硬闸**：quanti 侧设 `QUANTI_MAX_ORDER_NOTIONAL`（元）——任何单笔买入超过它即被拒并告警（`order_notional_capped`），防配置失误一天铺满仓。例如观察期设 `QUANTI_MAX_ORDER_NOTIONAL=10000`（仅拦买入，永不拦止损/清仓）。信任后调大或去掉。
+2. **建议开观察期敞口硬闸**（quanti 侧，均只拦买入、永不拦止损/清仓，信任后调大或去掉）：
+   - `QUANTI_MAX_ORDER_NOTIONAL`（元）：单笔买入名义额超限即拒 + 告警 `order_notional_capped`，防一笔铺满仓。例如 `=10000`。
+   - `QUANTI_MAX_LIVE_EXPOSURE`（元）：现持仓市值 + 本单超此上限即拒 + 告警 `order_exposure_capped`，封顶整个账户敞口。例如观察期 `=50000`。
 3. Web 上 `agent_start`，观察**一整周**：每天看 `/api/agent/decisions`、当前持仓、快照净值；确认止损/风控/换仓在真钱上按预期动作。
 
 ### 阶段 F：逐步加码
@@ -159,7 +161,7 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 | 优先级 | 项 | 现状 | 风险 |
 |---|---|---|---|
 | HIGH | 服务器时区断言 | ✅ 已修 | make_broker(live) 启动断言主机 UTC+8，否则拒建（`QUANTI_ALLOW_NON_CN_TZ=1` 可跳过）|
-| HIGH | 观察期敞口硬闸 — 单笔名义额上限 | ✅ 已修 | `QUANTI_MAX_ORDER_NOTIONAL`（元，0=关）；仅拦 BUY，永不拦 exit。**总敞口上限**仍待做 |
+| HIGH | 观察期敞口硬闸 — 单笔 + 总敞口 | ✅ 已修 | `QUANTI_MAX_ORDER_NOTIONAL`（单笔名义额）+ `QUANTI_MAX_LIVE_EXPOSURE`（总持仓市值上限）；均 0=关、仅拦 BUY、永不拦 exit |
 | HIGH | 订单幂等（client-order-id + 去重）+ mirror-before-POST | ✅ 已修 | 每单带 client-order-id，bridge 按它去重（写进券商 order remark，跨重启仍认）+ 先写镜像再 POST + POST 异常标 submitting（不盲目重发、不被误撤）。**全量启动对账**（把 submitting/孤儿单主动拉平）仍待做 |
 | MEDIUM | F3：pending 排队成交持久化 strength | ✅ 已修 | orders 表加 strength 列，入队持久化、成交按原始 conviction 定仓（不再硬编码 1.0）|
 | MEDIUM | G2：日内下单计数重启回种（从 /trader/trades） | ✅ 已修 | 实盘 QmtBroker 启动时从 /trader/trades 回种当日买入计数，重启不再清零 |

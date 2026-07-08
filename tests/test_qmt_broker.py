@@ -783,6 +783,27 @@ def test_no_cap_by_default(env):
     assert len(rec.orders) == 1
 
 
+def test_max_live_exposure_rejects_buy(env):
+    """Total-exposure cap: a BUY that would push held market value past the cap
+    is rejected before the venue, with an order_exposure_capped alert."""
+    db, provider = env
+    rec = RecordingBridge()
+    broker = _make(db, provider, client=rec, max_live_exposure=1000.0)
+    assert broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s") is False
+    assert rec.orders == []
+    assert any(d["kind"] == "order_exposure_capped"
+               for d in db.list_decisions(limit=10))
+
+
+def test_max_live_exposure_allows_within_cap(env):
+    """A generous total-exposure cap lets the BUY through (control)."""
+    db, provider = env
+    rec = RecordingBridge()
+    broker = _make(db, provider, client=rec, max_live_exposure=1e9)
+    assert broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s") is True
+    assert len(rec.orders) == 1
+
+
 # --- G2: seed daily open-count from the venue at live startup ----------------
 
 def test_seeds_daily_open_count_from_venue(env):
