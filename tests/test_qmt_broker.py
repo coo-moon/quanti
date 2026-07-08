@@ -713,3 +713,35 @@ def test_extreme_gap_up_abandoned_at_open(env):
     assert "gap-up" in o["reason"].lower()
     assert any(d["kind"] == "order_gap_abandoned"
                for d in db.list_decisions(limit=10))
+
+
+# --- is_connected accepts either live backend, rejects mock -----------------
+
+class _ModeBridge:
+    """Minimal bridge client whose /health reports a chosen backend mode."""
+
+    def __init__(self, mode: str) -> None:
+        self._mode = mode
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        if path == "/health":
+            return {"ok": True, "mode": self._mode,
+                    "trader_connected": True, "datafeed_ok": True}
+        return {}
+
+    def post(self, path: str, json: dict | None = None) -> dict:
+        return {"ok": True}
+
+
+def test_is_connected_accepts_xt_and_vnpy_rejects_mock(env):
+    """require_live gate must accept both real backends — 'xt' (direct xtquant)
+    and 'vnpy' (vnpy_xt) — while a silent 'mock' fallback still reads as down."""
+    db, provider = env
+
+    def broker(mode):
+        return QmtBroker(db, provider, client=_ModeBridge(mode),
+                         require_live=True, session_fn=lambda: True)
+
+    assert broker("xt").is_connected() is True
+    assert broker("vnpy").is_connected() is True
+    assert broker("mock").is_connected() is False

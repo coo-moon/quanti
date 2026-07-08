@@ -54,23 +54,72 @@ try:  # pragma: no cover - depends on the QMT environment
 except Exception:  # noqa: BLE001 - any import failure means "not on QMT box"
     XTQUANT_AVAILABLE = False
 
-# Live backend = vnpy's QMT gateway (Option B). Importing VnpyBackend never
-# fails — it guards its own vnpy import — so this works in mock mode too.
+# Two live backends, both importable off-box (they guard their own venue
+# imports and expose ``available()``):
+#   * XtDirectBackend — drives xtquant (xttrader+xtdata) directly on the QMT
+#     client's own python. Preferred: no vnpy_xt path/offset/version mismatch.
+#   * VnpyBackend — vnpy's QMT gateway (fallback / Option B).
 try:
     from bridge.vnpy_backend import VnpyBackend
 except ImportError:  # when run as a script from inside bridge/
     from vnpy_backend import VnpyBackend
+try:
+    from bridge.xt_direct_backend import XtDirectBackend
+except ImportError:  # when run as a script from inside bridge/
+    from xt_direct_backend import XtDirectBackend
 
 
 def _connect_setting_from_env() -> dict:  # pragma: no cover - QMT box only
-    """vnpy gateway connect dict, built from env vars. VERIFY the exact keys
-    against the installed vnpy_xt gateway's `default_setting`."""
+    """vnpy_xt gateway connect dict (FALLBACK path — the direct-xtquant backend
+    is preferred). Keys match vnpy_xt ``XtGateway.default_setting``.
+
+    NOTE: vnpy_xt appends ``\\userdata`` to ``QMT路径`` and expects the QMT
+    *install root*, while miniQMT trading lives under ``userdata_mini`` — so this
+    fallback is UNVERIFIED against miniQMT. ``仿真交易='否'`` leaves the trade API
+    disconnected (data-only, safe) until its semantics are confirmed on the box;
+    prefer ``QMT_BRIDGE_BACKEND=direct``."""
     import os
     return {
-        "账号": os.environ.get("QMT_ACCOUNT", ""),
-        "miniQMT路径": os.environ.get("QMT_USERDATA_MINI", ""),
-        "session_id": os.environ.get("QMT_SESSION_ID", "0"),
+        "token": os.environ.get("QMT_XTDATA_TOKEN", ""),
+        "股票市场": "是", "期货市场": "否", "期权市场": "否",
+        "仿真交易": "否",
+        "账号类型": "股票",
+        "QMT路径": os.environ.get("QMT_ROOT", ""),
+        "资金账号": os.environ.get("QMT_ACCOUNT", ""),
     }
+
+
+def _make_live_backend():  # pragma: no cover - QMT box only
+    """Pick the live backend. Prefer direct-xtquant (native to the QMT client's
+    own python; no vnpy_xt path/offset/version mismatch). Fall back to the vnpy
+    backend only if forced or if it's the only one importable. None → mock.
+
+    Env: ``QMT_BRIDGE_BACKEND`` = ""|"direct"|"vnpy"; direct needs
+    ``QMT_ACCOUNT`` + ``QMT_USERDATA_MINI`` (+ optional ``QMT_ACCOUNT_TYPE``)."""
+    import os
+    force = os.environ.get("QMT_BRIDGE_BACKEND", "").strip().lower()
+    if force != "vnpy" and XtDirectBackend.available():
+        acct = os.environ.get("QMT_ACCOUNT", "").strip()
+        path = os.environ.get("QMT_USERDATA_MINI", "").strip()
+        if acct and path:
+            b = XtDirectBackend(
+                acct, path,
+                account_type=os.environ.get("QMT_ACCOUNT_TYPE", "STOCK").strip() or "STOCK")
+            b.start()
+            return b
+        # Direct is the selected/preferred backend but isn't configured. Do NOT
+        # silently fall through to vnpy — vnpy lacks the QMT_BRIDGE_ALLOW_ORDERS
+        # observation gate and is unverified on miniQMT. Fail safe to mock (None)
+        # so require_live reads NOT connected; the operator must set the env vars
+        # or opt into vnpy explicitly with QMT_BRIDGE_BACKEND=vnpy.
+        logger.warning("xtquant present but QMT_ACCOUNT/QMT_USERDATA_MINI unset "
+                       "→ refusing silent vnpy fallback; running MOCK (not live)")
+        return None
+    if force != "direct" and VnpyBackend.available():
+        b = VnpyBackend(_connect_setting_from_env())
+        b.start()
+        return b
+    return None
 
 
 def _today() -> date:
@@ -89,9 +138,8 @@ class QmtGateway:
         # Live backend = vnpy QMT gateway when available (or an injected fake in
         # tests). Absent → mock mode. The mock state below is always set so the
         # synthetic engine is usable for dev/tests regardless of mode.
-        if backend is None and VnpyBackend.available():  # pragma: no cover - QMT box
-            backend = VnpyBackend(_connect_setting_from_env())
-            backend.start()
+        if backend is None:  # pragma: no cover - QMT box
+            backend = _make_live_backend()
         self._backend = backend
         self.mock = backend is None
         # --- mock state (only used in mock mode) ---
@@ -123,7 +171,7 @@ class QmtGateway:
             "vnpy": VnpyBackend.available(),
             "trader_connected": connected,
             "datafeed_ok": datafeed_ok,
-            "mode": "mock" if self.mock else "vnpy",
+            "mode": "mock" if self.mock else getattr(self._backend, "mode", "vnpy"),
             "version": BRIDGE_VERSION,
         }
 
@@ -399,7 +447,7 @@ def _make_handler(gw: QmtGateway):
 def serve(host: str = "127.0.0.1", port: int = 18099) -> None:
     gw = QmtGateway()
     httpd = ThreadingHTTPServer((host, port), _make_handler(gw))
-    mode = "MOCK (xtquant not found)" if gw.mock else "LIVE (xtquant)"
+    mode = "MOCK (xtquant not found)" if gw.mock else ("LIVE (%s)" % gw.health().get("mode"))
     logger.info("qmt-bridge v%s listening on http://%s:%d  [%s]",
                 BRIDGE_VERSION, host, port, mode)
     try:

@@ -122,13 +122,16 @@ class QmtBroker:
         if not h.get("ok"):
             return False
         if self._require_live:
-            # Real money: require real vnpy mode + a connected trader AND a fresh
-            # datafeed. `trader_connected` alone was a sticky bool that never
-            # flipped false on a mid-session disconnect, so the guard would keep
-            # firing orders into a dead gateway; the bridge now reports
-            # datafeed_ok from recent gateway events (H2). A bridge that predates
-            # this field omits it → default True so we don't regress older bridges.
-            return (h.get("mode") == "vnpy"
+            # Real money: require a real (non-mock) backend + a connected trader
+            # AND a fresh datafeed. Accept either live backend — "vnpy" (vnpy_xt
+            # gateway) or "xt" (direct xtquant); only "mock" must read as down, so
+            # a silent mock fallback never gets mirrored as real fills (G1).
+            # `trader_connected` alone was a sticky bool that never flipped false
+            # on a mid-session disconnect, so the guard would keep firing orders
+            # into a dead gateway; the bridge now reports datafeed_ok from recent
+            # events (H2). A bridge predating this field omits it → default True so
+            # we don't regress older bridges.
+            return (h.get("mode") in ("vnpy", "xt")
                     and bool(h.get("trader_connected"))
                     and h.get("datafeed_ok", True) is not False)
         return True
