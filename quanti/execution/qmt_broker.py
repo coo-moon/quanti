@@ -86,6 +86,7 @@ class QmtBroker:
         require_live: bool = False,
         pending_ttl_trading_days: int = 3,
         session_fn: "Callable[[], bool] | None" = None,
+        max_order_notional: float | None = None,
     ) -> None:
         self._db = db
         self._provider = provider
@@ -95,6 +96,15 @@ class QmtBroker:
         # connected and orders must not submit (audit G1). Default False keeps
         # dev/mock/tests working.
         self._require_live = require_live
+        # Observation-period blast-radius cap: reject a single BUY whose notional
+        # (volume×price) exceeds this many 元. A config slip (wrong strength, an
+        # account already holding 50万) otherwise铺满仓 on day one with no code
+        # ceiling. 0 / unset = disabled. Never caps SELLs — an exit must always
+        # get out. Env QUANTI_MAX_ORDER_NOTIONAL; explicit arg wins (tests).
+        import os
+        self._max_order_notional = (
+            float(max_order_notional) if max_order_notional is not None
+            else float(os.environ.get("QUANTI_MAX_ORDER_NOTIONAL", "0") or 0))
         self._risk = RiskManager(risk_config)
         from quanti.risk.protections import ProtectionConfig, ProtectionManager
         self._protections = ProtectionManager(
@@ -372,6 +382,19 @@ class QmtBroker:
                 r = "cash/position cap too tight"
                 self._mirror_order(signal, strategy_name, status="rejected",
                                    reason=r, reuse_order_id=queued_order_id)
+                return False, "rejected", r
+            # Observation-period blast-radius cap (BUY only — never block an exit).
+            if self._max_order_notional > 0 and volume * price > self._max_order_notional:
+                r = ("观察期单笔名义额上限 %.0f 元,本单 %.0f 元 → 拒单"
+                     % (self._max_order_notional, volume * price))
+                self._mirror_order(signal, strategy_name, status="rejected",
+                                   reason=r, reuse_order_id=queued_order_id)
+                self._db.log_decision(
+                    "order_notional_capped",
+                    "拒单(实盘) 买入 %s: %s" % (signal.stock_code, r),
+                    code=signal.stock_code,
+                    details={"venue": "qmt", "notional": round(volume * price, 2),
+                             "cap": self._max_order_notional})
                 return False, "rejected", r
         else:  # SELL — only the T+1-sellable portion can leave today
             pos = portfolio.positions.get(signal.stock_code)

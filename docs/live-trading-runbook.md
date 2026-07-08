@@ -105,7 +105,8 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 
 ### 阶段 E：小额跑 Agent
 1. 先只放**约 5 万**资金到该账户。
-2. Web 上 `agent_start`，观察**一整周**：每天看 `/api/agent/decisions`、当前持仓、快照净值；确认止损/风控/换仓在真钱上按预期动作。
+2. **建议开观察期单笔名义额硬闸**：quanti 侧设 `QUANTI_MAX_ORDER_NOTIONAL`（元）——任何单笔买入超过它即被拒并告警（`order_notional_capped`），防配置失误一天铺满仓。例如观察期设 `QUANTI_MAX_ORDER_NOTIONAL=10000`（仅拦买入，永不拦止损/清仓）。信任后调大或去掉。
+3. Web 上 `agent_start`，观察**一整周**：每天看 `/api/agent/decisions`、当前持仓、快照净值；确认止损/风控/换仓在真钱上按预期动作。
 
 ### 阶段 F：逐步加码
 - 观察满意后，再把目标资金加上去；每加一档观察一周。
@@ -140,8 +141,9 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 | `datafeed_ok=false`（持续） | 交易端掉线 / 行情断流 | 查 QMT 客户端；quanti 此时会自动拒单 |
 | 下单返回 `bridge orders disabled` | 下单闸没开 | 观察期正常；确认要下单再设 `QMT_BRIDGE_ALLOW_ORDERS=1` |
 | quanti `is_connected()` False | `/health` 任一门不满足，或缺 `QUANTI_LIVE_ACK` | 逐项对照阶段 B/C |
-| `RuntimeError: 拒绝构建实盘 broker` | 设了 `QUANTI_ACCOUNT=live` 但没 `QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY` | 补上二次确认 env |
-| 云主机上盘中不交易/止损不动 | 机器时区不是北京时间（naive now 被当北京时） | **务必把机器时区设为 Asia/Shanghai**（见第 7 节，代码断言待加） |
+| `RuntimeError: 拒绝构建实盘 broker...二次确认` | 设了 `QUANTI_ACCOUNT=live` 但没 `QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY` | 补上二次确认 env |
+| `RuntimeError: ...主机时区必须为北京时间` | 机器不是北京时间（云机常见 UTC）| **把机器时区设为 Asia/Shanghai** 后重启（已有启动断言拦截，见 7.2；确已用他法让 now() 返回北京时可 `QUANTI_ALLOW_NON_CN_TZ=1` 跳过）|
+| 买单被拒 `观察期单笔名义额上限...` | 触发了 `QUANTI_MAX_ORDER_NOTIONAL` 单笔硬闸 | 观察期安全网正常；确认无误后调大或去掉该 env |
 
 ---
 
@@ -156,9 +158,9 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 
 | 优先级 | 项 | 现状 | 风险 |
 |---|---|---|---|
-| HIGH | 服务器时区断言 | 待修 | 云/VM 默认 UTC → 北京交易时段判空 → 盘中止损/守护整段空转 |
+| HIGH | 服务器时区断言 | ✅ 已修 | make_broker(live) 启动断言主机 UTC+8，否则拒建（`QUANTI_ALLOW_NON_CN_TZ=1` 可跳过）|
+| HIGH | 观察期敞口硬闸 — 单笔名义额上限 | ✅ 已修 | `QUANTI_MAX_ORDER_NOTIONAL`（元，0=关）；仅拦 BUY，永不拦 exit。**总敞口上限**仍待做 |
 | HIGH | 订单幂等（client-order-id）+ 断线重发保护 + 启动对账 | 待修 | 网络抖动/崩溃可致真钱重复下单或孤儿单 |
-| HIGH | 观察期敞口硬闸（单笔名义额 / 总敞口上限） | 待修 | 配置失误可能第一天就满仓铺开，无代码级封顶 |
 | MEDIUM | F3：pending 排队成交持久化 strength | 待修 | 弱信号被按满仓建仓，实盘规模 ≠ 回测 |
 | MEDIUM | G2：日内下单计数重启回种（从 /trader/trades） | 待修 | 当日重启可绕过 `max_daily_trades` 上限 |
 | MEDIUM | 跨进程下单锁 | 待修 | 同时跑多个进程会对同一账户并发下单 |
