@@ -217,9 +217,9 @@ class QmtGateway:
             coid = str(body.get("client_order_id", "")).strip()
             if coid and coid in self._mock_coids:
                 return self._mock_coids[coid]
-            res = (self._mock_fill(code, direction, volume, price)
+            res = (self._mock_fill(code, direction, volume, price, coid)
                    if self._mock_autofill
-                   else self._mock_accept(code, direction, volume, price))
+                   else self._mock_accept(code, direction, volume, price, coid))
             if coid:
                 self._mock_coids[coid] = res
             return res
@@ -270,7 +270,7 @@ class QmtGateway:
 
     # ------------------------------------------------- mock fill engine
     def _mock_fill(self, code: str, direction: str, volume: int,
-                   price: float) -> dict:
+                   price: float, coid: str = "") -> dict:
         """Mock venue: fill the whole order immediately at the given (or a
         synthetic) price, and reflect it in mock positions / cash / trades."""
         self._seq += 1
@@ -304,7 +304,7 @@ class QmtGateway:
             "order_id": order_id, "code": code, "direction": direction,
             "volume": volume, "price": fill_price, "status": "filled",
             "filled_volume": volume, "filled_price": fill_price,
-            "created_at": now})
+            "created_at": now, "client_order_id": coid})
         self._mock_trades.append({
             "trade_id": f"t-{self._seq}", "order_id": order_id, "code": code,
             "direction": direction, "volume": volume, "price": fill_price,
@@ -313,7 +313,7 @@ class QmtGateway:
                 "filled_volume": volume, "filled_price": fill_price, "msg": ""}
 
     def _mock_accept(self, code: str, direction: str, volume: int,
-                     price: float) -> dict:
+                     price: float, coid: str = "") -> dict:
         """Record an order that rests open (status 'accepted') without filling
         — used when auto-fill is off, so the cancel / pending-reconcile paths
         can be exercised. No cash/position change until/unless it later fills."""
@@ -323,7 +323,7 @@ class QmtGateway:
             "order_id": order_id, "code": code, "direction": direction,
             "volume": volume, "price": price, "status": "accepted",
             "filled_volume": 0, "filled_price": 0.0,
-            "created_at": datetime.now().isoformat()})
+            "created_at": datetime.now().isoformat(), "client_order_id": coid})
         return {"ok": True, "order_id": order_id, "status": "accepted",
                 "filled_volume": 0, "filled_price": price, "msg": ""}
 

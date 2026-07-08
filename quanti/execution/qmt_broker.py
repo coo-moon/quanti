@@ -653,6 +653,48 @@ class QmtBroker:
                 out.rejected += 1
             else:
                 out.still_pending += 1
+        # Reconcile 'submitting' rows — orders whose venue POST result was unknown
+        # (#131). Match each to the venue order carrying its client_order_id
+        # (== the local row id, stamped in the venue remark) and stamp the real
+        # outcome, so a landed order regains its full local mirror (buy_date /
+        # entry_strategy → trailing-TP + strategy-exit, not just plain stop-loss).
+        # POSITIVE MATCH ONLY: a row with no venue match is LEFT 'submitting' (we
+        # never cancel on a possibly-incomplete venue list); the coid-in-remark
+        # dedup keeps any later retry from double-submitting either way.
+        by_coid = {v.get("client_order_id"): v for v in venue.values()
+                   if v.get("client_order_id")}
+        submitting = self._db.list_orders(limit=1000, status="submitting")
+        out.scanned += len(submitting)
+        for o in submitting:
+            v = by_coid.get(o["order_id"])
+            if v is None:
+                out.still_pending += 1
+                continue
+            st = v.get("status")
+            qty = int(v.get("volume", o.get("quantity", 0)) or 0)
+            if st == "filled":
+                self._db.update_order_submitted(
+                    o["order_id"], status="filled", quantity=qty,
+                    venue_order_id=v["order_id"],
+                    filled_price=float(v.get("filled_price", 0) or 0),
+                    filled_quantity=int(v.get("filled_volume", 0) or 0),
+                    reason="reconciled: filled at venue")
+                out.filled += 1
+            elif st in ("cancelled", "rejected"):
+                self._db.update_order_status(o["order_id"], st,
+                                             reason="reconciled from venue")
+                out.rejected += 1
+            else:  # accepted / pending / partial → stamp venue id, now trackable
+                self._db.update_order_submitted(
+                    o["order_id"], status="pending", quantity=qty,
+                    venue_order_id=v["order_id"],
+                    reason="reconciled: resting at venue")
+                out.still_pending += 1
+            self._db.log_decision(
+                "order_reconciled",
+                f"对账(实盘) {o['direction']} {o['code']}: submitting → {st}",
+                code=o["code"], details={"venue": "qmt", "order_id": o["order_id"],
+                                         "venue_order_id": v["order_id"], "status": st})
         return out
 
     def _advance_queued(self, o: dict, out: PendingFillResult) -> None:

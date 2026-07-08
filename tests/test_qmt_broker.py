@@ -883,3 +883,43 @@ def test_submit_unknown_result_no_crash_no_orphan(env):
     # so an order that may be live at the venue isn't silently abandoned locally.
     broker.try_fill_pending_orders()
     assert db.list_orders()[0]["status"] == "submitting"   # untouched
+
+
+# --- startup/tick reconcile of 'submitting' (unknown-result) rows -----------
+
+def test_reconcile_resolves_submitting_row_from_venue(env):
+    """A 'submitting' row (POST result was unknown) is resolved on the next tick
+    by matching the venue order carrying its client_order_id: the outcome +
+    venue id are stamped so a landed order regains its full local mirror."""
+    db, provider = env
+    db.insert_order({"order_id": "q_coid1", "code": "000001", "direction": "buy",
+                     "quantity": 100, "price_type": "limit", "limit_price": 10.0,
+                     "status": "submitting", "strategy_name": "s",
+                     "reason": "unknown", "entry_strategy": ""})
+
+    class ReconcileBridge(InProcBridge):
+        def get(self, path: str, params: dict | None = None) -> dict:
+            if path == "/trader/orders":
+                return {"orders": [{
+                    "order_id": "v-99", "code": "000001", "direction": "buy",
+                    "volume": 100, "price": 10.0, "status": "filled",
+                    "filled_volume": 100, "filled_price": 10.0,
+                    "created_at": "", "client_order_id": "q_coid1"}]}
+            return super().get(path, params)
+
+    _make(db, provider, client=ReconcileBridge()).try_fill_pending_orders()
+    row = next(o for o in db.list_orders() if o["order_id"] == "q_coid1")
+    assert row["status"] == "filled"
+    assert row["entry_strategy"] == "v-99"      # venue id stamped
+
+
+def test_reconcile_leaves_unmatched_submitting(env):
+    """A 'submitting' row with NO matching venue order is LEFT submitting — never
+    cancelled on a possibly-incomplete venue list (conservative / safe)."""
+    db, provider = env
+    db.insert_order({"order_id": "q_x", "code": "000001", "direction": "buy",
+                     "quantity": 100, "price_type": "limit", "status": "submitting",
+                     "entry_strategy": ""})
+    _make(db, provider, client=InProcBridge()).try_fill_pending_orders()  # venue empty
+    row = next(o for o in db.list_orders() if o["order_id"] == "q_x")
+    assert row["status"] == "submitting"        # untouched
