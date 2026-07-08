@@ -503,6 +503,20 @@ class Database:
                 updated_at TEXT
             );
 
+            -- Live P&L baseline: the account's total asset at the moment quanti
+            -- FIRST connected live, frozen as the "initial capital" the UI's
+            -- 累计收益/距目标 are measured against. The live QmtBroker reads the
+            -- real total from the broker each snapshot; without an anchored
+            -- baseline it would fall back to the --cash default (100万) and show a
+            -- nonsense -95% on a 5万 account. Single row id=1; set once on first
+            -- live connect (never auto-overwritten —入金/出金 needs an explicit
+            -- reset, not a silent re-anchor that would zero out real P&L).
+            CREATE TABLE IF NOT EXISTS live_baseline (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                baseline_capital REAL NOT NULL,
+                established_at TEXT
+            );
+
             -- Agent / goal -----------------------------------------------
 
             CREATE TABLE IF NOT EXISTS app_config (
@@ -1703,6 +1717,35 @@ class Database:
             "VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
             "orders_armed = excluded.orders_armed, updated_at = excluded.updated_at",
             (1 if armed else 0, datetime.now().isoformat()))
+        self.conn.commit()
+
+    # ---- live P&L baseline (frozen initial capital for 累计收益) -----------
+    def get_live_baseline(self) -> float | None:
+        """The anchored live initial-capital baseline, or None if not yet set.
+        The live QmtBroker measures 累计收益/距目标 against this instead of the
+        --cash default, so a 5万 account isn't shown as -95% off a phantom 100万."""
+        row = self.conn.execute(
+            "SELECT baseline_capital FROM live_baseline WHERE id = 1").fetchone()
+        return float(row[0]) if row else None
+
+    def set_live_baseline(self, capital: float, *, overwrite: bool = False) -> None:
+        """Anchor the live baseline to ``capital``. By default sets it ONCE (first
+        live connect) and never silently re-anchors — a later re-anchor would zero
+        out real P&L. ``overwrite=True`` is the explicit 入金/出金 reset path."""
+        from datetime import datetime
+        if overwrite:
+            self.conn.execute(
+                "INSERT INTO live_baseline (id, baseline_capital, established_at) "
+                "VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                "baseline_capital = excluded.baseline_capital, "
+                "established_at = excluded.established_at",
+                (float(capital), datetime.now().isoformat()))
+        else:
+            # First-writer-wins: INSERT OR IGNORE never clobbers an existing anchor.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO live_baseline "
+                "(id, baseline_capital, established_at) VALUES (1, ?, ?)",
+                (float(capital), datetime.now().isoformat()))
         self.conn.commit()
 
     def save_portfolio_snapshot(self, snapshot_date: date, cash: float,

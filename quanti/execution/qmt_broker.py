@@ -292,12 +292,24 @@ class QmtBroker:
         if session_closed_for_day(datetime.now(), self._provider):
             self._db.save_portfolio_snapshot(date.today(), cash, market_value,
                                              total)
+        # 累计收益 baseline = the account's total the FIRST time quanti connected
+        # live, frozen in DB — NOT the --cash default (100万), which would show a
+        # nonsense -95% on a real 5万 account. Anchor it here (once, and only once
+        # we actually have a real total>0 so a bridge-not-ready 0 can't poison it);
+        # thereafter every snapshot measures against the same frozen baseline.
+        baseline = self._db.get_live_baseline()
+        if baseline is None and total > 0:
+            self._db.set_live_baseline(total)  # first-writer-wins, never clobbers
+            baseline = total
+        # No baseline yet (total still 0/unreadable) → measure against `total`
+        # itself so P&L reads 0% (the div-by-0 guard below), NOT a phantom loss
+        # off the --cash default, until a real total>0 anchors the baseline.
+        init = baseline if baseline else total
         return {
-            "cash": cash, "initial_cash": self._initial_cash,
+            "cash": cash, "initial_cash": init,
             "market_value": market_value, "total_value": total,
-            "pnl": total - self._initial_cash,
-            "pnl_pct": (total - self._initial_cash) / self._initial_cash
-                       if self._initial_cash else 0.0,
+            "pnl": total - init,
+            "pnl_pct": (total - init) / init if init else 0.0,
             "positions": enriched,
             "snapshot_date": date.today().isoformat(),
         }

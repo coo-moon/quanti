@@ -99,3 +99,15 @@ def test_live_orders_armed_default_and_toggle(db):
     assert db.get_live_orders_armed() is True
     db.set_live_orders_armed(False)
     assert db.get_live_orders_armed() is False
+
+
+# ---- live P&L baseline (DB round-trip) -------------------------------------
+
+def test_live_baseline_default_and_first_writer_wins(db):
+    assert db.get_live_baseline() is None           # unset until first connect
+    db.set_live_baseline(50000.0)
+    assert db.get_live_baseline() == 50000.0
+    db.set_live_baseline(999999.0)                  # default = never re-anchor
+    assert db.get_live_baseline() == 50000.0        # first-writer-wins
+    db.set_live_baseline(70000.0, overwrite=True)   # explicit 入金 reset
+    assert db.get_live_baseline() == 70000.0
