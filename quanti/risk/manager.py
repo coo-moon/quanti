@@ -355,6 +355,15 @@ class RiskManager:
         self._daily_trade_count = 0
         self._count_day = date.today()
 
+    def seed_daily_trades(self, count: int) -> None:
+        """Seed today's open-trade count from an authoritative source (the
+        broker's own trades at session start). A live process restart mid-day
+        otherwise resets ``_daily_trade_count`` to 0, letting max_daily_trades be
+        bypassed by re-launching (audit G2). Rolls the day first so the seed
+        lands on today; never lowers an already-higher count."""
+        self._roll_day_if_needed()
+        self._daily_trade_count = max(self._daily_trade_count, int(count))
+
     def record_trade(self, direction: Direction | None = None) -> None:
         """Count a trade against the daily cap. The cap limits NEW positions
         (opens) — exits (SELL), including forced stop-loss / flatten, do NOT

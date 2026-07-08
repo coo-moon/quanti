@@ -117,6 +117,28 @@ class QmtBroker:
         # in-session ones submit now. Injectable so tests are wall-clock free.
         self._session_fn = session_fn
         self._strategy_cache: dict | None = None  # name → strategy class
+        # Live: seed today's open-count from the broker's own trades so a mid-day
+        # restart can't reset the daily cap to 0 and bypass max_daily_trades
+        # (audit G2). Best-effort; a bridge that's down at startup just seeds 0.
+        if self._require_live:
+            self._seed_daily_count()
+
+    def _seed_daily_count(self) -> None:
+        """Reseed the RiskManager's daily open-count from /trader/trades (the
+        venue is truth), counting today's BUY fills. Never raises — a startup
+        with the bridge down simply seeds nothing."""
+        try:
+            trades = (self._client.get("/trader/trades") or {}).get("trades", [])
+        except Exception as e:  # noqa: BLE001 - bridge down at startup
+            logger.warning("qmt: could not seed daily trade count: %s", e)
+            return
+        today = date.today().isoformat()
+        buys = sum(1 for t in trades
+                   if str(t.get("direction", "")).lower() == "buy"
+                   and str(t.get("time", ""))[:10] == today)
+        if buys:
+            self._risk.seed_daily_trades(buys)
+            logger.info("qmt: seeded daily open-count = %d from venue trades", buys)
 
     # ----------------------------------------------------------- health
     def is_connected(self) -> bool:
