@@ -231,6 +231,11 @@ class Database:
         adds = [
             ("positions", "entry_strategy", "TEXT DEFAULT ''"),
             ("orders", "entry_strategy", "TEXT DEFAULT ''"),
+            # Persist the signal's conviction on the order row so a pending /
+            # overnight-queued fill sizes on the ORIGINAL strength — not a
+            # hardcoded 1.0 that silently over-invested weak signals (audit F3).
+            # Legacy rows backfill to 1.0 (= prior behavior, no regression).
+            ("orders", "strength", "REAL DEFAULT 1.0"),
             ("stocks", "delist_date", "TEXT"),
             # Qlib-style price adjustment: store RAW prices + a per-(code,date)
             # back-adjustment factor. Pre-existing rows backfill to 1.0 (read as
@@ -441,7 +446,8 @@ class Database:
                 reason TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 filled_at TEXT,
-                entry_strategy TEXT DEFAULT ''
+                entry_strategy TEXT DEFAULT '',
+                strength REAL DEFAULT 1.0
             );
 
             CREATE TABLE IF NOT EXISTS trades (
@@ -1422,8 +1428,8 @@ class Database:
             """
             INSERT INTO orders (order_id, code, direction, quantity, price_type, limit_price,
                                 status, strategy_name, filled_price, filled_quantity,
-                                reason, created_at, filled_at, entry_strategy)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                reason, created_at, filled_at, entry_strategy, strength)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order["order_id"], order["code"], order["direction"],
@@ -1434,6 +1440,7 @@ class Database:
                 order.get("created_at") or datetime.now().isoformat(),
                 order.get("filled_at"),
                 order.get("entry_strategy", ""),
+                float(order.get("strength", 1.0)),
             ),
         )
         self.conn.commit()
@@ -1482,7 +1489,7 @@ class Database:
             rows = self.conn.execute(
                 "SELECT order_id, code, direction, quantity, status, filled_price, "
                 "filled_quantity, strategy_name, reason, created_at, filled_at, "
-                "entry_strategy "
+                "entry_strategy, strength "
                 "FROM orders WHERE status=? ORDER BY created_at ASC LIMIT ?",
                 (status, limit),
             ).fetchall()
@@ -1490,7 +1497,7 @@ class Database:
             rows = self.conn.execute(
                 "SELECT order_id, code, direction, quantity, status, filled_price, "
                 "filled_quantity, strategy_name, reason, created_at, filled_at, "
-                "entry_strategy "
+                "entry_strategy, strength "
                 "FROM orders ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -1501,6 +1508,7 @@ class Database:
                 "filled_quantity": r[6], "strategy_name": r[7],
                 "reason": r[8], "created_at": r[9], "filled_at": r[10],
                 "entry_strategy": r[11] or "",
+                "strength": r[12] if r[12] is not None else 1.0,
             }
             for r in rows
         ]

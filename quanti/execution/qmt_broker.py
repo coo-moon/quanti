@@ -603,7 +603,11 @@ class QmtBroker:
             return
         sig = Signal(
             stock_code=o["code"], direction=Direction(o["direction"]),
-            strength=1.0, reason=o.get("reason", "") or "queued fill",
+            # Original conviction persisted at queue time, not a hardcoded 1.0
+            # that over-invested weak signals on the default overnight-queue
+            # path (audit F3).
+            strength=float(o.get("strength", 1.0)),
+            reason=o.get("reason", "") or "queued fill",
             entry_strategy="")
         strat = o.get("strategy_name", "") or ""
         # Extreme-gap-up guard (BUY only): if the open has gapped up past the
@@ -873,5 +877,6 @@ class QmtBroker:
             "created_at": datetime.now().isoformat(),
             "filled_at": datetime.now().isoformat() if status == "filled" else None,
             "entry_strategy": venue_order_id,
+            "strength": signal.strength,
         })
         return order_id

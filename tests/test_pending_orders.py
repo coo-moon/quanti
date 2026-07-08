@@ -233,6 +233,33 @@ class TestFilling:
         # Decision log shows order_filled_pending entry
         assert len(db.list_decisions(kind="order_filled_pending")) == 1
 
+    def test_pending_fill_sizes_on_persisted_strength(self, seeded_pending):
+        """F3: a weak (strength=0.5) buy, queued then filled, must size on the
+        persisted 0.5 — not the pre-fix hardcoded 1.0 that over-invested weak
+        signals to full size on the pending path."""
+        db, provider = seeded_pending
+        # High concentration caps so STRENGTH is the binding sizing constraint —
+        # otherwise the 20% single-stock cap clips every strength to the same qty
+        # and the test can't tell 0.5 from 1.0.
+        broker = PaperBroker(db, provider, initial_cash=200_000,
+                             fill_mode="pending",
+                             risk_config=RiskConfig(max_position_pct=0.95,
+                                                    max_industry_pct=0.95))
+        broker.execute_signal(
+            Signal(stock_code="AAA", direction=Direction.BUY,
+                   strength=0.5, reason="weak"), "test")
+        # Persisted on the pending order row (not clobbered to 1.0).
+        assert db.list_orders(status="pending")[0]["strength"] == 0.5
+        _backdate_pending(db)
+        _append_new_bar(db, "AAA", days_from_today_back=0,
+                        open_price=11.0, close_price=11.1)
+        broker.try_fill_pending_orders()
+        pos = next(p for p in db.list_positions() if p["code"] == "AAA")
+        notional = pos["quantity"] * 11.011
+        # strength 0.5 → ~0.475×cash ≈ 95k. The pre-fix bug (size on 1.0) would
+        # be ~0.95×cash ≈ 190k. Bound brackets 0.5 and excludes 1.0.
+        assert 60_000 < notional < 120_000, notional
+
     def test_no_new_bar_keeps_pending(self, seeded_pending):
         """try_fill_pending with no new bar → pending stays pending."""
         db, provider = seeded_pending
