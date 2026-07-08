@@ -500,6 +500,45 @@ def test_postclose_snapshot_persisted(env, monkeypatch):
     assert rows[0]["total_value"] == pytest.approx(1_000_000)
 
 
+def test_live_pnl_anchors_baseline_to_account_total(env, monkeypatch):
+    """累计收益 must measure against the account's total at first live connect,
+    NOT the --cash default — else a real 5万 account reads as -95% off 100万."""
+    db, provider = env
+    monkeypatch.setattr("quanti.execution.qmt_broker.session_closed_for_day",
+                        lambda *a, **k: False)
+    bridge = AssetBridge(50_000)                  # real account: 5万
+    broker = _make(db, provider, client=bridge)   # _make hardcodes initial_cash=100万
+    snap = broker.snapshot_portfolio()
+    # Anchored to the real total, so P&L is 0 — not (5万-100万)/100万 = -95%.
+    assert snap["initial_cash"] == pytest.approx(50_000)
+    assert snap["pnl"] == pytest.approx(0.0)
+    assert snap["pnl_pct"] == pytest.approx(0.0)
+    assert db.get_live_baseline() == pytest.approx(50_000)
+    # Account grows to 6万 → +20% measured against the FROZEN 5万 baseline
+    # (the baseline is NOT re-anchored to the new total).
+    bridge.total = 60_000
+    snap2 = broker.snapshot_portfolio()
+    assert snap2["initial_cash"] == pytest.approx(50_000)   # still frozen
+    assert snap2["pnl"] == pytest.approx(10_000)
+    assert snap2["pnl_pct"] == pytest.approx(0.2)
+
+
+def test_live_baseline_not_anchored_on_zero_total(env, monkeypatch):
+    """A bridge-not-ready total=0 must NOT poison the baseline; it anchors on the
+    first snapshot that sees a real positive total (no phantom -100% in between)."""
+    db, provider = env
+    monkeypatch.setattr("quanti.execution.qmt_broker.session_closed_for_day",
+                        lambda *a, **k: False)
+    bridge = AssetBridge(0.0)
+    broker = _make(db, provider, client=bridge)
+    snap = broker.snapshot_portfolio()
+    assert db.get_live_baseline() is None          # not anchored to 0
+    assert snap["pnl_pct"] == pytest.approx(0.0)    # no phantom loss
+    bridge.total = 50_000                          # account资产 now readable
+    broker.snapshot_portfolio()
+    assert db.get_live_baseline() == pytest.approx(50_000)
+
+
 def test_portfolio_stop_hwm_survives_restart(env, tmp_path, monkeypatch):
     """盘中冲高 → 进程死掉(该日无收盘覆写)→ 重启后熔断仍以真实盘中峰为
     高水位触发,且幻影峰值没有写进 equity curve。"""
