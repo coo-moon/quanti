@@ -148,6 +148,7 @@ class QmtGateway:
         self._mock_orders: list[dict] = []
         self._mock_trades: list[dict] = []
         self._seq = 0
+        self._mock_coids: dict[str, dict] = {}  # client_order_id → result (dedup)
         # When False, mock orders rest as "accepted" instead of filling at
         # submit — lets tests exercise the cancel / pending-reconcile paths.
         self._mock_autofill = True
@@ -210,9 +211,18 @@ class QmtGateway:
             return {"ok": False, "order_id": "", "status": "rejected",
                     "msg": "bad order: need code, direction(buy/sell), volume>0"}
         if self.mock:
-            if self._mock_autofill:
-                return self._mock_fill(code, direction, volume, price)
-            return self._mock_accept(code, direction, volume, price)
+            # Idempotency: a repeat client_order_id returns the first result
+            # rather than filling/accepting a second time (mirrors the live
+            # backend's dedup so the whole chain is testable off the QMT box).
+            coid = str(body.get("client_order_id", "")).strip()
+            if coid and coid in self._mock_coids:
+                return self._mock_coids[coid]
+            res = (self._mock_fill(code, direction, volume, price)
+                   if self._mock_autofill
+                   else self._mock_accept(code, direction, volume, price))
+            if coid:
+                self._mock_coids[coid] = res
+            return res
         return self._backend.submit_order(body)
 
     def cancel(self, body: dict) -> dict:

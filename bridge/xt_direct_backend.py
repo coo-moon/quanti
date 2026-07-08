@@ -126,6 +126,7 @@ class XtDirectBackend:
         self._session = int(session) if session else int(time.time())
         self._trader = None
         self._acc = None
+        self._coid_results = {}  # client_order_id → result dict (idempotency cache)
         self._lock = threading.RLock()        # guards connected / freshness clock
         self._venue_lock = threading.RLock()  # serializes ALL trader I/O — the
         # HTTP server is threaded and xttrader is not documented thread-safe.
@@ -358,19 +359,75 @@ class XtDirectBackend:
             return {"ok": False, "order_id": "", "status": "rejected",
                     "filled_volume": 0, "filled_price": 0.0,
                     "msg": "trader not connected"}
+        # Idempotency: never submit the same client_order_id twice at the venue.
+        # A retry (network hiccup / crash / overnight-queue re-tick) that carries
+        # the same coid returns the EXISTING order's status instead of placing a
+        # second real order.
+        coid = str(body.get("client_order_id", "")).strip()
+        if coid:
+            prev = self._find_by_coid(coid)
+            if prev is not None:
+                return prev
         otype = xtconstant.STOCK_BUY if direction == "buy" else xtconstant.STOCK_SELL
+        # Stamp the coid into the order remark so the venue itself carries it —
+        # that's what makes dedup survive a bridge restart (the in-memory cache is
+        # gone, but _find_by_coid re-discovers the order by its remark).
+        remark = coid or str(body.get("reason", ""))[:22]
         with self._venue_lock:
             oid = self._trader.order_stock(
                 self._acc, self._xt_symbol(code), otype, volume,
-                xtconstant.FIX_PRICE, price, "quanti", str(body.get("reason", ""))[:40])
+                xtconstant.FIX_PRICE, price, "quanti", remark)
         if oid is None or int(oid) < 0:
             return {"ok": False, "order_id": "", "status": "rejected",
                     "filled_volume": 0, "filled_price": 0.0,
                     "msg": "venue rejected order (order_stock returned %s)" % oid}
         # Fill is asynchronous; report submitted and let QmtBroker reconcile off
         # orders()/trades().
-        return {"ok": True, "order_id": str(oid), "status": "submitted",
-                "filled_volume": 0, "filled_price": 0.0, "msg": ""}
+        res = {"ok": True, "order_id": str(oid), "status": "submitted",
+               "filled_volume": 0, "filled_price": 0.0, "msg": ""}
+        if coid:
+            self._coid_results[coid] = res
+        return res
+
+    def _find_by_coid(self, coid: str):  # pragma: no cover - QMT box only
+        """Return a result dict for a client_order_id already submitted, or None
+        if the venue definitively has no such order (safe to submit).
+
+        FAIL-CLOSED: if the dedup check itself can't be completed (query returns
+        None / raises — the stale-session failure mode the heartbeat documents),
+        RAISE rather than return None. Returning None would fall through to a
+        fresh order_stock() and place a DUPLICATE real order on exactly the
+        restart-retry scenario this dedup exists to prevent. A raised error
+        propagates out as HTTP 500 → quanti's POST try/except treats the submit
+        as 'unknown, retry later' — no duplicate, no silent miss.
+
+        Fast path: this process's cache. Cross-restart: scan the venue's orders
+        for one whose remark == coid (the venue is the durable dedup ledger)."""
+        cached = self._coid_results.get(coid)
+        if cached is not None:
+            return cached
+        with self._venue_lock:
+            rows = self._trader.query_stock_orders(self._acc)
+        if rows is None:
+            raise RuntimeError(
+                "xtdirect: dedup check failed (query_stock_orders returned None); "
+                "refusing to submit to avoid a duplicate order")
+        smap = _status_map()
+        for o in rows:
+            if str(getattr(o, "order_remark", "")) == coid:
+                status = smap.get(getattr(o, "order_status", None), "accepted")
+                # ok reflects the mapped status: a cancelled/rejected existing
+                # order must NOT read as accepted (that would falsely count a
+                # daily trade and briefly mirror it as pending).
+                res = {"ok": status not in ("cancelled", "rejected"),
+                       "order_id": str(getattr(o, "order_id", "")),
+                       "status": status,
+                       "filled_volume": int(getattr(o, "traded_volume", 0)),
+                       "filled_price": float(getattr(o, "traded_price", 0.0)),
+                       "msg": "dedup: existing order for client_order_id"}
+                self._coid_results[coid] = res
+                return res
+        return None
 
     def cancel(self, body: dict) -> dict:
         order_id = str(body.get("order_id", ""))

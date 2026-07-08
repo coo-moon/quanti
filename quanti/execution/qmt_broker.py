@@ -470,31 +470,63 @@ class QmtBroker:
                 ref = last if last > 0 else pos.current_price
                 price = ref * (1 - self._slippage)
 
-        res = self._client.post("/trader/order", {
-            "code": signal.stock_code, "direction": signal.direction.value,
-            "volume": int(volume),
-            "price": self._order_price(signal.stock_code, price),
-            "price_type": "limit" if price else "market"})
+        # Idempotent submit (no duplicate real orders on retry / crash):
+        #  1) mirror-BEFORE-POST — ensure a local row (coid) exists before the
+        #     venue call, so a crash between 'venue accepted' and 'DB write' can't
+        #     leave an order the local mirror never recorded.
+        #  2) client_order_id — the bridge dedups by it (it's stamped into the
+        #     venue order remark), so re-driving the SAME order (an overnight-queue
+        #     re-tick, or a retry after an unknown POST result) can NEVER submit a
+        #     second time at the venue.
+        # queued path reuses its stable row id; the in-session path mints one now.
+        coid = queued_order_id or self._mirror_order(
+            signal, strategy_name, status="pending", quantity=int(volume))
+        order_px = self._order_price(signal.stock_code, price)
+        try:
+            res = self._client.post("/trader/order", {
+                "code": signal.stock_code, "direction": signal.direction.value,
+                "volume": int(volume), "price": order_px,
+                "price_type": "limit" if price else "market",
+                "client_order_id": coid})
+        except Exception as e:  # noqa: BLE001 - result UNKNOWN, not failed
+            # The order may or may not have reached the venue. Mark the row
+            # 'submitting' (attempted, unconfirmed) — NOT 'pending'. A 'pending'
+            # row with no venue id looks like a never-submitted overnight order,
+            # and _advance_queued would gap-up/TTL-CANCEL it locally while the
+            # venue order (which carries this coid in its remark) may be live or
+            # already filled → a ghost fill + audit mismatch. 'submitting' rows
+            # are outside the queue driver: never auto-cancelled and never blindly
+            # re-sent; left for reconcile / human review. (The coid in the venue
+            # remark means any deliberate retry still dedups.)
+            self._db.update_order_status(
+                coid, "submitting", reason=f"submit result unknown: {e}")
+            self._db.log_decision(
+                "order_submit_unknown",
+                f"提交结果未知(实盘,已标记 submitting 待核对) {signal.direction.value} "
+                f"{signal.stock_code} {int(volume)}股: {e}",
+                code=signal.stock_code,
+                details={"venue": "qmt", "order_id": coid, "error": str(e)})
+            return False, "pending", "submit result unknown"
         accepted = bool(res.get("ok"))
         filled = accepted and res.get("status") == "filled"
         status = "filled" if filled else ("pending" if accepted else "rejected")
         if accepted:
             # Count the order against the daily-trade hard cap — the same floor
-            # PaperBroker enforces (paper_broker records on fill). reset_daily()
-            # at session start + seeding the count from /trader/trades is phase-③.
+            # PaperBroker enforces (paper_broker records on fill).
             self._risk.record_trade(signal.direction)
         venue_msg = res.get("msg", "")
-        # Audit: the decision reason (signal.reason — e.g. 策略离场信号) leads and
-        # is never clobbered by the venue message; venue text is appended for
-        # troubleshooting. Pre-fix a non-empty msg OVERWROTE signal.reason, so a
-        # filled exit's orders row lost which rule (止损/策略离场/止盈) fired.
+        # Resolve the SAME row (coid) in place with the venue outcome. reuse is
+        # what stamps the venue id onto a queued order's row — WITHOUT it a filled
+        # overnight order left its row 'pending'/no-id and got re-submitted every
+        # reconcile tick (duplicate). The decision reason (signal.reason) leads and
+        # is never clobbered by the venue message.
         self._mirror_order(
             signal, strategy_name, status=status,
             reason=" | ".join(p for p in (signal.reason, venue_msg) if p),
             venue_order_id=res.get("order_id", ""),
             filled_price=float(res.get("filled_price", 0) or 0),
             filled_quantity=int(res.get("filled_volume", 0) or 0),
-            quantity=int(volume))
+            quantity=int(volume), reuse_order_id=coid)
         self._db.log_decision(
             "order_submitted" if accepted else "order_rejected",
             f"{'已报' if accepted else '废单'} {signal.direction.value} "

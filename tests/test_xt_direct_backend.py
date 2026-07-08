@@ -246,3 +246,48 @@ def test_gateway_health_reports_xt_mode():
     assert h["mode"] == "xt"
     assert h["trader_connected"] is True
     assert h["datafeed_ok"] is True
+
+
+def test_submit_dedups_by_client_order_id(monkeypatch):
+    """A repeat client_order_id must NOT call order_stock a second time — the
+    coid is stamped into the venue order remark and the in-process cache returns
+    the first result (idempotency)."""
+    t = FakeTrader(order_ret=42)
+    b = _mk(monkeypatch, t, allow_orders=True)
+    body = {"code": "000001", "direction": "buy", "volume": 100,
+            "price": 10.5, "client_order_id": "c1"}
+    r1 = b.submit_order(dict(body))
+    r2 = b.submit_order(dict(body))               # same coid → dedup
+    assert r1["order_id"] == "42" == r2["order_id"]
+    assert len(t.submitted) == 1                   # order_stock called ONCE
+    assert t.submitted[0]["remark"] == "c1"        # coid stamped into remark
+    # a different coid does submit again
+    b.submit_order({**body, "client_order_id": "c2"})
+    assert len(t.submitted) == 2
+
+
+def test_dedup_check_fails_closed_on_query_none(monkeypatch):
+    """If the venue orders query can't complete (None on a stale session), the
+    dedup check must RAISE (fail-closed) — never fall through to a fresh
+    order_stock, which would place a DUPLICATE real order on a restart-retry."""
+    t = FakeTrader(order_ret=42)
+    t._orders = None                       # stale session → query returns None
+    b = _mk(monkeypatch, t, allow_orders=True)
+    with pytest.raises(Exception):
+        b.submit_order({"code": "000001", "direction": "buy", "volume": 100,
+                        "price": 10.5, "client_order_id": "fresh"})
+    assert t.submitted == []               # nothing placed
+
+
+def test_dedup_hit_on_cancelled_order_returns_not_ok(monkeypatch):
+    """A dedup hit on an already cancelled/rejected venue order returns ok=False
+    (not a false 'accepted' that would bump the daily-trade count)."""
+    cancelled = types.SimpleNamespace(
+        order_id=7, order_remark="c9", order_status=FakeConst.ORDER_CANCELED,
+        traded_volume=0, traded_price=0.0)
+    t = FakeTrader(orders=[cancelled], order_ret=42)
+    b = _mk(monkeypatch, t, allow_orders=True)
+    res = b.submit_order({"code": "000001", "direction": "buy", "volume": 100,
+                          "price": 10.5, "client_order_id": "c9"})
+    assert res["ok"] is False and res["status"] == "cancelled"
+    assert t.submitted == []               # deduped: no re-submit
