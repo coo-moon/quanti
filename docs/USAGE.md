@@ -2,7 +2,7 @@
 
 > 面向 A 股的 AI 自治量化交易系统。设定目标，剩下交给 Agent。
 
-适用版本:Quanti 0.3.0(2026-05 升级:walk-forward 验证、截面因子、Top-K ensemble、Claude LLM agent 接入、流动性宇宙清洗)。当前所有交易走 PaperBroker 模拟盘,未接真实券商(参见 [`TODO-live-trading.md`](TODO-live-trading.md))。
+适用版本:Quanti(2026-05 升级:walk-forward 验证、截面因子、Top-K ensemble、Claude LLM agent 接入、流动性宇宙清洗;2026-07:QMT 实盘接入)。日常仍默认走 **PaperBroker 模拟盘**。**实盘**已实现直连 xtquant 后端(`XtDirectBackend` / qmt-bridge),并对江海证券 QMT 完成**只读**端到端验证;真实下单默认关闭,需 `QMT_BRIDGE_ALLOW_ORDERS=1` + `QUANTI_ACCOUNT=live` + `QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY` 三重放行,且尚未在真机跑过下单冒烟。实盘接入/运维见 **[`live-trading-runbook.md`](live-trading-runbook.md)**。
 
 ---
 
@@ -80,7 +80,7 @@ cd ..
 
 # 验证安装
 quanti --help
-pytest -q              # 应该 159 passed(含 walk-forward / 因子 / ensemble / LLM 测试)
+pytest -q              # 应该 809 passed(含实盘安全/日内闸门/订单幂等/因子挖掘/hyperopt 等)
 ```
 
 ### 2.3 目录结构
@@ -1181,7 +1181,7 @@ quanti up  # 会重新初始化
 .venv/bin/python -m pytest tests -v
 ```
 
-应该 159 passed(含 walk-forward / 因子 / ensemble / LLM stub 测试)。
+应该 809 passed(含实盘安全 / 日内闸门 / 订单幂等 / 因子挖掘 / hyperopt 等)。
 
 ### 13.6 日志
 
@@ -1223,7 +1223,7 @@ sqlite3 data/quanti.db 'SELECT ts, kind, summary FROM agent_decisions ORDER BY i
           ▼             ▼              ▼
    ┌────────────┐  ┌──────────┐  ┌──────────────┐
    │  Strategy   │  │ Screener │  │  PaperBroker │
-   │  Selector   │  │  Loader  │  │  (or QmtBroker future)
+   │  Selector   │  │  Loader  │  │  或实盘 QmtBroker(直连 xtquant,已实现)
    └─────┬──────┘  └────┬─────┘  └──────┬───────┘
          │              │                │
          ▼              ▼                ▼
@@ -1287,7 +1287,8 @@ sqlite3 data/quanti.db 'SELECT ts, kind, summary FROM agent_decisions ORDER BY i
 ### C. 相关文档
 
 - [`README.md`](../README.md) — 项目总览
-- [`TODO-live-trading.md`](TODO-live-trading.md) — 接真实券商的 TODO 清单
+- [`live-trading-runbook.md`](live-trading-runbook.md) — **实盘接入 / 运维手册(当前权威)**
+- [`TODO-live-trading.md`](TODO-live-trading.md) — 早期接入 TODO(部分已被实盘接入工作取代,实盘现状以 runbook 为准)
 - [`plans/2026-05-25-smart-quant-upgrade.md`](plans/2026-05-25-smart-quant-upgrade.md) — Phase 1-3 升级的设计文档 + 红线 + 验收 gate
 - `docs/plans/` — 历史实现计划
 

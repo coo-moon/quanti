@@ -455,7 +455,7 @@ OpenClaw 配置示例（MCP client config）：
 - [x] 决策日志自动保留（默认 90 天）+ 手动清理 (`quanti agent prune`)
 - [x] 前端按路由懒加载（ECharts 进 Backtest 才下载，首屏 -72%）
 - [ ] regime 检测 v1.1：observe-only 验证后按行情自动切换选股器/仓位
-- [~] 接入真实券商 API（QMT / miniQMT）—— **脚手架就绪、mock 端到端可跑、真机未验证**（已过 2026-06-22 实盘安全审计加固：require_live 门控 / 限价 tick+涨跌停 clamp / 持仓现价驱动逐票止损，G1/G4/C5/C6；及 H1/H2/H3 加固：委托价带走 raw 轴、行情失效不静默禁用止损、实盘二次确认门）：`QmtBroker` + `bridge/qmt_bridge.py`（vnpy_xt 后端）+ `xtdata` 历史源。**启用入口**：`QUANTI_ACCOUNT=live` + `QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY`（二者缺一拒绝构建实盘 broker），且实盘不自动拉起 Agent、须手动 `agent_start`。路线见 `docs/plans/2026-06-16-live-trading-qmt.md`
+- [~] 接入真实券商 API（QMT / miniQMT）—— **真机只读链路已端到端验证**（江海证券 QMT 实盘、账户 85530137：`/health` mode=xt && trader_connected && datafeed_ok，实时行情 + `connect`/`query_account`/`query_asset` 交易查询通道全通）；**真实下单尚未在真机跑过**（下单总闸 `QMT_BRIDGE_ALLOW_ORDERS=1` 才放行，默认关；冒烟测试待盘中）。后端：`QmtBroker` + `bridge/qmt_bridge.py`，首选**直连 xtquant** 后端 `XtDirectBackend`（`bridge/xt_direct_backend.py`，PR #126；vnpy_xt 降为未验证 fallback）+ `xtdata` 历史源。**接实盘代码债已全部清零**（PR #125–#134）：H1/H2/H3、时区断言（UTC+8）、观察期敞口双闸（`QUANTI_MAX_ORDER_NOTIONAL` 单笔 + `QUANTI_MAX_LIVE_EXPOSURE` 总敞口）、订单幂等（client-order-id 去重 + mirror-before-POST + 对账）、跨进程实盘单例锁、F3/G2。**启用入口**：`QUANTI_ACCOUNT=live` + `QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY`（缺一拒绝构建实盘 broker），实盘不自动拉起 Agent、须手动 `agent_start`。**操作手册**：`docs/live-trading-runbook.md`（历史路线：`docs/plans/2026-06-16-live-trading-qmt.md`）
 - [ ] 实时分钟级行情
 - [ ] PostgreSQL 后端
 
