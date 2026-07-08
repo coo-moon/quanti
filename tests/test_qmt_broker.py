@@ -813,3 +813,52 @@ def test_no_daily_seed_when_not_live(env):
     db, provider = env
     broker = QmtBroker(db, provider, client=InProcBridge(), session_fn=lambda: True)
     assert broker._risk._daily_trade_count == 0
+
+
+# --- order idempotency: no duplicate real orders on retry / crash -----------
+
+def test_queued_order_resolved_not_resubmitted(env):
+    """A queued overnight order, once submitted, must resolve its OWN row (stamp
+    the venue id) so a later reconcile tick doesn't re-drive → re-submit it.
+    Pre-fix the queued row stayed 'pending' with no venue id and _advance_queued
+    re-POSTed it every tick (duplicate real order)."""
+    db, provider = env
+    rec = RecordingBridge()
+    sess = {"open": False}
+    broker = _make(db, provider, client=rec, session_fn=lambda: sess["open"],
+                   risk_config=RiskConfig(extreme_gap_up_block_pct=0.0))
+    broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s")  # queues
+    assert rec.orders == [] and len(db.list_orders(status="pending")) == 1
+    sess["open"] = True
+    broker.try_fill_pending_orders()          # submits once
+    broker.try_fill_pending_orders()          # 2nd tick must NOT re-submit
+    assert len(rec.orders) == 1, len(rec.orders)
+    # No un-submitted queued row lingers (row was resolved, not orphaned pending).
+    assert all(o.get("entry_strategy")
+               for o in db.list_orders(status="pending"))
+
+
+def test_submit_unknown_result_no_crash_no_orphan(env):
+    """An exception on the venue POST is UNKNOWN, not failed: no crash, a mirror
+    row already exists (mirror-before-POST → no orphan), and an
+    order_submit_unknown alert is logged. Not blindly re-sent in this call."""
+    db, provider = env
+
+    class FlakyBridge(InProcBridge):
+        def post(self, path: str, json: dict | None = None) -> dict:
+            if path == "/trader/order":
+                raise ConnectionError("timeout mid-submit")
+            return super().post(path, json)
+
+    broker = _make(db, provider, client=FlakyBridge())     # in-session
+    broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s")
+    rows = db.list_orders()
+    assert len(rows) == 1                                   # mirror-before-POST
+    assert rows[0]["status"] == "submitting"               # attempted, unconfirmed
+    assert any(d["kind"] == "order_submit_unknown"
+               for d in db.list_decisions(limit=10))
+    # A reconcile tick must NOT ghost-cancel it: 'submitting' is outside the
+    # overnight-queue driver (which only cancels never-attempted 'pending' rows),
+    # so an order that may be live at the venue isn't silently abandoned locally.
+    broker.try_fill_pending_orders()
+    assert db.list_orders()[0]["status"] == "submitting"   # untouched

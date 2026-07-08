@@ -207,3 +207,29 @@ def test_http_round_trip_health():
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_mock_dedups_by_client_order_id():
+    """Idempotency: a repeat client_order_id returns the first result instead of
+    placing a second order/fill — mirrors the live backend's dedup so the whole
+    chain is testable off the QMT box."""
+    gw = QmtGateway()  # mock mode
+    body = {"code": "000001", "direction": "buy", "volume": 100,
+            "price": 10.0, "client_order_id": "coid-1"}
+    r1 = gw.submit_order(dict(body))
+    r2 = gw.submit_order(dict(body))              # same coid → dedup
+    assert r1["order_id"] == r2["order_id"]        # same order, not a 2nd
+    assert len(gw._mock_orders) == 1               # only one venue order
+    assert len(gw._mock_trades) == 1               # only one fill
+    r3 = gw.submit_order({**body, "client_order_id": "coid-2"})
+    assert r3["order_id"] != r1["order_id"]        # a new coid → a new order
+    assert len(gw._mock_orders) == 2
+
+
+def test_mock_no_coid_not_deduped():
+    """Without a client_order_id, each submit is a distinct order (legacy)."""
+    gw = QmtGateway()
+    body = {"code": "000001", "direction": "buy", "volume": 100, "price": 10.0}
+    gw.submit_order(dict(body))
+    gw.submit_order(dict(body))
+    assert len(gw._mock_orders) == 2
