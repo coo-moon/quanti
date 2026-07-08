@@ -12,6 +12,7 @@
 - **运行中**：模拟盘 PaperBroker。
 - **已就绪**：QMT 直连 xtquant 桥（`bridge/xt_direct_backend.py`，PR #126）——真机已实测**只读**链路端到端连通（江海证券 QMT 实盘，账户 85530137）：`/health` 报 `mode=xt && trader_connected && datafeed_ok`，能读到真实资金/持仓，quanti `make_broker(live)` 的 `QmtBroker.is_connected()` 为 True。
 - **代码债已清零**：接实盘代码债 PR #125–#134 **全部修复**（见第 7 节，§7.2 全 ✅）。
+- **UI 下单开关已就绪**（PR #136）：实盘账户下 Web「实盘控制」卡有一道**布防/撤防**开关（DB 持久化 `live_control.orders_armed`，**默认撤防=观察**），是真钱买入的最后一道、也是唯一能在 UI 里**实时切换**的闸。只拦买入；卖出/止损/清仓永不受影响。撤防即一键在应用内停掉所有新买入（见阶段 C/D 与第 5 节）。
 - **待做（真机下单冒烟，已计划）**：真实**下单**从未在真机跑过（下单闸默认关闭）；冒烟测试**已计划、待盘中 + 操作者在场**按阶段 D 执行——这是上真钱前唯一剩下的技术验证步骤。
 - **未达标（业务跑道）**：见第 1 节（模拟盘连续交易日 + 风控触发尚未满足）。
 
@@ -96,15 +97,21 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 ```
 - Web 打开，「当前持仓」应显示**真实账户**的持仓/资金。
 - 此阶段 quanti 只读账户、不下单（下单闸在 bridge 侧仍关闭）。观察 1~2 天确认数据无误。
+- Web「实盘控制」卡此时会出现（仅实盘账户可见）：红框危险区，显示实盘徽标、券商桥接健康（只读），下单开关应为**已撤防·观察模式**（默认）。观察期就保持撤防——即便有人误开了 bridge 侧下单闸，quanti 也会因未布防而拒掉每一笔买入。
 
-### 阶段 D：开下单闸 + 手动冒烟一笔
-1. **停 bridge**，加上下单闸重启：
+### 阶段 D：开下单闸（**两道**）+ 手动冒烟一笔
+> 真钱买入现在需要**两道下单闸同时打开**：bridge 侧 `QMT_BRIDGE_ALLOW_ORDERS=1`（部署闸）**和** quanti UI 的**布防**（运行时闸）。任缺一道，买入都被拒；卖出/止损/清仓不受任一道影响。
+
+1. **停 bridge**，加上部署闸重启：
    ```powershell
-   $env:QMT_BRIDGE_ALLOW_ORDERS = "1"   # ← 现在才允许真实下单
+   $env:QMT_BRIDGE_ALLOW_ORDERS = "1"   # ← bridge 侧部署闸:现在才允许真实下单
    C:\Users\HuaWenbo\qmt-bridge-venv\Scripts\python.exe bridge\qmt_bridge.py --port 18099
    ```
-2. 在 Web「手动下单」买 **100 股最便宜的标的**，确认：下单 → 成交 → 能撤单，全流程无误，且券商 App 里能看到这笔。
-3. 卖掉这笔（T+1，次日）。确认卖出与对账正常。
+   重启后「实盘控制」卡的**部署闸**应显示**已放行**。
+2. 在 Web「实盘控制」卡点【**布防实盘下单**】（会二次确认）→ 开关变为**已布防·放行真钱买入**。这是运行时闸，随时可一键撤防回观察。
+3. 在 Web「手动下单」买 **100 股最便宜的标的**，确认：下单 → 成交 → 能撤单，全流程无误，且券商 App 里能看到这笔。
+4. 卖掉这笔（T+1，次日）。确认卖出与对账正常。
+5. 冒烟完若暂不继续，**先撤防**（一键回观察），再按需停 bridge。
 
 ### 阶段 E：小额跑 Agent
 1. 先只放**约 5 万**资金到该账户。
@@ -128,12 +135,15 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 
 ## 5. 紧急回滚（任何时候出问题）
 
-1. Web →「停止 Agent」按钮，或 `quanti agent stop`，或 MCP `agent_stop`。
-2. 把 bridge 的 `QMT_BRIDGE_ALLOW_ORDERS` 去掉重启 → 立即禁止任何新下单（只读）。
+> 按**从软到硬**升级。关键区别：**撤防只停买入、保留卖出/止损/清仓**；而去掉 bridge 下单闸或关交易端会**连止损单一起挡掉**——手上有持仓、还指望止损保护时，别一上来就用最硬的那招。
+
+0. **最快·首选**：Web「实盘控制」→【**撤防下单**】。一键停掉所有新买入，止损/止盈/清仓/熔断继续保护持仓。买错了/买太多的第一反应就是它。
+1. Web →「停止 Agent」按钮，或 `quanti agent stop`，或 MCP `agent_stop` → 停掉自动循环。
+2. 把 bridge 的 `QMT_BRIDGE_ALLOW_ORDERS` 去掉重启 → 禁止任何新下单（⚠️ 含止损/清仓等 exit，仅在确定要完全冻结时用）。
 3. 直接**关掉 QMT 交易端** → 券商账户回到纯手动，任何自动单都发不出去。
 4. DB 里持仓/订单/成交/决策全程留痕，可回放排查。
 
-> 记住这条铁律：**关 QMT 交易端 = 最硬的急停**。
+> 记住这条铁律：**关 QMT 交易端 = 最硬的急停**（也最粗暴——它同时废掉了止损）。**只想拦买入、保住止损，用「撤防」。**
 
 ---
 
@@ -149,6 +159,8 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 | `RuntimeError: 拒绝构建实盘 broker...二次确认` | 设了 `QUANTI_ACCOUNT=live` 但没 `QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY` | 补上二次确认 env |
 | `RuntimeError: ...主机时区必须为北京时间` | 机器不是北京时间（云机常见 UTC）| **把机器时区设为 Asia/Shanghai** 后重启（已有启动断言拦截，见 7.2；确已用他法让 now() 返回北京时可 `QUANTI_ALLOW_NON_CN_TZ=1` 跳过）|
 | 买单被拒 `观察期单笔名义额上限...` | 触发了 `QUANTI_MAX_ORDER_NOTIONAL` 单笔硬闸 | 观察期安全网正常；确认无误后调大或去掉该 env |
+| 买单被拒 `实盘下单未布防(观察模式)` / 决策日志 `order_disarmed` | UI 下单开关处于**撤防**（默认）| 确认要下单 → Web「实盘控制」点【布防实盘下单】。卖出不受影响 |
+| 「实盘控制」布防按钮**灰掉点不动** | 进程未带 `QUANTI_LIVE_ACK` → `live_capable=false` | 补 `QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY` 重启后端（无它即便布防也不会真下单）|
 
 ---
 
@@ -170,6 +182,7 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 | MEDIUM | F3：pending 排队成交持久化 strength | ✅ 已修 | orders 表加 strength 列，入队持久化、成交按原始 conviction 定仓（不再硬编码 1.0）|
 | MEDIUM | G2：日内下单计数重启回种（从 /trader/trades） | ✅ 已修 | 实盘 QmtBroker 启动时从 /trader/trades 回种当日买入计数，重启不再清零 |
 | MEDIUM | 跨进程下单锁 | ✅ 已修 | 实盘 agent 启动取 DB 心跳单例锁；已有实盘进程在跑则第二个拒启（心跳失效自动可被接管） |
+| 控制 | UI 运行时下单闸（布防/撤防，PR #136） | ✅ 已加 | `_send_now` 的 BUY 分支顶部读 `live_control.orders_armed`；默认撤防、盘中可一键切换、只拦买入永不拦 exit。与 bridge `QMT_BRIDGE_ALLOW_ORDERS` 双闸并存 |
 | — | 其余见 `2026-06-22-live-readiness-audit.md` 六节 HIGH 清单 | 部分已修 | — |
 
 ### 7.3 设计边界
@@ -188,7 +201,7 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
    QMT_BRIDGE_BACKEND=direct QMT_ACCOUNT=... QMT_USERDATA_MINI=...\userdata_mini
    → curl /health 应 mode=xt&&trader_connected&&datafeed_ok
 3. quanti：QUANTI_ACCOUNT=live QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY quanti up --no-agent  → 只读核对
-4. 加 QMT_BRIDGE_ALLOW_ORDERS=1 重启 bridge → Web 手动 100 股冒烟 → 撤/卖验证
+4. 开双闸：①加 QMT_BRIDGE_ALLOW_ORDERS=1 重启 bridge ②Web「实盘控制」点【布防】→ Web 手动 100 股冒烟 → 撤/卖验证
 5. 放 5 万 → agent_start 观察一周 → 满意再加码
-急停：关 XtMiniQmt。
+急停（软→硬）：Web【撤防】(只停买入、留止损) → 停 Agent → 去 ALLOW_ORDERS 重启(连 exit 一起冻) → 关 XtMiniQmt(最硬)。
 ```
