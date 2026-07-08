@@ -87,6 +87,7 @@ class QmtBroker:
         pending_ttl_trading_days: int = 3,
         session_fn: "Callable[[], bool] | None" = None,
         max_order_notional: float | None = None,
+        max_live_exposure: float | None = None,
     ) -> None:
         self._db = db
         self._provider = provider
@@ -105,6 +106,13 @@ class QmtBroker:
         self._max_order_notional = (
             float(max_order_notional) if max_order_notional is not None
             else float(os.environ.get("QUANTI_MAX_ORDER_NOTIONAL", "0") or 0))
+        # Observation-period TOTAL-exposure cap: reject a BUY that would push the
+        # account's held market value beyond this many 元 (current exposure + this
+        # order). Bounds the whole book during ramp-up, not just one order. 0 /
+        # unset = disabled; never caps SELLs. Env QUANTI_MAX_LIVE_EXPOSURE.
+        self._max_live_exposure = (
+            float(max_live_exposure) if max_live_exposure is not None
+            else float(os.environ.get("QUANTI_MAX_LIVE_EXPOSURE", "0") or 0))
         self._risk = RiskManager(risk_config)
         from quanti.risk.protections import ProtectionConfig, ProtectionManager
         self._protections = ProtectionManager(
@@ -418,6 +426,23 @@ class QmtBroker:
                     details={"venue": "qmt", "notional": round(volume * price, 2),
                              "cap": self._max_order_notional})
                 return False, "rejected", r
+            # Observation-period TOTAL-exposure cap (BUY only): current held
+            # market value + this order must stay under the ceiling.
+            if self._max_live_exposure > 0:
+                exposure = max(0.0, portfolio.total_value - portfolio.cash)
+                if exposure + volume * price > self._max_live_exposure:
+                    r = ("观察期总敞口上限 %.0f 元,现敞口 %.0f + 本单 %.0f 超限 → 拒单"
+                         % (self._max_live_exposure, exposure, volume * price))
+                    self._mirror_order(signal, strategy_name, status="rejected",
+                                       reason=r, reuse_order_id=queued_order_id)
+                    self._db.log_decision(
+                        "order_exposure_capped",
+                        "拒单(实盘) 买入 %s: %s" % (signal.stock_code, r),
+                        code=signal.stock_code,
+                        details={"venue": "qmt", "exposure": round(exposure, 2),
+                                 "order": round(volume * price, 2),
+                                 "cap": self._max_live_exposure})
+                    return False, "rejected", r
         else:  # SELL — only the T+1-sellable portion can leave today
             pos = portfolio.positions.get(signal.stock_code)
             if pos is None or pos.quantity <= 0:
