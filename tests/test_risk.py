@@ -367,3 +367,17 @@ def test_daily_cap_counts_opens_not_exits():
     rm.record_trade(Direction.BUY)
     ok, reason = rm.check(buy, pf)
     assert ok is False and "limit" in reason.lower()
+
+
+def test_seed_daily_trades_blocks_restart_bypass():
+    """G2: seeding today's open-count (from the venue at session start) keeps the
+    daily cap intact across a mid-day process restart — which would otherwise
+    reset the in-memory count to 0 and let max_daily_trades be bypassed."""
+    rm = RiskManager(RiskConfig(max_daily_trades=2))
+    pf = Portfolio(cash=1_000_000.0)
+    buy = Signal("000001", Direction.BUY, 0.5, "b")
+    rm.seed_daily_trades(2)                 # 2 opens already done today per venue
+    ok, reason = rm.check(buy, pf)
+    assert ok is False and "limit" in reason.lower()   # cap already reached
+    rm.seed_daily_trades(1)                 # never LOWERS an existing count
+    assert rm._daily_trade_count == 2

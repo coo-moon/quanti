@@ -781,3 +781,35 @@ def test_no_cap_by_default(env):
     broker = _make(db, provider, client=rec)       # no max_order_notional
     assert broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s") is True
     assert len(rec.orders) == 1
+
+
+# --- G2: seed daily open-count from the venue at live startup ----------------
+
+def test_seeds_daily_open_count_from_venue(env):
+    """A live QmtBroker seeds today's open-count from /trader/trades on startup
+    so a mid-day restart doesn't reset the daily cap to 0 (audit G2). Only
+    today's BUYs count; SELLs and prior days are excluded."""
+    db, provider = env
+    today = date.today().isoformat()
+
+    class SeedBridge(InProcBridge):
+        def get(self, path: str, params: dict | None = None) -> dict:
+            if path == "/trader/trades":
+                return {"trades": [
+                    {"direction": "buy", "time": today + "T10:00:00"},
+                    {"direction": "buy", "time": today + "T10:01:00"},
+                    {"direction": "sell", "time": today + "T10:02:00"},   # exit
+                    {"direction": "buy", "time": "2020-01-01T10:00:00"},   # old
+                ]}
+            return super().get(path, params)
+
+    broker = QmtBroker(db, provider, client=SeedBridge(),
+                       require_live=True, session_fn=lambda: True)
+    assert broker._risk._daily_trade_count == 2      # 2 today-buys seeded
+
+
+def test_no_daily_seed_when_not_live(env):
+    """Non-live (dev/paper/tests) doesn't call the venue on construct."""
+    db, provider = env
+    broker = QmtBroker(db, provider, client=InProcBridge(), session_fn=lambda: True)
+    assert broker._risk._daily_trade_count == 0
