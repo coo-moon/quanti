@@ -19,6 +19,37 @@ LIVE_ACK_ENV = "QUANTI_LIVE_ACK"
 LIVE_ACK_TOKEN = "I_KNOW_REAL_MONEY"
 
 
+def _local_utc_offset():
+    """The host's current UTC offset (a timedelta). Isolated so tests can
+    simulate a UTC / wrong-tz host without touching the real clock."""
+    from datetime import datetime
+    return datetime.now().astimezone().utcoffset()
+
+
+def _assert_cn_timezone() -> None:
+    """Live A-share trading sessions are computed from a naive ``datetime.now()``
+    (host local time — see ``quanti/utils/market.py``). So the host MUST be on
+    Beijing time (UTC+8): on a UTC cloud/VM the 09:30–15:00 window maps to
+    ~01:30–07:00 local, ``in_trading_session`` is False all day, and the intraday
+    guard (pending fills, per-stock stop-loss, portfolio circuit breaker) silently
+    no-ops during the real session. Fail loud at live startup rather than run a
+    whole day with risk control disabled.
+
+    Set QUANTI_ALLOW_NON_CN_TZ=1 only if you have deliberately made now() return
+    Beijing time some other way (rare)."""
+    import os
+    from datetime import timedelta
+    if os.environ.get("QUANTI_ALLOW_NON_CN_TZ", "") == "1":
+        return
+    off = _local_utc_offset()
+    if off != timedelta(hours=8):
+        raise RuntimeError(
+            "拒绝构建实盘 broker:主机时区必须为北京时间(UTC+8),当前本地 UTC 偏移为 "
+            f"{off}。A 股交易时段由本地 naive now() 计算,时区不对会让盘中守护/止损/"
+            "熔断在真实交易时段整段空转。请把机器时区设为 Asia/Shanghai 后重试"
+            "(若确已用其他方式让 now() 返回北京时间,可设 QUANTI_ALLOW_NON_CN_TZ=1 跳过)。")
+
+
 def make_broker(db, provider, *, account: str | None = None,
                 initial_cash: float = 1_000_000.0,
                 strategies_dir: str = "strategies",
@@ -34,6 +65,7 @@ def make_broker(db, provider, *, account: str | None = None,
             raise RuntimeError(
                 "拒绝构建实盘 broker:QUANTI_ACCOUNT=live 需要二次确认。"
                 f"请显式设置 {LIVE_ACK_ENV}={LIVE_ACK_TOKEN} 表示你清楚这是真钱交易。")
+        _assert_cn_timezone()
         from quanti.execution.qmt_broker import QmtBroker
         return QmtBroker(db, provider, initial_cash=initial_cash,
                          strategies_dir=strategies_dir, require_live=True)

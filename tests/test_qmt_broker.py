@@ -745,3 +745,39 @@ def test_is_connected_accepts_xt_and_vnpy_rejects_mock(env):
     assert broker("xt").is_connected() is True
     assert broker("vnpy").is_connected() is True
     assert broker("mock").is_connected() is False
+
+
+# --- observation-period per-order notional cap (BUY only) -------------------
+
+def test_max_order_notional_rejects_oversized_buy(env):
+    """A BUY whose notional exceeds the cap is rejected before the venue, with
+    an audit decision — the observation-period blast-radius guard."""
+    db, provider = env
+    rec = RecordingBridge()
+    broker = _make(db, provider, client=rec, max_order_notional=1000.0)
+    landed = broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s")
+    assert landed is False
+    assert rec.orders == []                        # never reached the venue
+    o = db.list_orders()[0]
+    assert o["status"] == "rejected" and "名义额" in o["reason"]
+    assert any(d["kind"] == "order_notional_capped"
+               for d in db.list_decisions(limit=10))
+
+
+def test_max_order_notional_allows_within_cap(env):
+    """A generous cap lets the BUY through to the venue (control)."""
+    db, provider = env
+    rec = RecordingBridge()
+    broker = _make(db, provider, client=rec, max_order_notional=1e9)
+    landed = broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s")
+    assert landed is True
+    assert len(rec.orders) == 1                    # reached the venue
+
+
+def test_no_cap_by_default(env):
+    """Unset (0) cap = disabled: a normal BUY reaches the venue unimpeded."""
+    db, provider = env
+    rec = RecordingBridge()
+    broker = _make(db, provider, client=rec)       # no max_order_notional
+    assert broker.execute_signal(Signal("000001", Direction.BUY, 0.5, "b"), "s") is True
+    assert len(rec.orders) == 1
