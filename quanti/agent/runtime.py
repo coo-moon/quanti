@@ -144,11 +144,17 @@ class AgentRuntime:
         self._stop_flag = threading.Event()
         self._status = AgentStatus()
         self._lock = threading.Lock()
+        # Cross-process live-trading singleton (see _acquire_live_singleton).
+        self._singleton_owner: str | None = None
+        self._singleton_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------- public
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        # Live only: take the cross-process singleton BEFORE starting the loop —
+        # refuse to run a second live agent against the same account (raises).
+        self._acquire_live_singleton()
         goal = load_goal(self._db)
         goal.enabled = True
         save_goal(self._db, goal)
@@ -161,6 +167,13 @@ class AgentRuntime:
             self._guard_thread = threading.Thread(
                 target=self._guard_loop, name="quanti-intraday-guard", daemon=True)
             self._guard_thread.start()
+        if self._singleton_owner and (
+                self._singleton_thread is None
+                or not self._singleton_thread.is_alive()):
+            self._singleton_thread = threading.Thread(
+                target=self._singleton_heartbeat, name="quanti-live-lock",
+                daemon=True)
+            self._singleton_thread.start()
         with self._lock:
             self._status.enabled = True
             self._status.running = True
@@ -180,6 +193,7 @@ class AgentRuntime:
             self._status.enabled = False
             self._status.running = False
             self._status.started_at = None
+        self._release_live_singleton()
         if was_running:
             self._db.log_decision("agent_stop", "Agent stopped")
 
@@ -192,12 +206,66 @@ class AgentRuntime:
         self._stop_flag.set()
         with self._lock:
             self._status.running = False
-        for th in (self._thread, self._guard_thread):
+        for th in (self._thread, self._guard_thread, self._singleton_thread):
             if th is not None:
                 try:
                     th.join(timeout=2)
                 except Exception:
                     pass
+        self._release_live_singleton()
+
+    # ------------------------------------------ live singleton (cross-process)
+    def _acquire_live_singleton(self) -> None:
+        """Live only: claim the cross-process singleton so a second process
+        (server + CLI agent + MCP …) can't drive the same live account and
+        double/conflict orders. No-op for paper. Raises if another live process
+        currently holds it."""
+        if not getattr(self._broker, "_require_live", False):
+            return
+        import os
+        import socket
+        import uuid
+        owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        if not self._db.claim_live_singleton(owner):
+            raise RuntimeError(
+                "拒绝启动实盘 Agent:已有另一个实盘进程在运行(live_singleton 被占用)。"
+                "同一账户被多个进程驱动会重复/冲突下单——请先停掉那个进程再启动。")
+        self._singleton_owner = owner
+        self._db.log_decision(
+            "live_singleton_acquired", "实盘单例锁已获取(跨进程互斥)",
+            details={"owner": owner})
+
+    def _singleton_heartbeat(self) -> None:
+        """Refresh the singleton heartbeat so our lock doesn't look stale. If we
+        LOSE it (another process reclaimed a stale lock), halt — two live agents
+        must never run at once."""
+        while not self._stop_flag.wait(30):
+            owner = self._singleton_owner
+            if not owner:
+                return
+            try:
+                if not self._db.refresh_live_singleton(owner):
+                    logger.critical(
+                        "live singleton lost by %s — halting agent to avoid "
+                        "split-brain live trading", owner)
+                    self._db.log_decision(
+                        "live_singleton_lost",
+                        "实盘单例锁丢失(疑似被另一进程接管),已自停避免双实盘",
+                        details={"owner": owner})
+                    self._stop_flag.set()
+                    return
+            except Exception as e:  # noqa: BLE001
+                logger.warning("live singleton heartbeat error: %s", e)
+
+    def _release_live_singleton(self) -> None:
+        owner = self._singleton_owner
+        if not owner:
+            return
+        self._singleton_owner = None  # stop the heartbeat before deleting the row
+        try:
+            self._db.release_live_singleton(owner)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("live singleton release error: %s", e)
 
     def guard_status(self) -> dict:
         """Intraday-guard daemon state for the live status card."""

@@ -482,6 +482,17 @@ class Database:
                 updated_at TEXT NOT NULL
             );
 
+            -- Cross-process live-trading singleton: at most one process may run
+            -- the LIVE agent loop against a given account/DB at a time (else two
+            -- agents both submit orders → conflicting/duplicate real trades). A
+            -- heartbeat-based lock: the holder refreshes heartbeat_at; a stale
+            -- row (holder crashed) is reclaimable. Single row id=1.
+            CREATE TABLE IF NOT EXISTS live_singleton (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                owner TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL
+            );
+
             -- Agent / goal -----------------------------------------------
 
             CREATE TABLE IF NOT EXISTS app_config (
@@ -1620,6 +1631,50 @@ class Database:
             """,
             (value, datetime.now().isoformat()),
         )
+        self.conn.commit()
+
+    # ---- live-trading singleton (cross-process mutual exclusion) ----------
+    def claim_live_singleton(self, owner: str, stale_seconds: int = 120) -> bool:
+        """Atomically claim the live-trading singleton for ``owner``. Succeeds if
+        the row is free, already ours, or STALE (heartbeat older than
+        ``stale_seconds`` → the prior holder crashed). Returns True iff we hold
+        it after the call. This is the cross-process guard that stops two
+        processes (server + CLI agent + MCP …) from both driving live orders."""
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        stale_before = (now - timedelta(seconds=stale_seconds)).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO live_singleton (id, owner, heartbeat_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                owner = excluded.owner,
+                heartbeat_at = excluded.heartbeat_at
+            WHERE live_singleton.owner = excluded.owner
+               OR live_singleton.heartbeat_at < ?
+            """,
+            (owner, now.isoformat(), stale_before),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT owner FROM live_singleton WHERE id = 1").fetchone()
+        return bool(row) and row[0] == owner
+
+    def refresh_live_singleton(self, owner: str) -> bool:
+        """Bump the heartbeat iff we still own the singleton. Returns False if we
+        no longer own it (someone reclaimed a stale lock — a split-brain signal;
+        the caller should halt rather than keep trading)."""
+        from datetime import datetime
+        cur = self.conn.execute(
+            "UPDATE live_singleton SET heartbeat_at = ? WHERE id = 1 AND owner = ?",
+            (datetime.now().isoformat(), owner))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def release_live_singleton(self, owner: str) -> None:
+        """Release the singleton iff we hold it (no-op otherwise)."""
+        self.conn.execute(
+            "DELETE FROM live_singleton WHERE id = 1 AND owner = ?", (owner,))
         self.conn.commit()
 
     def save_portfolio_snapshot(self, snapshot_date: date, cash: float,

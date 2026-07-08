@@ -163,7 +163,7 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 | HIGH | 订单幂等（client-order-id + 去重）+ mirror-before-POST | ✅ 已修 | 每单带 client-order-id，bridge 按它去重（写进券商 order remark，跨重启仍认）+ 先写镜像再 POST + POST 异常标 submitting（不盲目重发、不被误撤）。**全量启动对账**（把 submitting/孤儿单主动拉平）仍待做 |
 | MEDIUM | F3：pending 排队成交持久化 strength | ✅ 已修 | orders 表加 strength 列，入队持久化、成交按原始 conviction 定仓（不再硬编码 1.0）|
 | MEDIUM | G2：日内下单计数重启回种（从 /trader/trades） | ✅ 已修 | 实盘 QmtBroker 启动时从 /trader/trades 回种当日买入计数，重启不再清零 |
-| MEDIUM | 跨进程下单锁 | 待修 | 同时跑多个进程会对同一账户并发下单 |
+| MEDIUM | 跨进程下单锁 | ✅ 已修 | 实盘 agent 启动取 DB 心跳单例锁；已有实盘进程在跑则第二个拒启（心跳失效自动可被接管） |
 | — | 其余见 `2026-06-22-live-readiness-audit.md` 六节 HIGH 清单 | 部分已修 | — |
 
 ### 7.3 设计边界
