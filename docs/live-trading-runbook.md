@@ -161,7 +161,7 @@ quanti up --no-agent   # 实盘默认不自动拉起 Agent；--no-agent 更明�
 | HIGH | 服务器时区断言 | ✅ 已修 | make_broker(live) 启动断言主机 UTC+8，否则拒建（`QUANTI_ALLOW_NON_CN_TZ=1` 可跳过）|
 | HIGH | 观察期敞口硬闸 — 单笔名义额上限 | ✅ 已修 | `QUANTI_MAX_ORDER_NOTIONAL`（元，0=关）；仅拦 BUY，永不拦 exit。**总敞口上限**仍待做 |
 | HIGH | 订单幂等（client-order-id）+ 断线重发保护 + 启动对账 | 待修 | 网络抖动/崩溃可致真钱重复下单或孤儿单 |
-| MEDIUM | F3：pending 排队成交持久化 strength | 待修 | 弱信号被按满仓建仓，实盘规模 ≠ 回测 |
+| MEDIUM | F3：pending 排队成交持久化 strength | ✅ 已修 | orders 表加 strength 列，入队持久化、成交按原始 conviction 定仓（不再硬编码 1.0）|
 | MEDIUM | G2：日内下单计数重启回种（从 /trader/trades） | 待修 | 当日重启可绕过 `max_daily_trades` 上限 |
 | MEDIUM | 跨进程下单锁 | 待修 | 同时跑多个进程会对同一账户并发下单 |
 | — | 其余见 `2026-06-22-live-readiness-audit.md` 六节 HIGH 清单 | 部分已修 | — |

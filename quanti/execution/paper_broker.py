@@ -511,7 +511,9 @@ class PaperBroker:
             sig = Signal(
                 stock_code=o["code"],
                 direction=Direction(o["direction"]),
-                strength=1.0,
+                # Size on the ORIGINAL conviction persisted at queue time, not a
+                # hardcoded 1.0 that over-invested weak signals (audit F3).
+                strength=float(o.get("strength", 1.0)),
                 reason=o.get("reason", "") or "pending fill",
                 entry_strategy=o.get("entry_strategy", "") or "",
             )
@@ -1008,6 +1010,7 @@ class PaperBroker:
             "created_at": datetime.now().isoformat(),
             "filled_at": datetime.now().isoformat() if status == "filled" else None,
             "entry_strategy": signal.entry_strategy,
+            "strength": signal.strength,
         })
         return order_id
 
