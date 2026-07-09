@@ -355,3 +355,19 @@ class TestRiskControlConfig:
             r = await client.post("/api/config/risk-control",
                                   json={**self._FULL, field: bad})
             assert r.status_code == 422, f"{field}={bad} should be rejected"
+
+
+def test_intraday_guard_sec_env(db, monkeypatch):
+    """Guard cadence is env-tunable (QUANTI_INTRADAY_GUARD_SEC), default 5s."""
+    from quanti.api.app import create_app
+    from quanti.data.provider import DataProvider
+
+    monkeypatch.delenv("QUANTI_INTRADAY_GUARD_SEC", raising=False)
+    app = create_app(db=db, provider=DataProvider(db), strategies_dir="strategies",
+                     autostart_background_sync=False)
+    assert app.state.agent._intraday_guard_sec == 5          # default
+
+    monkeypatch.setenv("QUANTI_INTRADAY_GUARD_SEC", "13")
+    app2 = create_app(db=db, provider=DataProvider(db), strategies_dir="strategies",
+                      autostart_background_sync=False)
+    assert app2.state.agent._intraday_guard_sec == 13        # env override

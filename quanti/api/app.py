@@ -52,17 +52,20 @@ def create_app(
                          initial_cash=initial_cash, fill_mode="pending",
                          strategies_dir=strategies_dir or "strategies")
     # Both accounts run the fast intraday guard (reconcile fills + exits +
-    # circuit breaker on a ~1min cadence). Live rides xtdata realtime quotes
-    # via the bridge; paper rides free Tencent quotes (execution.factory) so
-    # intraday stop hits are caught the day they happen instead of after the
-    # next daily bar lands. In-session paper SELLs fill immediately at the
-    # realtime quote (live-mirror); BUYs and off-session signals queue for
-    # the next open as before.
+    # circuit breaker). Cadence is env-tunable via QUANTI_INTRADAY_GUARD_SEC
+    # (default 5s) — the guard waits this long BETWEEN cycles (sequential, no
+    # overlap), so a lower value = faster fill-reconcile + stop-loss reaction.
+    # Live rides xtdata realtime quotes via the bridge; paper rides free Tencent
+    # quotes (execution.factory) so intraday stop hits are caught the day they
+    # happen instead of after the next daily bar lands. In-session paper SELLs
+    # fill immediately at the realtime quote (live-mirror); BUYs and off-session
+    # signals queue for the next open as before.
+    guard_sec = int(os.environ.get("QUANTI_INTRADAY_GUARD_SEC", "5") or 5)
     agent = AgentRuntime(
         db=db, provider=provider, broker=broker,
         strategies_dir=strategies_dir or "strategies",
         screeners_dir=screeners_dir or "screeners",
-        intraday_guard_sec=60)
+        intraday_guard_sec=guard_sec)
     # Independent daemon that keeps daily_quotes fresh, decoupled from the
     # agent's 4h tick. Auto-starts by default so cold-start users don't
     # have to know about it; tests pass autostart_background_sync=False
