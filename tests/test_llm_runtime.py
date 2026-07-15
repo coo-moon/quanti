@@ -189,6 +189,59 @@ class TestRunLLMDecision:
         assert len(logs) >= 1
         assert "一个 BUY" in logs[0]["summary"]
 
+    def test_llm_cycle_logs_broker_rejections(self, tmp_path):
+        """When the broker gates the LLM's buys (risk / protection layer), the
+        llm_cycle summary shows the reject count AND reason — not a bare
+        '0 成交' that reads like the proposed orders vanished. Regression for
+        the 'have 提单 but no 待成交订单' confusion."""
+        from datetime import datetime, timedelta
+        from quanti.risk.protections import ProtectionConfig
+
+        db, provider = _make_llm_db(tmp_path)
+        today = date.today()
+
+        def iso(d):
+            return datetime(d.year, d.month, d.day, 15, 0).isoformat()
+
+        # 3 stop-loss exits in the window → StoplossGuard locks all new BUYs.
+        for i, c in enumerate(["000010", "000020", "000030"]):
+            d = today - timedelta(days=i + 1)
+            db.insert_order({
+                "order_id": f"sl{i}", "code": c, "direction": "sell",
+                "quantity": 100, "price_type": "market", "limit_price": 0.0,
+                "status": "filled", "strategy_name": "risk_exit",
+                "filled_price": 9.0, "filled_quantity": 100,
+                "reason": "止损", "created_at": iso(d), "filled_at": iso(d),
+                "entry_strategy": "",
+            })
+        broker = PaperBroker(db, provider, initial_cash=1_000_000,
+                             fill_mode="pending",
+                             protection_config=ProtectionConfig(
+                                 sg_lookback_days=10, sg_trade_limit=3,
+                                 sg_lock_days=10, max_drawdown_enabled=False))
+        client = StubLLMClient([
+            _propose_block(orders=[{
+                "code": "000001", "direction": "buy",
+                "size_pct": 0.05, "reason": "看多"}], reasoning="买一只"),
+        ])
+        candidates = [FusedCandidate(
+            code="000001", strategy_score=0.7, factor_score=0.5,
+            final_score=0.7, industry="银行",
+            contributing_strategies=["ma_cross"])]
+        result = run_llm_decision(db=db, broker=broker, goal=Goal(),
+                                  candidates=candidates, llm_client=client)
+        assert result["filled"] == 0
+        logs = db.list_decisions(kind="llm_cycle")
+        assert logs
+        summary = logs[0]["summary"]
+        assert "1 单提议" in summary
+        assert "拒单" in summary and "StoplossGuard" in summary
+        details = logs[0]["details"]
+        assert details["n_rejected"] == 1
+        assert details["reject_reasons"] and \
+            any("StoplossGuard" in r for r in details["reject_reasons"])
+        db.close()
+
     def test_order_for_unvetted_code_rejected(self, llm_setup):
         """LLM may not propose codes that aren't in the candidate list."""
         db, _, broker = llm_setup

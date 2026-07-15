@@ -315,10 +315,19 @@ class PaperBroker:
         the whole holding is still T+1-frozen today. BUYs and off-session
         signals queue as before.
         """
+        return self._submit_one(signal, strategy_name)[0]
+
+    def _submit_one(self, signal: Signal,
+                    strategy_name: str) -> tuple[str, str]:
+        """One signal → (status, reject_reason). status is
+        "filled" | "pending" | "rejected"; reject_reason is the human-readable
+        cause when rejected (else ""). Split out from execute_signal_ex so
+        execute_signals can surface WHY a signal was turned away (into
+        BrokerResult.reasons, matching QmtBroker) without changing the
+        str-returning public method the API/tests depend on."""
         if self._fill_mode == "immediate":
-            return ("filled"
-                    if self._execute_signal_immediate(signal, strategy_name)
-                    else "rejected")
+            landed, reason = self._execute_signal_immediate(signal, strategy_name)
+            return ("filled" if landed else "rejected"), reason
         if signal.direction == Direction.SELL:
             price = self._intraday_marks([signal.stock_code]).get(signal.stock_code)
             if price and not self._limit_down_locked(signal.stock_code, price):
@@ -327,20 +336,21 @@ class PaperBroker:
                 if pos is None or self._sellable_qty(pos, date.today()) > 0:
                     # pos None → _sell_now records the "no position" reject
                     # now, instead of parking a doomed pending order.
-                    return ("filled"
-                            if self._sell_now(signal, strategy_name, price)
-                            else "rejected")
-        landed = self._queue_pending_signal(signal, strategy_name)
-        return "pending" if landed else "rejected"
+                    landed, reason = self._sell_now(signal, strategy_name, price)
+                    return ("filled" if landed else "rejected"), reason
+        landed, reason = self._queue_pending_signal(signal, strategy_name)
+        return ("pending" if landed else "rejected"), reason
 
     def execute_signals(self, signals: list[Signal],
                         strategy_name: str = "") -> BrokerResult:
         out = BrokerResult()
         for s in signals:
             out.accepted += 1
-            status = self.execute_signal_ex(s, strategy_name)
+            status, reason = self._submit_one(s, strategy_name)
             if status == "rejected":
                 out.rejected += 1
+                if reason:
+                    out.reasons.append(reason)
             elif status == "filled":
                 out.filled += 1
             else:
@@ -351,9 +361,12 @@ class PaperBroker:
 
     # ------------------------------ immediate (synchronous) execution path
     def _execute_signal_immediate(self, signal: Signal,
-                                  strategy_name: str) -> bool:
+                                  strategy_name: str) -> tuple[bool, str]:
         """Old behavior: fill synchronously against latest close. Used by
-        the backtest path and unit tests."""
+        the backtest path and unit tests. Returns (filled, reject_reason);
+        reject_reason is "" on a fill. Fill-stage failures (cash/T+1/capacity)
+        carry a coarse reason — the precise cause is already in the order row
+        and this path is backtest/test-only, not the live BUY route."""
         portfolio = self._build_runtime_portfolio()
         ok, reason, kind = self._entry_allowed(signal, portfolio)
         if not ok:
@@ -366,13 +379,13 @@ class PaperBroker:
                 code=signal.stock_code,
                 details={"signal_reason": signal.reason},
             )
-            return False
+            return False, reason
 
         bar = self._latest_bar(signal.stock_code)
         if bar is None:
             self._record_order(signal, strategy_name, status="rejected",
                                reason="no market data")
-            return False
+            return False, "无行情数据"
         ref_price, bar_date = float(bar.close), bar.date
 
         # Tradability gate: can't buy a limit-up lock or sell a limit-down lock
@@ -388,21 +401,27 @@ class PaperBroker:
                 code=signal.stock_code,
                 details={"bar_date": bar.date.isoformat(), "open": bar.open,
                          "prev_close": pc})
-            return False
+            return False, r
 
         if signal.direction == Direction.BUY:
-            return self._fill_buy(signal, ref_price, bar_date, strategy_name,
-                                  bar_amount=float(bar.amount or 0))
-        return self._fill_sell(signal, ref_price, bar_date, strategy_name,
-                               bar_amount=float(bar.amount or 0))
+            filled = self._fill_buy(signal, ref_price, bar_date, strategy_name,
+                                    bar_amount=float(bar.amount or 0))
+            return filled, ("" if filled else "买入未成交(资金/容量不足)")
+        filled = self._fill_sell(signal, ref_price, bar_date, strategy_name,
+                                 bar_amount=float(bar.amount or 0))
+        return filled, ("" if filled else "卖出未成交(T+1/无持仓/容量)")
 
     # ------------------------------ pending (queued) execution path
     def _queue_pending_signal(self, signal: Signal,
-                              strategy_name: str) -> bool:
+                              strategy_name: str) -> tuple[bool, str]:
         """Queue a signal as a PENDING order. Risk is checked at queue
         time AND again at fill time — early rejection saves writing rows
         for hopeless signals, but late rejection catches portfolio drift
         between queue and fill.
+
+        Returns (landed, reject_reason): landed True once the order rests in
+        the queue; reject_reason names the cause when it doesn't (risk cap /
+        protection guard / no position), "" for the silent dedup drop.
 
         Dedup: if there's already a pending order for the same (code,
         direction), the new signal is dropped to avoid stacked orders.
@@ -423,7 +442,7 @@ class PaperBroker:
                 code=signal.stock_code,
                 details={"signal_reason": signal.reason, "stage": "queue"},
             )
-            return False
+            return False, reason
 
         # Dedup against current pending queue
         for o in self._db.list_orders(limit=500, status="pending"):
@@ -431,8 +450,9 @@ class PaperBroker:
                 # Already have a pending order for this code+direction.
                 # Drop silently — no row, no log spam — so a strategy
                 # that emits the same signal every tick doesn't pollute
-                # the orders table.
-                return False
+                # the orders table. Empty reason keeps it out of the cycle
+                # summary too (it's an intentional no-op, not a real reject).
+                return False, ""
 
         # Reject SELL with no position immediately (cheap check).
         if signal.direction == Direction.SELL:
@@ -440,7 +460,7 @@ class PaperBroker:
             if signal.stock_code not in held:
                 self._record_order(signal, strategy_name,
                                    status="rejected", reason="no position")
-                return False
+                return False, "无持仓可卖"
 
         order_id = self._record_order(signal, strategy_name,
                                       status="pending", reason=signal.reason)
@@ -452,7 +472,7 @@ class PaperBroker:
                      "signal_reason": signal.reason,
                      "queued_strength": signal.strength},
         )
-        return True
+        return True, ""
 
     # ------------------------------ pending fill scanner
     def try_fill_pending_orders(self) -> PendingFillResult:
@@ -720,11 +740,13 @@ class PaperBroker:
         return raw_now <= raw_close * (1 - band) + 1e-9
 
     def _sell_now(self, signal: Signal, strategy_name: str,
-                  price: float) -> bool:
+                  price: float) -> tuple[bool, str]:
         """Fill a SELL immediately at the given in-session realtime mark (hfq
         axis; slippage/commission/T+1 via the normal _fill_sell path) — what a
         live market sell does. Yesterday's bar turnover proxies today's B1
         participation cap (there's no intraday turnover feed here).
+
+        Returns (filled, reject_reason): reject_reason is "" on a fill.
 
         Full-exit sells (anything but the 削峰 trim) that fill also supersede
         SELLs resting in the queue (no double-fill tomorrow) and re-queue any
@@ -748,7 +770,7 @@ class PaperBroker:
                          if p["code"] == signal.stock_code), None)
             if left is not None and left["quantity"] > 0:
                 self._queue_pending_signal(signal, strategy_name)
-        return filled
+        return filled, ("" if filled else "卖出未成交(T+1/无持仓/容量)")
 
     def enforce_portfolio_stop(self) -> bool:
         """Portfolio drawdown circuit breaker: if equity is down past
