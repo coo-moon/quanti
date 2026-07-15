@@ -260,6 +260,44 @@ def test_protection_blocks_buy_after_stop_loss_cluster(tmp_path):
     assert ok2 is True
 
 
+def test_execute_signals_reports_reject_reasons(tmp_path):
+    """A gated BUY surfaces its reason in BrokerResult.reasons (parity with
+    QmtBroker), so the caller can report WHY it was turned away — not just a
+    bare rejected count. Regression: PaperBroker used to leave reasons empty."""
+    from datetime import datetime, timedelta
+    from quanti.risk.protections import ProtectionConfig
+
+    db = Database(str(tmp_path / "rr.db"))
+    db.initialize()
+    provider = DataProvider(db)
+    today = date.today()
+
+    def iso(d):
+        return datetime(d.year, d.month, d.day, 15, 0).isoformat()
+
+    # 3 stop-loss exits in the window → StoplossGuard locks all new BUYs.
+    for i, c in enumerate(["000001", "000002", "000003"]):
+        d = today - timedelta(days=i + 1)
+        db.insert_order({
+            "order_id": f"o{i}", "code": c, "direction": "sell",
+            "quantity": 100, "price_type": "market", "limit_price": 0.0,
+            "status": "filled", "strategy_name": "risk_exit",
+            "filled_price": 9.0, "filled_quantity": 100,
+            "reason": "止损", "created_at": iso(d), "filled_at": iso(d),
+            "entry_strategy": "",
+        })
+    broker = PaperBroker(db, provider, initial_cash=200_000,
+                         fill_mode="pending",
+                         protection_config=ProtectionConfig(
+                             sg_lookback_days=10, sg_trade_limit=3,
+                             sg_lock_days=10, max_drawdown_enabled=False))
+    result = broker.execute_signals(
+        [Signal("600519", Direction.BUY, 1.0, "buy")], "llm")
+    assert result.rejected == 1
+    assert result.filled == 0 and result.pending == 0
+    assert result.reasons and any("StoplossGuard" in r for r in result.reasons)
+
+
 def test_volume_cap_limits_immediate_buy(tmp_path):
     """B1: PaperBroker's fill is capped at 25% of the bar's turnover too, so
     backtest and paper agree on capacity (not just the backtest)."""

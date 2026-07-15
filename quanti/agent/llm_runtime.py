@@ -887,6 +887,14 @@ def run_llm_decision(
     result = broker.execute_signals(signals, strategy_name="llm")
     snapshot = broker.snapshot_portfolio()
 
+    # Broker-layer rejections (risk caps / protection guards / T+1 / cash /
+    # 涨跌停) — the real reason a proposed order never became a resting or
+    # filled order. Order-preserving dedup so identical guard hits (e.g. a
+    # global StoplossGuard lock blocking every BUY) show once. Distinct from
+    # `rejection_reasons` above, which are LLM-layer prunes (unvetted code /
+    # oversize / risk-triad veto) applied BEFORE the order reached the broker.
+    broker_reject_reasons = list(dict.fromkeys(result.reasons))
+
     log_payload = {
         # Ground truth, not the requested alias: provider clients may remap
         # (e.g. claude-* → deepseek-v4-pro). Anthropic client has no remap.
@@ -896,6 +904,9 @@ def run_llm_decision(
         "n_proposed": len(proposed),
         "n_valid": len(valid_orders),
         "rejections": rejection_reasons,
+        "n_rejected": result.rejected,
+        "reject_reasons": broker_reject_reasons,
+        "n_pending": result.pending,
         "filled": result.filled,
         "stop_loss_filled": sl_count,
         "usage": debug.get("usage", {}),
@@ -904,10 +915,24 @@ def run_llm_decision(
         "risk_review": risk_review,
         "n_reflections": len(reflections),
     }
-    db.log_decision(
-        "llm_cycle",
-        f"LLM 决策: {len(valid_orders)} 单提议, {result.filled} 成交 — {reasoning[:120]}",
-        details=log_payload)
+    # Summary shows the full fate of the proposed orders in one line:
+    # 提议 → 成交 / 挂单 / 拒单(原因). Before this, "N 单提议, 0 成交" looked like
+    # the orders vanished — you had to dig into the separate protection_block /
+    # risk_reject entries to learn they were gated. Reasons are truncated so the
+    # line stays readable; the full list lives in details.reject_reasons.
+    parts = [f"{len(valid_orders)} 单提议", f"{result.filled} 成交"]
+    if result.pending:
+        parts.append(f"{result.pending} 挂单")
+    if result.rejected:
+        seg = f"{result.rejected} 拒单"
+        if broker_reject_reasons:
+            joined = "；".join(broker_reject_reasons)
+            seg += f"({joined[:80]}…)" if len(joined) > 80 else f"({joined})"
+        parts.append(seg)
+    summary = "LLM 决策: " + ", ".join(parts)
+    if reasoning:
+        summary += f" — {reasoning[:120]}"
+    db.log_decision("llm_cycle", summary, details=log_payload)
 
     return {
         "ok": True,
