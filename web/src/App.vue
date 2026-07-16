@@ -45,6 +45,13 @@
             </svg>
             股票池
           </router-link>
+          <router-link to="/etf-grid" class="nav-link">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <rect x="1.5" y="1.5" width="13" height="13" rx="1.5" stroke="currentColor" stroke-width="1.5" />
+              <path d="M6 1.5v13M10 1.5v13M1.5 6h13M1.5 10h13" stroke="currentColor" stroke-width="1" />
+            </svg>
+            网格挖掘
+          </router-link>
           <router-link to="/risk" class="nav-link">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path d="M8 1l6 2.5V8c0 3.5-2.5 6-6 7-3.5-1-6-3.5-6-7V3.5L8 1z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
