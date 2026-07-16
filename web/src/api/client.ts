@@ -552,3 +552,115 @@ export const saveDataSource = (source: string, token?: string | null) =>
 
 export default api;
 
+
+// --- ETF 网格挖掘器 ---
+export interface EtfGridStatus {
+  codes: number;
+  start: string | null;
+  end: string | null;
+  rows: number;
+  has_token: boolean;
+  universe: number;
+}
+export interface EtfScreenRow {
+  code: string;
+  name: string;
+  category: string;
+  t0: boolean;
+  price: number;
+  grid_score: number;
+  er: number;
+  vol: number;
+  amp: number;
+  net: number;
+  pos: number;
+  rev: number;
+  adv: number;
+  days: number;
+  grid_ret?: number;
+  hold_ret?: number;
+  grid_dd?: number;
+  hold_dd?: number;
+  bt_trades?: number;
+  box_lo: number;
+  box_hi: number;
+  grids: number;
+  step: number;
+  step_pct: number;
+  stop: number;
+}
+export interface EtfDeploy {
+  box_lo: number;
+  box_hi: number;
+  price: number;
+  grids: number;
+  step: number;
+  step_pct: number;
+  stop: number;
+}
+export interface EtfBacktestResult {
+  grid_ret: number;
+  hold_ret: number;
+  grid_dd: number;
+  hold_dd: number;
+  trades: number;
+  start: string;
+  end: string;
+  grid_curve: Record<string, number>;
+  hold_curve: Record<string, number>;
+  deploy: EtfDeploy;
+  name: string;
+  category: string;
+  t0: boolean;
+  error?: string;
+}
+export interface EtfOptimizeRow {
+  N: number;
+  box: string;
+  spacing: string;
+  trim: string;
+  mean: number;
+  worst: number;
+  dd: number;
+  beat_hold: string;
+  trades: number;
+  per_quarter: Record<string, number>;
+}
+export interface EtfOptimizeResult {
+  code: string;
+  name: string;
+  quarters: string[];
+  holds: Record<string, number>;
+  robust: EtfOptimizeRow[];
+  overfit: EtfOptimizeRow[];
+  best: EtfOptimizeRow;
+  deploy: EtfDeploy;
+  error?: string;
+}
+
+export const fetchEtfGridStatus = () =>
+  api.get<EtfGridStatus>("/etf-grid/status");
+export const runEtfSyncAsync = () =>
+  api.post<{ job_id?: string; error?: string }>("/etf-grid/sync/async");
+export const fetchEtfSyncStatus = (jobId: string) =>
+  api.get<{ current: number; total: number; status: string; errors?: unknown }>(
+    "/etf-grid/sync/status",
+    { params: { job_id: jobId } },
+  );
+export const screenEtfGrid = (advMin = 1e8) =>
+  api.post<{ results?: EtfScreenRow[]; count?: number; error?: string }>(
+    "/etf-grid/screen",
+    null,
+    { params: { adv_min: advMin } },
+  );
+export const backtestEtfGrid = (req: {
+  code: string;
+  start?: string;
+  N?: number;
+  lookback?: number;
+  rebal?: number;
+  geom?: boolean;
+  trim?: boolean;
+}) => api.post<EtfBacktestResult>("/etf-grid/backtest", req);
+export const optimizeEtfGrid = (code: string) =>
+  api.post<EtfOptimizeResult>("/etf-grid/optimize", null, { params: { code } });

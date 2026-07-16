@@ -1627,3 +1627,131 @@ async def optimize_status(job_id: str, request: Request):
 async def tuned_params(request: Request):
     """Return all stored optimization results (tuned strategy parameters)."""
     return request.app.state.db.list_optimization_results()
+
+
+# --- ETF 网格挖掘器 -----------------------------------------------------------
+# 挖掘近期适合网格「稳定套现」的 ETF + 回测 + 参数优化(多季度样本外验证)。
+# ETF 数据 market.db 无, 独立从 tushare 拉(fund_daily/fund_adj)缓存到 etf_daily 表。
+# 立场: 网格无 alpha, 稳定成立的只有降回撤; UI 需显式呈现此风险。
+
+class EtfBacktestRequest(BaseModel):
+    code: str
+    start: str = ""              # YYYY-MM-DD, 空=数据末尾往前半年
+    N: int = 10
+    lookback: int = 60
+    rebal: int = 0               # 0=固定箱体(更稳健), >0=每 N 日重设
+    geom: bool = False
+    trim: bool = True
+
+
+@router.get("/etf-grid/status")
+async def etf_grid_status(request: Request):
+    """ETF 缓存状态 + 是否已配置 tushare token(基金接口)。"""
+    from quanti.data.source import tushare_token
+    from quanti.etf_grid import data as etf_data
+    db = request.app.state.db
+    st = etf_data.cache_status(db)
+    st["has_token"] = bool(tushare_token(db))
+    st["universe"] = len(etf_data.ETF_UNIVERSE)
+    return st
+
+
+@router.post("/etf-grid/sync/async")
+async def etf_grid_sync_async(request: Request):
+    """拉取 ETF 全集日线到 etf_daily(异步)。返回 job_id, 轮询 /etf-grid/sync/status。"""
+    from quanti.data.source import tushare_token
+    from quanti.etf_grid import data as etf_data
+    db = request.app.state.db
+    if not tushare_token(db):
+        return {"error": "未配置 tushare token（去『数据源配置』填入，基金接口需 2000 积分权限）"}
+    job_id = f"etfsync_{str(uuid.uuid4())[:8]}"
+    db.create_sync_job(job_id, "_etf_sync", len(etf_data.ETF_UNIVERSE))
+    asyncio.create_task(_run_etf_sync(job_id, request.app.state))
+    return {"job_id": job_id}
+
+
+async def _run_etf_sync(job_id: str, state) -> None:
+    from quanti.data.source import tushare_token
+    from quanti.etf_grid import data as etf_data
+    db = state.db
+    loop = asyncio.get_event_loop()
+
+    def work() -> None:
+        token = tushare_token(db)
+        end = date.today().strftime("%Y%m%d")
+        start = (date.today() - timedelta(days=1100)).strftime("%Y%m%d")
+        db.update_sync_job(job_id, 0, "running", {})
+
+        def prog(cur, total, msg):
+            db.update_sync_job(job_id, cur, "running", {})
+
+        res = etf_data.sync_universe(db, token, start, end, progress=prog)
+        db.update_sync_job(job_id, res["ok"], "done",
+                           {"failed": res["failed"]} if res["failed"] else {})
+
+    try:
+        await loop.run_in_executor(None, work)
+    except Exception as e:  # noqa: BLE001
+        db.update_sync_job(job_id, 0, "error", {"error": str(e)})
+
+
+@router.get("/etf-grid/sync/status")
+async def etf_grid_sync_status(request: Request, job_id: str):
+    job = request.app.state.db.get_sync_job(job_id)
+    if not job:
+        return {"error": "job not found"}
+    return {"current": job["current"], "total": job["total"],
+            "status": job["status"], "errors": job.get("errors", {})}
+
+
+@router.post("/etf-grid/screen")
+async def etf_grid_screen(request: Request, adv_min: float = 1e8):
+    """挖掘: 从缓存里筛出近期适合网格「稳定套现」的 ETF(低ER+净≈0+高穿越+足流动)。"""
+    from quanti.etf_grid import grid as etf_grid
+    db = request.app.state.db
+    rows = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: etf_grid.screen(db, adv_min=adv_min))
+    if not rows:
+        return {"error": "无 ETF 缓存或无达标标的，请先『同步ETF数据』", "results": []}
+    return {"results": rows, "count": len(rows)}
+
+
+@router.post("/etf-grid/backtest")
+async def etf_grid_backtest(body: EtfBacktestRequest, request: Request):
+    """单只 ETF 网格 vs 买入持有回测, 含净值曲线。"""
+    from quanti.etf_grid import data as etf_data
+    from quanti.etf_grid import grid as etf_grid
+    db = request.app.state.db
+    bars = etf_data.read_etf(db, body.code)
+    if bars is None:
+        return {"error": f"{body.code} 无缓存数据，请先同步"}
+    start = body.start
+    if not start:
+        from datetime import date as _date
+        start = (_date.fromisoformat(str(bars.dates[-1])) - timedelta(days=190)).isoformat()
+    bt = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: etf_grid.backtest(bars, start, N=body.N, lookback=body.lookback,
+                                         rebal=body.rebal, geom=body.geom, trim=body.trim))
+    if bt is None:
+        return {"error": "数据不足以回测(需 lookback + 起投窗)"}
+    bt["deploy"] = etf_grid.deployable_box(bars, lookback=body.lookback, N=body.N, trim=body.trim)
+    name, cat, t0 = etf_data.ETF_META.get(body.code, (body.code, "", False))
+    bt["name"], bt["category"], bt["t0"] = name, cat, t0
+    return bt
+
+
+@router.post("/etf-grid/optimize")
+async def etf_grid_optimize(request: Request, code: str):
+    """参数扫描 + 多季度样本外验证, 输出稳健箱体/格数 + 过拟合反例对照。"""
+    from quanti.etf_grid import data as etf_data
+    from quanti.etf_grid import grid as etf_grid
+    db = request.app.state.db
+    bars = etf_data.read_etf(db, code)
+    if bars is None:
+        return {"error": f"{code} 无缓存数据，请先同步"}
+    opt = await asyncio.get_event_loop().run_in_executor(None, lambda: etf_grid.optimize(bars))
+    if opt is None:
+        return {"error": "历史数据不足(需≥3个季度)以做样本外验证"}
+    name, cat, t0 = etf_data.ETF_META.get(code, (code, "", False))
+    opt["code"], opt["name"], opt["category"], opt["t0"] = code, name, cat, t0
+    return opt
