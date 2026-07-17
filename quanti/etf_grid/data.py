@@ -59,6 +59,38 @@ ETF_UNIVERSE: list[tuple[str, str, str, bool]] = [
     ("513050.SH", "中概互联ETF", "跨境T0", True),
     ("513180.SH", "恒生科技ETF", "跨境T0", True),
     ("159941.SZ", "纳指ETFSZ", "跨境T0", True),
+    # 扩充：更多债券/T+0
+    ("511360.SH", "短融ETF", "债券T0", True),
+    ("511030.SH", "公司债ETF", "债券T0", True),
+    ("511220.SH", "城投债ETF", "债券T0", True),
+    ("511020.SH", "活跃国债ETF", "债券T0", True),
+    ("159649.SZ", "国开债ETF", "债券T0", True),
+    # 扩充：更多行业/主题
+    ("515170.SH", "食品饮料ETF", "行业", False),
+    ("159996.SZ", "家电ETF", "行业", False),
+    ("516110.SH", "汽车ETF", "行业", False),
+    ("515070.SH", "人工智能ETF", "行业", False),
+    ("159819.SZ", "人工智能ETFSZ", "行业", False),
+    ("515220.SH", "煤炭ETF", "行业", False),
+    ("515210.SH", "钢铁ETF", "行业", False),
+    ("516020.SH", "化工ETF", "行业", False),
+    ("159825.SZ", "农业ETF", "行业", False),
+    ("159865.SZ", "养殖ETF", "行业", False),
+    ("560080.SH", "中药ETF", "行业", False),
+    ("159755.SZ", "电池ETF", "行业", False),
+    ("512670.SH", "国防ETF", "行业", False),
+    ("512720.SH", "计算机ETF", "行业", False),
+    ("515030.SH", "新能源车ETF", "行业", False),
+    ("159869.SZ", "游戏ETF", "行业", False),
+    ("512290.SH", "生物医药ETF", "行业", False),
+    ("159766.SZ", "旅游ETF", "行业", False),
+    ("516510.SH", "云计算ETF", "行业", False),
+    ("588080.SH", "科创板50ETF", "宽基", False),
+    # 扩充：更多跨境 T+0
+    ("159920.SZ", "恒生ETF", "跨境T0", True),
+    ("513330.SH", "恒生互联网ETF", "跨境T0", True),
+    ("513060.SH", "恒生医疗ETF", "跨境T0", True),
+    ("159607.SZ", "中概互联SZ", "跨境T0", True),
 ]
 ETF_META = {c: (name, cat, t0) for c, name, cat, t0 in ETF_UNIVERSE}
 
