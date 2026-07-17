@@ -54,6 +54,10 @@
         </div>
       </div>
       <div v-if="screenError" class="alert alert-error mt">{{ screenError }}</div>
+      <div v-if="rows.length" class="cat-filter mt">
+        <button v-for="[c, n] in categories" :key="c" class="chip" :class="{ active: catFilter === c }"
+          @click="catFilter = c">{{ c }} <span class="chip-n">{{ n }}</span></button>
+      </div>
       <div v-if="rows.length" class="table-wrap mt">
         <table>
           <thead>
@@ -64,8 +68,8 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="(r, i) in rows" :key="r.code" :class="{ sel: r.code === selected }">
-              <td><span class="rank" :class="rankCls(i)">{{ i + 1 }}</span></td>
+            <tr v-for="r in filteredRows" :key="r.code" :class="{ sel: r.code === selected }">
+              <td><span class="rank" :class="rankCls(rankOf(r) - 1)">{{ rankOf(r) }}</span></td>
               <td><span class="code-badge">{{ r.code }}</span></td>
               <td>{{ r.name }}<span v-if="r.t0" class="t0-tag">T+0</span></td>
               <td class="td-muted">{{ r.category }}</td>
@@ -238,6 +242,18 @@ const screening = ref(false);
 const screened = ref(false);
 const screenError = ref("");
 const rows = ref<EtfScreenRow[]>([]);
+const catFilter = ref("全部");
+const categories = computed<[string, number][]>(() => {
+  const m = new Map<string, number>();
+  for (const r of rows.value) m.set(r.category, (m.get(r.category) ?? 0) + 1);
+  return [["全部", rows.value.length], ...m.entries()];
+});
+const filteredRows = computed(() =>
+  catFilter.value === "全部"
+    ? rows.value
+    : rows.value.filter((r) => r.category === catFilter.value),
+);
+const rankOf = (r: EtfScreenRow) => rows.value.indexOf(r) + 1;
 
 const selected = ref("");
 const selectedName = ref("");
@@ -312,6 +328,7 @@ async function doScreen() {
     } else {
       rows.value = res.data.results ?? [];
     }
+    catFilter.value = "全部";
     screened.value = true;
   } catch (e) {
     console.error(e);
@@ -415,6 +432,12 @@ onUnmounted(stopSyncPoll);
 .form-group label { font-size: 12px; color: var(--color-text-secondary); }
 .form-group input, .select-wrap select { padding: 8px 10px; border-radius: var(--radius-sm); border: 1px solid var(--color-border, #d2d2d7); font-size: 14px; width: 100%; }
 .form-actions { flex-direction: row; gap: 10px; }
+.cat-filter { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { border: 1px solid var(--color-border, #d2d2d7); background: var(--color-surface); color: var(--color-text-secondary);
+  border-radius: 980px; padding: 4px 12px; font-size: 13px; cursor: pointer; transition: var(--transition); }
+.chip:hover { border-color: var(--color-accent); }
+.chip.active { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+.chip-n { font-variant-numeric: tabular-nums; opacity: 0.7; margin-left: 2px; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th { text-align: left; padding: 8px 10px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--color-text-tertiary); border-bottom: 1px solid var(--color-border, #e5e5ea); white-space: nowrap; }
