@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -724,6 +725,7 @@ def run_llm_decision(
     candidates: list[FusedCandidate],
     llm_client: LLMClient,
     cfg: LLMConfig | None = None,
+    broker_gate=None,
 ) -> dict:
     """Top-level entry. Composes context → LLM loop → execution → log.
 
@@ -733,6 +735,12 @@ def run_llm_decision(
     On any LLM failure, falls back to "no LLM orders this tick" — the
     legacy ensemble path's signals (if any) are NOT re-run here; the
     caller decides the fallback strategy.
+
+    `broker_gate` is an optional context-manager factory wrapping the
+    execution tail (exits → rotation → buys). AgentRuntime passes
+    `_broker_exec` so those mutations serialize against the intraday guard
+    while the minutes of LLM I/O above stay lock-free; it may raise to abort
+    the tick (portfolio breaker tripped mid-flight). Defaults to no gate.
     """
     cfg = cfg or LLMConfig()
     portfolio = broker.snapshot_portfolio()
@@ -879,26 +887,30 @@ def run_llm_decision(
         for o in valid_orders
     ]
 
-    # Exits first (stop-loss / strategy / take-profit), then LLM buys.
-    sl_count = broker.check_exits()
+    # Everything below mutates the book — one short critical section, so the
+    # intraday guard's stop-loss keeps running through the LLM legs above.
+    with (broker_gate or nullcontext)():
+        # Exits first (stop-loss / strategy / take-profit), then LLM buys.
+        sl_count = broker.check_exits()
 
-    # Score-gated rotation (换仓, opt-in): if the book is full, free the weakest
-    # holding so a clearly-stronger LLM pick can be funded. The LLM's picks are
-    # a subset of `candidates`, so their final_score still applies. Runs after
-    # check_exits (post-exit cash/positions) and before the buys, so the freed
-    # cash funds them.
-    rot_sells = _rotation_sells_if_enabled(db, broker, candidates, valid_orders)
-    if rot_sells:
-        broker.execute_signals(rot_sells, strategy_name="rotation")
-        db.log_decision(
-            "rotation",
-            f"换仓 释放 {len(rot_sells)} 个弱仓为更强候选腾位: "
-            + ", ".join(s.stock_code for s in rot_sells),
-            details={"sells": [{"code": s.stock_code, "reason": s.reason}
-                               for s in rot_sells]})
+        # Score-gated rotation (换仓, opt-in): if the book is full, free the
+        # weakest holding so a clearly-stronger LLM pick can be funded. The
+        # LLM's picks are a subset of `candidates`, so their final_score still
+        # applies. Runs after check_exits (post-exit cash/positions) and before
+        # the buys, so the freed cash funds them.
+        rot_sells = _rotation_sells_if_enabled(db, broker, candidates,
+                                               valid_orders)
+        if rot_sells:
+            broker.execute_signals(rot_sells, strategy_name="rotation")
+            db.log_decision(
+                "rotation",
+                f"换仓 释放 {len(rot_sells)} 个弱仓为更强候选腾位: "
+                + ", ".join(s.stock_code for s in rot_sells),
+                details={"sells": [{"code": s.stock_code, "reason": s.reason}
+                                   for s in rot_sells]})
 
-    result = broker.execute_signals(signals, strategy_name="llm")
-    snapshot = broker.snapshot_portfolio()
+        result = broker.execute_signals(signals, strategy_name="llm")
+        snapshot = broker.snapshot_portfolio()
 
     # Broker-layer rejections (risk caps / protection guards / T+1 / cash /
     # 涨跌停) — the real reason a proposed order never became a resting or

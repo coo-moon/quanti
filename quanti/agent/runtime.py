@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -72,6 +73,12 @@ def _seconds_until_daily(now: datetime, hour: int, minute: int) -> float:
     if target <= now:
         target += timedelta(days=1)
     return (target - now).total_seconds()
+
+
+class CycleHalted(Exception):
+    """The portfolio circuit breaker tripped (intraday guard) while this tick
+    was still computing. Raised by `AgentRuntime._broker_exec` so the tick
+    aborts instead of buying back into a book that was just flattened."""
 
 
 @dataclass
@@ -138,9 +145,19 @@ class AgentRuntime:
         # observe-only "pool_vs_passive" active-vs-passive guardrail log
         self._thread: threading.Thread | None = None
         self._guard_thread: threading.Thread | None = None
-        # Serializes broker mutations between the full tick and the intraday
-        # guard thread (RLock: the in-cycle cache-miss recursion re-enters).
+        # Serializes broker MUTATIONS between the tick and the intraday guard
+        # thread. Held only for the short mutating segments of a tick (see
+        # `_broker_exec`), never across the compute stages — those can take
+        # minutes and the guard would starve. RLock so a nested critical
+        # section (e.g. `_set_cycle_sizer` inside one) doesn't self-deadlock.
         self._broker_lock = threading.RLock()
+        # Serializes tick-vs-tick (loop thread vs the manual /api tick button).
+        # This is what `_broker_lock` used to do by being held end-to-end.
+        # RLock: the strategy-cache-miss path recurses into _run_one_cycle.
+        self._cycle_lock = threading.RLock()
+        # Set by whichever thread fires the portfolio circuit breaker; checked
+        # under `_broker_lock` before every tick mutation (see `_broker_exec`).
+        self._breaker_flag = threading.Event()
         self._stop_flag = threading.Event()
         self._status = AgentStatus()
         self._lock = threading.Lock()
@@ -306,6 +323,9 @@ class AgentRuntime:
                 logger.warning("guard fill reconcile failed: %s", e)
             try:
                 if self._broker.enforce_portfolio_stop():
+                    # Flag first: a tick may be mid-compute right now and must
+                    # not place its buys into the book we just flattened.
+                    self._breaker_flag.set()
                     self._db.log_decision("cycle_halt", "盘中组合熔断:已清仓并暂停 agent")
                     self.stop()
                     return
@@ -851,21 +871,27 @@ class AgentRuntime:
         reset, so a sizer injected at broker construction survives an
         equal-weight toggle. No-op returning False on brokers without a sizer
         slot (e.g. QmtBroker, which sizes via cash%/risk-cap and ignores
-        Sizer)."""
+        Sizer).
+
+        Takes `_broker_lock` itself (it's a broker mutation, and it is called
+        from the lock-free compute stages) — the guard only ever sells, which
+        the sizer doesn't size, but the invariant "no concurrent broker
+        mutation" is cheaper to keep than to reason about."""
         setter = getattr(self._broker, "set_sizer", None)
         if setter is None:
             return False
-        if weight_per_name is not None:
-            from quanti.risk.sizer import FixedSizer
-            if not self._equal_weight_active:
-                self._prev_sizer = getattr(self._broker, "_sizer", None)
-            setter(FixedSizer(max_pct=min(1.0, weight_per_name)))
-            self._equal_weight_active = True
-            return True
-        if self._equal_weight_active:
-            setter(self._prev_sizer)
-            self._equal_weight_active = False
-        return False
+        with self._broker_lock:
+            if weight_per_name is not None:
+                from quanti.risk.sizer import FixedSizer
+                if not self._equal_weight_active:
+                    self._prev_sizer = getattr(self._broker, "_sizer", None)
+                setter(FixedSizer(max_pct=min(1.0, weight_per_name)))
+                self._equal_weight_active = True
+                return True
+            if self._equal_weight_active:
+                setter(self._prev_sizer)
+                self._equal_weight_active = False
+            return False
 
     def _build_llm_client(self, params: dict):
         """Construct an LLM client per goal.params['llm_provider'].
@@ -937,56 +963,96 @@ class AgentRuntime:
                     "LLM 未安装,降级到 ensemble 路径",
                     details={"error": str(e)})
                 signals = [c.to_signal() for c in fused]
-                sl = self._broker.check_exits()
-                result = self._broker.execute_signals(signals, "ensemble_fallback")
-                snap = self._broker.snapshot_portfolio()
+                with self._broker_exec():
+                    sl = self._broker.check_exits()
+                    result = self._broker.execute_signals(signals,
+                                                          "ensemble_fallback")
+                    snap = self._broker.snapshot_portfolio()
                 return {"ok": True, "signals": len(signals),
                         "filled": result.filled, "rejected": result.rejected,
                         "stop_loss_filled": sl, "snapshot": snap,
                         "evaluations": evaluations,
                         "strategy": "ensemble_fallback"}
 
+        # The LLM leg (debate + judgment + risk triad) is minutes of network
+        # I/O and must NOT hold `_broker_lock`; only its execution tail does,
+        # via this gate. See `_broker_exec`.
         return run_llm_decision(
             db=self._db, broker=self._broker, goal=goal,
             candidates=fused, llm_client=client, cfg=cfg,
+            broker_gate=self._broker_exec,
         ) | {"evaluations": evaluations, "strategy": "llm"}
 
     # ----------------------------------------------------- the actual cycle
-    def _run_one_cycle(self) -> dict:
-        # Serialize with the intraday guard thread — both mutate broker state
-        # (fills / exits / portfolio stop), so they must never run concurrently.
+    @contextmanager
+    def _broker_exec(self):
+        """Critical section around a tick's broker mutations.
+
+        The whole cycle body used to run under `_broker_lock`, which starved
+        the 5s intraday guard for as long as a tick took: production logs show
+        2026-07-24 10:04:58 → 10:14:07, i.e. 9m09s of an open book with no
+        stop-loss, no fill reconcile and no circuit breaker. Now only the
+        mutating segments take the lock (fills+breaker, sizer install, exits→
+        rotation→execute); the compute stages in between — data refresh,
+        screener, factor panel, walk-forward selection, LLM debate/decision —
+        run lock-free, so the guard gets in every 5s as designed.
+
+        The guard's intent is preserved: every broker mutation on either side
+        still happens under this lock, so tick and guard never mutate
+        concurrently. What they may now do is *interleave* — hence the
+        breaker re-check: if the guard flattened and halted the agent while we
+        were computing, buying back in would undo the circuit breaker.
+        """
         with self._broker_lock:
-            return self._run_cycle_body()
+            if self._breaker_flag.is_set():
+                raise CycleHalted("组合熔断已触发,本轮放弃下单")
+            yield
+
+    def _run_one_cycle(self) -> dict:
+        # Tick-vs-tick exclusion only (manual /api tick vs the loop thread).
+        # Serialization against the intraday guard is per-mutation now — see
+        # `_broker_exec`.
+        with self._cycle_lock:
+            try:
+                return self._run_cycle_body()
+            except CycleHalted as e:
+                logger.warning("cycle aborted mid-flight: %s", e)
+                return {"ok": True, "halted": True, "reason": str(e)}
 
     def _run_cycle_body(self) -> dict:
         ts = datetime.now().isoformat()
+        self._breaker_flag.clear()  # fresh cycle; the breaker re-runs below
         goal = load_goal(self._db)
 
         # FIRST: try to fill any pending orders from prior ticks. This must
         # happen before new signal generation so today's fills update cash
         # / positions before any new sizing decisions are made. Safe to call
         # in immediate-fill mode too — returns 0-scanned and exits.
-        try:
-            pending_result = self._broker.try_fill_pending_orders()
-        except AttributeError:
-            # Broker without pending support (legacy / test stub).
-            pending_result = None
+        with self._broker_exec():
+            try:
+                pending_result = self._broker.try_fill_pending_orders()
+            except AttributeError:
+                # Broker without pending support (legacy / test stub).
+                pending_result = None
 
-        # Portfolio drawdown circuit breaker — if equity has fallen past the
-        # portfolio stop from its high-water mark, flatten everything and halt
-        # the agent. Last line of defense before deeper losses; runs before any
-        # new signal generation.
-        try:
-            if self._broker.enforce_portfolio_stop():
-                summary = "组合回撤熔断：已清仓并暂停 agent"
-                self._db.log_decision("cycle_halt", summary)
-                self.stop()  # disables goal + sets stop flag (no self-join)
-                with self._lock:
-                    self._status.last_tick_at = ts
-                    self._status.last_tick_summary = summary
-                return {"ok": True, "halted": True, "reason": summary}
-        except AttributeError:
-            pass  # broker without circuit-breaker support (test stub)
+            # Portfolio drawdown circuit breaker — if equity has fallen past the
+            # portfolio stop from its high-water mark, flatten everything and
+            # halt the agent. Last line of defense before deeper losses; runs
+            # before any new signal generation. Same critical section as the
+            # fills above so the breaker's read-peak-then-snapshot sequence
+            # can't be interleaved by the guard's own snapshot (audit G3/L2).
+            try:
+                if self._broker.enforce_portfolio_stop():
+                    self._breaker_flag.set()
+                    summary = "组合回撤熔断：已清仓并暂停 agent"
+                    self._db.log_decision("cycle_halt", summary)
+                    self.stop()  # disables goal + sets stop flag (no self-join)
+                    with self._lock:
+                        self._status.last_tick_at = ts
+                        self._status.last_tick_summary = summary
+                    return {"ok": True, "halted": True, "reason": summary}
+            except AttributeError:
+                pass  # broker without circuit-breaker support (test stub)
 
         universe = self._resolve_universe(goal)
         if not universe:
@@ -1007,13 +1073,12 @@ class AgentRuntime:
         # context when goal.params["regime_in_prompt"] is on (see
         # quanti/regime/prompt.py).
         #
-        # READ, never compute. `_run_one_cycle` holds `_broker_lock` for this
-        # whole body and the intraday guard (stop-loss, portfolio breaker,
-        # fill reconcile) contends for the same lock — production logs already
-        # show a 9-minute guard gap from a slow tick. `load_latest` is one
-        # indexed row (~1ms); `report.generate()` would be 10s of full-market
-        # pandas plus an LLM call up to 300s, i.e. that many minutes with no
-        # stop-loss. Never call generate() from inside a tick.
+        # READ, never compute. `load_latest` is one indexed row (~1ms);
+        # `report.generate()` would be 10s of full-market pandas plus an LLM
+        # call up to 300s. That no longer blocks the intraday guard (the tick
+        # only takes `_broker_lock` for its mutating segments — see
+        # `_broker_exec`), but it would still stall the tick's own exits and
+        # buys by that long. Never call generate() from inside a tick.
         if (goal.params or {}).get("regime_detect"):
             try:
                 from quanti.regime.prompt import PARAM as _REGIME_PROMPT_PARAM
@@ -1224,25 +1289,30 @@ class AgentRuntime:
         # sells echoing "positions" that only existed in the backtest. Real
         # sells should come from RiskManager.check_stop_loss() or live
         # position-tracking signals.
-        held = {p["code"] for p in self._db.list_positions()}
-        signals = [s for s in signals
-                   if not (s.direction == Direction.SELL and s.stock_code not in held)]
+        # One critical section for everything that touches the book: the guard
+        # must not slip an exit between our position read and our orders.
+        with self._broker_exec():
+            held = {p["code"] for p in self._db.list_positions()}
+            signals = [s for s in signals
+                       if not (s.direction == Direction.SELL
+                               and s.stock_code not in held)]
 
-        # Risk exits first (stop-loss / strategy / take-profit) so we free
-        # cash before new buys.
-        sl_count = self._broker.check_exits()
+            # Risk exits first (stop-loss / strategy / take-profit) so we free
+            # cash before new buys.
+            sl_count = self._broker.check_exits()
 
-        # Score-gated rotation (换仓, opt-in): if the book is full, free the
-        # weakest holding so a clearly-stronger fresh candidate can be funded.
-        # Runs AFTER check_exits so it sees the post-exit cash/positions and
-        # won't target a name already exiting. Only the scored ensemble path
-        # populates `fused`.
-        if fused:
-            self._maybe_rotate(fused, [c.code for c in fused])
+            # Score-gated rotation (换仓, opt-in): if the book is full, free the
+            # weakest holding so a clearly-stronger fresh candidate can be
+            # funded. Runs AFTER check_exits so it sees the post-exit cash/
+            # positions and won't target a name already exiting. Only the scored
+            # ensemble path populates `fused`.
+            if fused:
+                self._maybe_rotate(fused, [c.code for c in fused])
 
-        # Execute
-        result = self._broker.execute_signals(signals, strategy_name=strategy_name)
-        snap = self._broker.snapshot_portfolio()
+            # Execute
+            result = self._broker.execute_signals(signals,
+                                                  strategy_name=strategy_name)
+            snap = self._broker.snapshot_portfolio()
 
         # Pending mode can mix outcomes in one batch: in-session SELLs fill
         # immediately (live-mirror) while BUYs queue — surface both counts.

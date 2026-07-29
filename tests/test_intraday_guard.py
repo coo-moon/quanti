@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import threading
+from datetime import date, datetime
 
 import pytest
 
-from quanti.agent.runtime import AgentRuntime
+from quanti.agent.goal import load_goal, save_goal
+from quanti.agent.runtime import AgentRuntime, CycleHalted
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.factory import make_broker
@@ -129,3 +131,76 @@ def test_guard_halts_on_portfolio_stop(dbp, monkeypatch):
     agent._intraday_guard()
     assert br.calls == ["fill", "stop"]            # halted before check_exits
     assert agent.status().running is False
+    # A tick computing right now must not buy back into the flattened book.
+    assert agent._breaker_flag.is_set()
+
+
+# ----- lock narrowing: the guard must not starve behind a slow tick ---------
+
+def _slow_tick_agent(dbp, broker):
+    """Runtime whose tick blocks in a pure-compute stage (`_ensure_recent_data`,
+    which sits after the fills/breaker section and before everything else) until
+    released. Goal pins a missing strategy so the tick returns right after."""
+    db, provider = dbp
+    db.upsert_stock("000001", "平安银行", "SZ", date(1991, 4, 3), "银行")
+    goal = load_goal(db)
+    goal.strategy_name = "__missing__"   # short-circuits after the compute stage
+    save_goal(db, goal)
+    agent = AgentRuntime(db, provider, broker, intraday_guard_sec=60)
+    in_compute, release = threading.Event(), threading.Event()
+
+    def _blocking_refresh(codes, lookback_days=200):
+        in_compute.set()
+        assert release.wait(10), "test never released the tick"
+
+    agent._ensure_recent_data = _blocking_refresh
+    return agent, in_compute, release
+
+
+def test_guard_runs_while_tick_computes(dbp, monkeypatch):
+    """The regression: the tick used to hold `_broker_lock` end-to-end, so a
+    slow cycle blocked the guard's stop-loss (prod: 9m09s on 2026-07-24)."""
+    monkeypatch.setattr("quanti.utils.market.in_trading_session", lambda *a, **k: True)
+    br = _FakeBroker()
+    agent, in_compute, release = _slow_tick_agent(dbp, br)
+
+    t = threading.Thread(target=agent._safe_cycle, daemon=True)
+    t.start()
+    assert in_compute.wait(10), "tick never reached the compute stage"
+    br.calls.clear()                     # drop the tick's own fill/stop calls
+    agent._intraday_guard()              # would block forever before the fix
+    assert br.calls == ["fill", "stop", "exits"]
+
+    release.set()
+    t.join(10)
+    assert not t.is_alive()
+
+
+def test_tick_mutations_still_exclude_the_guard(dbp, monkeypatch):
+    """Narrowed ≠ removed: while the guard holds the broker lock, a tick can
+    compute but cannot enter its mutating sections."""
+    monkeypatch.setattr("quanti.utils.market.in_trading_session", lambda *a, **k: True)
+    agent, _, _ = _slow_tick_agent(dbp, _FakeBroker())
+    entered = threading.Event()
+
+    with agent._broker_lock:
+        t = threading.Thread(
+            target=lambda: (agent._broker_exec().__enter__(), entered.set()),
+            daemon=True)
+        t.start()
+        assert not entered.wait(0.5)     # blocked on the guard's lock
+    assert entered.wait(5)               # released once the guard is done
+
+
+def test_breaker_mid_tick_aborts_before_orders(dbp):
+    """Guard flattens + halts while the tick is in the LLM/compute stage → the
+    tick's execution gate refuses instead of re-entering the market."""
+    agent, _, _ = _slow_tick_agent(dbp, _FakeBroker())
+    with agent._broker_exec():
+        pass                                     # clean book: gate opens
+    agent._breaker_flag.set()                    # guard tripped the breaker
+    with pytest.raises(CycleHalted), agent._broker_exec():
+        pass
+    # _run_one_cycle turns it into a halted result, not an agent_error.
+    agent._run_cycle_body = lambda: (_ for _ in ()).throw(CycleHalted("x"))
+    assert agent._run_one_cycle() == {"ok": True, "halted": True, "reason": "x"}
