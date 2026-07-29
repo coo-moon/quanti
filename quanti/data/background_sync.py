@@ -52,6 +52,10 @@ logger = logging.getLogger(__name__)
 #: reliably serving them by this wall-clock boundary.
 MARKET_CLOSE_GRACE = dtime(15, 30)
 
+#: 每日 regime 快照的触发时刻。定在 17:30 而非收盘即跑,是为了让后台同步
+#: 先把当日全市场日线补齐(15:30 后陆续到位),快照才读得到今天的收盘数据。
+REGIME_RUN_AT = dtime(17, 30)
+
 
 def expected_latest_bar(now: datetime) -> date:
     """The most recent calendar date whose daily bar should exist upstream.
@@ -153,6 +157,7 @@ class BackgroundQuoteSyncer:
         now_fn=None,  # () -> datetime; injectable clock for tests
         financials_fn=None,  # () -> int; runs once/day if set (None = off, tests)
         mining_fn=None,      # () -> int; runs once/day if set (None = off, tests)
+        regime_fn=None,      # () -> Any; runs once/day AFTER REGIME_RUN_AT
     ) -> None:
         self._db = db
         self._cfg = config or BackgroundSyncConfig()
@@ -162,6 +167,8 @@ class BackgroundQuoteSyncer:
         self._last_fin_day = None  # date of the last financials sync (once/day)
         self._mining_fn = mining_fn
         self._last_mine_day = None  # date of the last factor mining (once/day)
+        self._regime_fn = regime_fn
+        self._last_regime_day = None  # date of the last regime snapshot
 
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
@@ -301,6 +308,32 @@ class BackgroundQuoteSyncer:
         except Exception as e:  # noqa: BLE001 - optional; never kills the loop
             logger.warning("bg-sync factor mining failed: %s", e)
 
+    def _maybe_run_regime(self) -> None:
+        """Daily market-regime snapshot, once per calendar day and only after
+        REGIME_RUN_AT (17:30). Unlike the financials/mining hooks this one is
+        *time-gated*: it reads the day's closing bars, which only land after the
+        market closes and the syncer tops them up. Running it at 09:00 would
+        snapshot yesterday and burn the day's only slot.
+
+        Weekends/holidays: no new bar lands, so the snapshot would just re-run
+        on a stale date. `generate` keys on the latest bar date and UPSERTs, so
+        a weekend run is a harmless no-op rewrite — not worth a calendar lookup.
+        """
+        if self._regime_fn is None:
+            return
+        now = self._now()
+        if now.time() < REGIME_RUN_AT:
+            return
+        today = now.date()
+        if self._last_regime_day == today:
+            return
+        self._last_regime_day = today  # set first → a failure won't retry till tomorrow
+        try:
+            self._regime_fn()
+            logger.info("bg-sync regime snapshot done")
+        except Exception as e:  # noqa: BLE001 - optional; never kills the loop
+            logger.warning("bg-sync regime snapshot failed: %s", e)
+
     # ----------------- main loop -----------------
 
     def _loop(self) -> None:
@@ -315,6 +348,7 @@ class BackgroundQuoteSyncer:
 
             self._maybe_sync_financials()
             self._maybe_mine_factors()
+            self._maybe_run_regime()
 
             # Build the source adapter per loop so a UI source/token change
             # applies without a restart. Misconfig (e.g. tushare, no token — no

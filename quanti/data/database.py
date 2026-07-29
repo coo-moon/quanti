@@ -172,6 +172,14 @@ class Database:
         self._migrate()
         self._drop_shadow_tables()
 
+    @property
+    def market_db_path(self) -> str:
+        """Path of the DB holding market-wide tables — the attached market DB,
+        or this DB itself in single-file mode. Lets callers that need their own
+        connection (the regime snapshot's full-market pandas scan) open the
+        right file instead of hogging the shared one for 10-20s."""
+        return self._market_db_path or self._db_path
+
     def _tune_pragmas(self, schema: str) -> None:
         """Per-database PRAGMAs. journal_mode/synchronous/cache_size/mmap_size
         are all per-schema, so the ATTACHed `market` DB needs its own set — not
@@ -194,7 +202,8 @@ class Database:
     # ("数据没了"). Keep in sync with the `{m}`-prefixed CREATEs in _create_tables.
     _SHARED_TABLES = ("stocks", "daily_quotes", "daily_basic", "financials",
                       "trade_calendar", "stock_pools", "pool_stocks",
-                      "sync_jobs", "news_sentiment", "share_unlocks")
+                      "sync_jobs", "news_sentiment", "share_unlocks",
+                      "regime_snapshots")
 
     def _drop_shadow_tables(self) -> None:
         """Guard against the recurring shadow-table masking bug: when a market
@@ -399,6 +408,30 @@ class Database:
                 float_pct REAL,
                 fetched_at TEXT,
                 PRIMARY KEY (code, free_date)
+            );
+
+            -- Daily market-regime snapshot (observe-only; never a trade signal).
+            -- Market-wide, not account-specific → shared market DB, so paper
+            -- and live read one history. One row per bar date; a same-day
+            -- re-run UPSERTs. Rule layer (rule_label/score, breadth's
+            -- deterministic vote) and LLM layer (llm_*, headline, action) sit
+            -- side by side on purpose — their disagreement is itself
+            -- information, so the narrative never overwrites the rule call.
+            CREATE TABLE IF NOT EXISTS {m}regime_snapshots (
+                date TEXT PRIMARY KEY,
+                rule_label TEXT NOT NULL,
+                rule_score INTEGER NOT NULL,
+                llm_regime TEXT DEFAULT '',
+                llm_confidence INTEGER DEFAULT 0,
+                headline TEXT DEFAULT '',
+                action TEXT DEFAULT '',
+                metrics_json TEXT NOT NULL DEFAULT '{{}}',
+                sectors_json TEXT NOT NULL DEFAULT '{{}}',
+                llm_json TEXT NOT NULL DEFAULT '{{}}',
+                report_md TEXT DEFAULT '',
+                news_json TEXT NOT NULL DEFAULT '{{}}',
+                model TEXT DEFAULT '',
+                created_at TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS {m}idx_daily_quotes_code

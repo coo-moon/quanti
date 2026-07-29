@@ -664,3 +664,75 @@ export const backtestEtfGrid = (req: {
 }) => api.post<EtfBacktestResult>("/etf-grid/backtest", req);
 export const optimizeEtfGrid = (code: string) =>
   api.post<EtfOptimizeResult>("/etf-grid/optimize", null, { params: { code } });
+
+// --- 市场 regime 快照 ---
+
+export interface RegimeMetrics {
+  above20?: number;
+  above50?: number;
+  above200?: number;
+  cap1?: number;
+  eq1?: number;
+  cap5?: number;
+  eq5?: number;
+  cap20?: number;
+  eq20?: number;
+  up?: number;
+  dn?: number;
+  fl?: number;
+  ad_ratio?: number;
+  nh?: number;
+  nl?: number;
+  amt_today?: number;
+  amt5?: number;
+  amt20?: number;
+  amt_chg?: number;
+  turn?: number;
+  n_stocks?: number;
+}
+export interface RegimeSector {
+  industry: string;
+  ret: number;
+  n: number;
+}
+export interface RegimeLLM {
+  regime?: string;
+  confidence?: number;
+  headline?: string;
+  drivers?: string[];
+  sectors_favored?: string[];
+  sectors_avoid?: string[];
+  action?: string;
+  risk_notes?: string[];
+}
+export interface RegimeSnapshot {
+  exists?: boolean;
+  date: string;
+  rule_label: string;
+  rule_score: number;
+  llm_regime: string;
+  llm_confidence: number;
+  headline: string;
+  action: string;
+  metrics: RegimeMetrics;
+  model: string;
+  created_at: string;
+  // 仅 latest / 单日详情返回
+  sectors?: { top20?: RegimeSector[]; bottom20?: RegimeSector[]; top5d?: RegimeSector[] };
+  llm?: RegimeLLM;
+  report_md?: string;
+  news?: { cctv?: unknown[]; flash?: unknown[] };
+}
+
+export const fetchRegimeLatest = () =>
+  api.get<RegimeSnapshot & { exists: boolean }>("/regime/latest");
+export const fetchRegimeHistory = (limit = 90) =>
+  api.get<{ items: RegimeSnapshot[] }>("/regime/history", { params: { limit } });
+export const fetchRegimeDay = (day: string) =>
+  api.get<RegimeSnapshot>(`/regime/${day}`);
+// 全市场扫描 + LLM 深度思考,实测 30-120s —— 前端要给足超时,否则手动
+// 触发永远显示失败而后台其实成功了。
+export const runRegimeSnapshot = () =>
+  api.post<RegimeSnapshot & { ok: boolean }>("/regime/run", null, {
+    timeout: 600_000,
+  });
