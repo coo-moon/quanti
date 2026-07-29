@@ -1755,3 +1755,46 @@ async def etf_grid_optimize(request: Request, code: str):
     name, cat, t0 = etf_data.ETF_META.get(code, (code, "", False))
     opt["code"], opt["name"], opt["category"], opt["t0"] = code, name, cat, t0
     return opt
+
+
+# --- 市场 regime 快照(observe-only) ---
+# 数据面 10-20s 的全市场 pandas 扫描 + LLM 一次思考调用,都跑在 executor 里,
+# 不阻塞事件循环。手动触发存在的意义是「不想等 17:30」,以及首次上线时补当天。
+
+
+@router.get("/regime/latest")
+async def regime_latest(request: Request):
+    """最新一期快照(含正文报告)。没有则返回 exists=false,由前端引导手动生成。"""
+    from quanti.regime import report as regime_report
+    snap = regime_report.load_latest(request.app.state.db)
+    if not snap:
+        return {"exists": False}
+    return {"exists": True, **snap}
+
+
+@router.get("/regime/history")
+async def regime_history(request: Request, limit: int = 90):
+    """历史列表(不含正文/新闻,体积小),供时间轴与列表展示。"""
+    from quanti.regime import report as regime_report
+    limit = max(1, min(int(limit), 365))
+    return {"items": regime_report.load_history(request.app.state.db, limit)}
+
+
+@router.get("/regime/{day}")
+async def regime_one(day: str, request: Request):
+    """按日期取某一期完整快照(点历史条目时用)。"""
+    from quanti.regime import report as regime_report
+    snap = regime_report.load_one(request.app.state.db, day)
+    if not snap:
+        raise HTTPException(status_code=404, detail=f"{day} 无快照")
+    return {"exists": True, **snap}
+
+
+@router.post("/regime/run")
+async def regime_run(request: Request, with_news: bool = True):
+    """立即跑一次快照并落库(不等 17:30 的定时)。约 30-90s:全市场扫描 + LLM 思考。"""
+    from quanti.regime import report as regime_report
+    db = request.app.state.db
+    snap = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: regime_report.generate(db, with_news=with_news))
+    return {"ok": True, **snap}

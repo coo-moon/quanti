@@ -107,8 +107,18 @@ def create_app(
             llm, db, provider, codes, today, n_candidates=12)
         return len(rescored) + len(mined)
 
+    # Once/day after 17:30 (market closed, bars topped up), snapshot the market
+    # regime: full-market breadth + sector rotation + news, run through
+    # DeepSeek v4-pro in thinking mode, persisted to market.regime_snapshots.
+    # Observe-only — it never emits a trade signal. Without DEEPSEEK_API_KEY the
+    # data layer still lands and only the narrative is skipped.
+    def _daily_regime() -> None:
+        from quanti.regime import report as regime_report
+        regime_report.generate(db)
+
     bg_sync = BackgroundQuoteSyncer(db=db, financials_fn=_sync_latest_financials,
-                                    mining_fn=_auto_mine_factors)
+                                    mining_fn=_auto_mine_factors,
+                                    regime_fn=_daily_regime)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):

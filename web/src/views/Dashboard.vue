@@ -5,6 +5,10 @@
       <p class="page-desc">管理你的股票池和市场数据</p>
     </div>
 
+    <!-- 每日市场 regime 快照(17:30 自动生成)。放第一屏——先看清市场在
+         什么状态,再谈池子和同步。 -->
+    <RegimeCard />
+
     <details class="card ds-card">
       <summary class="card-header ds-summary">
         <h2>数据源</h2>
@@ -238,6 +242,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, watch, onMounted, onUnmounted } from "vue";
+import RegimeCard from "../components/RegimeCard.vue";
 import {
   fetchStocks,
   fetchStockStats,
