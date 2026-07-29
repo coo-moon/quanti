@@ -44,7 +44,10 @@ class StubLLMClient:
         self.calls: list[dict] = []
 
     def create_message(self, **kw) -> dict:
-        self.calls.append({k: kw[k] for k in ("model", "temperature", "max_tokens")})
+        # Record everything, including system/messages — tests that assert on
+        # what actually reached the model (e.g. the regime context landing in
+        # the judge's user message and nowhere else) need the prompt itself.
+        self.calls.append(dict(kw))
         if not self._responses:
             raise AssertionError("StubLLMClient ran out of scripted responses")
         return self._responses.pop(0)
@@ -442,3 +445,142 @@ class TestRuntimeLLMPath:
         agent._llm_client = TripWire()
         save_goal(db, Goal(target_annual_return=0.20))  # no agent_mode set
         agent.tick()  # must not raise
+
+
+# ----- regime context reaching the judge --------------------------------
+# The snapshot is read-only here (produced daily at 17:30 by the background
+# syncer). What these guard is *where* it lands: the judge's user message and
+# nowhere else. See quanti/regime/prompt.py for why the report's LLM-written
+# action/sector fields are stripped before they ever get here.
+
+def _seed_regime_snapshot(db, when=None):
+    from quanti.regime import report as R
+    d = (when or date.today()).isoformat()
+    R.save(db, {
+        "date": d, "rule_label": "震荡(区间/分化)", "rule_score": -1,
+        "llm_regime": "震荡", "llm_confidence": 75,
+        "headline": "防御资产继续占优", "action": "观望",
+        "metrics": {"above20": 45.0, "above50": 21.0, "above200": 14.0,
+                    "up": 4252, "dn": 1215, "ad_ratio": 3.5, "nh": 676,
+                    "nl": 485, "cap5": -0.6, "eq5": 2.7, "cap20": -3.8,
+                    "eq20": -9.2, "amt_chg": -20.8, "n_stocks": 5000},
+        "sectors": {"top20": [{"industry": "黄金", "ret": 12.0, "n": 10}]},
+        "llm": {"action": "观望", "sectors_favored": ["黄金"]},
+        "report_md": "正文", "news": {}, "model": "deepseek-v4-pro",
+        "created_at": f"{d}T17:35:00",
+    })
+
+
+def _regime_text_block(text: str) -> dict:
+    return {"stop_reason": "end_turn",
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": 20, "output_tokens": 10}}
+
+
+def _texts_of(call) -> str:
+    """All user-message text in one scripted LLM call."""
+    out = []
+    for m in call.get("messages") or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, list):
+            out.extend(b.get("text", "") for b in c if isinstance(b, dict))
+    return "\n".join(out)
+
+
+class TestRegimeContext:
+    def test_reaches_the_judge_and_not_the_debaters(self, tmp_path):
+        db, provider = _make_llm_db(tmp_path, "regime_judge.db")
+        # pending = next-open fill, the only mode where feeding the prior
+        # session's breadth is not look-ahead.
+        broker = PaperBroker(db, provider, initial_cash=1_000_000,
+                             fill_mode="pending")
+        _seed_regime_snapshot(db)
+        client = StubLLMClient([
+            _regime_text_block("多头:看好"), _regime_text_block("空头:看空"),
+            _propose_block(orders=[{"code": "000001", "direction": "buy",
+                                    "size_pct": 0.05, "reason": "r"}]),
+        ])
+        run_llm_decision(db=db, broker=broker,
+                         goal=Goal(params={"regime_in_prompt": True}),
+                         candidates=[FusedCandidate(
+                             code="000001", strategy_score=0.7, factor_score=0.5,
+                             final_score=0.7, industry="银行",
+                             contributing_strategies=["ma_cross"])],
+                         llm_client=client,
+                         cfg=LLMConfig(debate_enabled=True, debate_rounds=1))
+        bull, bear, judge = (_texts_of(c) for c in client.calls[:3])
+        assert "市场环境" not in bull and "市场环境" not in bear, \
+            "同一份外生叙事喂给多空双方会让辩论坍缩成它的回声"
+        assert "市场环境" in judge and "站上 MA20/50/200" in judge
+        assert "不得据此调整 size_pct" in judge
+        # 快照里 LLM 写的仓位/板块建议不得随行就市地漏进来
+        for banned in ("观望", "黄金", "防御资产继续占优"):
+            assert banned not in judge, f"{banned!r} 不该进裁判上下文"
+        db.close()
+
+    def test_immediate_fill_mode_gets_no_regime(self, llm_setup):
+        """llm_setup 的 PaperBroker 是 immediate(同 bar close 成交)——
+        注入 T 日收盘算的宽度会变成前视,闸门必须拦住。"""
+        db, _, broker = llm_setup
+        _seed_regime_snapshot(db)
+        client = StubLLMClient([_propose_block(orders=[])])
+        run_llm_decision(db=db, broker=broker,
+                         goal=Goal(params={"regime_in_prompt": True}),
+                         candidates=[FusedCandidate(
+                             code="000001", strategy_score=0.7, factor_score=0.5,
+                             final_score=0.7, industry="银行",
+                             contributing_strategies=["ma_cross"])],
+                         llm_client=client, cfg=LLMConfig())
+        assert "市场环境" not in _texts_of(client.calls[0])
+
+    def test_off_by_default_and_logged(self, tmp_path):
+        db, provider = _make_llm_db(tmp_path, "regime_off.db")
+        broker = PaperBroker(db, provider, initial_cash=1_000_000,
+                             fill_mode="pending")
+        _seed_regime_snapshot(db)
+        client = StubLLMClient([_propose_block(orders=[])])
+        run_llm_decision(db=db, broker=broker, goal=Goal(),  # 没开开关
+                         candidates=[FusedCandidate(
+                             code="000001", strategy_score=0.7, factor_score=0.5,
+                             final_score=0.7, industry="银行",
+                             contributing_strategies=["ma_cross"])],
+                         llm_client=client, cfg=LLMConfig())
+        assert "市场环境" not in _texts_of(client.calls[0])
+        # 决策日志要能事后分辨「这一 tick 到底注没注」
+        details = db.list_decisions(kind="llm_cycle")[0]["details"]
+        assert details["regime_injected"] is False
+        assert details["regime_skip_reason"] == "未开启"
+        assert "order_codes" in details
+        db.close()
+
+    def test_tick_step_one_logs_the_snapshot(self, runtime_with_llm):
+        """用户要的「tick 第一步」:跑一个真 tick,决策日志里必须出现这条
+        regime 观测,且它读的是已落库快照(而不是在持锁的 tick 里现算)。"""
+        db, agent = runtime_with_llm
+        _seed_regime_snapshot(db)
+        agent._llm_client = StubLLMClient([_propose_block(orders=[])])
+        save_goal(db, Goal(target_annual_return=0.20,
+                           params={"agent_mode": "llm", "regime_detect": True,
+                                   "signal_threshold": 0.0}))
+        agent.tick()
+        logs = db.list_decisions(kind="regime")
+        assert logs, "tick 第一步没有写出 regime 观测"
+        d = logs[0]["details"]
+        assert d["date"] == date.today().isoformat()
+        assert d["rule_label"] == "震荡(区间/分化)"
+        assert d["metrics"]["above50"] == 21.0
+        # 开关没开 → 只观测,不进 prompt
+        assert d["into_prompt"] is False
+        assert "仅观测" in logs[0]["summary"]
+
+    def test_tick_without_snapshot_says_so(self, runtime_with_llm):
+        db, agent = runtime_with_llm       # 没有 seed 快照
+        agent._llm_client = StubLLMClient([_propose_block(orders=[])])
+        save_goal(db, Goal(target_annual_return=0.20,
+                           params={"agent_mode": "llm", "regime_detect": True,
+                                   "signal_threshold": 0.0}))
+        agent.tick()                        # 不得抛出
+        logs = db.list_decisions(kind="regime")
+        assert logs and "无市场 regime 快照" in logs[0]["summary"]

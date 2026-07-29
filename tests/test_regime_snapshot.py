@@ -1,5 +1,4 @@
-"""Tests for the daily market-regime snapshot (quanti.regime — the report the
-UI card renders; NOT quanti.agent.regime, which is the agent's own detector).
+"""Tests for the daily market-regime snapshot and its use inside a tick.
 
 Network and LLM are never hit — the breadth layer is stubbed with synthetic
 metrics and the LLM with a scripted client. What actually needs guarding:
@@ -14,17 +13,22 @@ metrics and the LLM with a scripted client. What actually needs guarding:
     leaving the day blank
   * same-day re-runs UPSERT rather than pile up rows
   * the 17:30 gate: earlier is a no-op, later runs exactly once per day
+  * **the three gates on prompt injection** (TestRegimePromptGates below):
+    opt-in off / immediate fill mode / stale snapshot each yield no context,
+    and the payload never carries the report's LLM-written position advice.
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from quanti.data.background_sync import BackgroundQuoteSyncer
 from quanti.data.database import Database
+from quanti.regime import prompt as P
 from quanti.regime import report as R
 
 
@@ -251,3 +255,135 @@ class TestNews:
         monkeypatch.setattr(N, "_with_timeout", lambda fn, timeout=0: None)
         assert N.fetch_cctv(date(2026, 7, 29)) == []
         assert N.fetch_flash() == []
+
+
+# --------------------------------------------------- prompt injection gates
+
+class _Broker:
+    """Only the attribute the gate reads. Live QmtBroker has no _fill_mode at
+    all — that path is covered by test_live_broker_without_fill_mode_passes."""
+
+    def __init__(self, fill_mode="pending"):
+        self._fill_mode = fill_mode
+
+
+class _LiveBroker:
+    """No _fill_mode attribute — mirrors QmtBroker (real venue matching, so
+    there is no same-bar-close fill to guard against)."""
+
+
+def _goal(**params):
+    return SimpleNamespace(params=params)
+
+
+@pytest.fixture
+def snap_db(db):
+    """A db holding one snapshot dated 2026-07-28 (a Tuesday)."""
+    monkey = _fake_breadth("2026-07-28")
+    R.save(db, {
+        "date": monkey["latest"], "rule_label": monkey["label"],
+        "rule_score": monkey["score"], "llm_regime": "震荡",
+        "llm_confidence": 75, "headline": "防御资产继续占优", "action": "观望",
+        "metrics": R._metrics_payload(monkey), "sectors": R._sectors_payload(monkey),
+        "llm": {"regime": "震荡", "action": "观望",
+                "sectors_favored": ["黄金"], "sectors_avoid": ["半导体"]},
+        "report_md": "正文", "news": {}, "model": "deepseek-v4-pro",
+        "created_at": "2026-07-28T17:35:00",
+    })
+    return db
+
+
+WED_1600 = datetime(2026, 7, 29, 16, 0)   # 周三收盘后、17:30 快照生成前
+
+
+class TestRegimePromptGates:
+    def test_off_by_default(self, snap_db):
+        block, meta = P.regime_block(snap_db, _goal(), _Broker(), now=WED_1600)
+        assert block == ""
+        assert meta["regime_injected"] is False
+        assert meta["regime_skip_reason"] == "未开启"
+
+    def test_injects_when_enabled(self, snap_db):
+        block, meta = P.regime_block(snap_db, _goal(regime_in_prompt=True),
+                                     _Broker(), now=WED_1600)
+        assert meta["regime_injected"] is True
+        assert meta["regime_snapshot_date"] == "2026-07-28"
+        assert "市场环境" in block and "2026-07-28" in block
+        assert "MA20/50/200" in block and "21.0%" in block   # above50
+        assert "震荡(区间/分化)" in block and "投票分 -1" in block
+
+    def test_immediate_fill_mode_never_injects(self, snap_db):
+        """CLI/MCP tick fills same-bar at close — feeding it T's closing
+        breadth would be textbook look-ahead."""
+        block, meta = P.regime_block(snap_db, _goal(regime_in_prompt=True),
+                                     _Broker("immediate"), now=WED_1600)
+        assert block == ""
+        assert "immediate" in meta["regime_skip_reason"]
+
+    def test_live_broker_without_fill_mode_passes(self, snap_db):
+        block, _ = P.regime_block(snap_db, _goal(regime_in_prompt=True),
+                                  _LiveBroker(), now=WED_1600)
+        assert block != ""
+
+    def test_stale_snapshot_is_dropped(self, snap_db):
+        """快照 2026-07-28(周二) vs 决策日 2026-08-03(下周一) = 4 个交易日。"""
+        block, meta = P.regime_block(snap_db, _goal(regime_in_prompt=True),
+                                     _Broker(), now=datetime(2026, 8, 3, 16, 0))
+        assert block == ""
+        assert "陈旧" in meta["regime_skip_reason"]
+
+    def test_no_snapshot_is_not_an_error(self, db):
+        block, meta = P.regime_block(db, _goal(regime_in_prompt=True),
+                                     _Broker(), now=WED_1600)
+        assert block == "" and meta["regime_skip_reason"] == "无快照"
+
+    def test_broken_db_degrades_to_empty(self, snap_db):
+        class Boom:
+            @property
+            def conn(self):
+                raise RuntimeError("db gone")
+
+        block, meta = P.regime_block(Boom(), _goal(regime_in_prompt=True),
+                                     _Broker(), now=WED_1600)
+        assert block == "" and meta["regime_skip_reason"].startswith("异常")
+
+    def test_payload_carries_no_position_advice(self, snap_db):
+        """快照里 LLM 写的仓位指令与板块推荐一律不得进 prompt:
+        action 是另一个 LLM 的仓位命令,板块 20 日动量对未来 20 日 rank IC
+        为负(-0.0725, t=-9.27)且与 industry_neutral 对冲。"""
+        block, _ = P.regime_block(snap_db, _goal(regime_in_prompt=True),
+                                  _Broker(), now=WED_1600)
+        for banned in ("加仓", "减仓", "观望", "黄金", "半导体",
+                       "防御资产继续占优", "正文"):
+            assert banned not in block, f"{banned!r} 不该出现在注入内容里"
+
+    def test_payload_carries_the_no_resize_ban(self, snap_db):
+        """客观数字必须和禁令一起注入,否则就是把被自己回测否定的择时信号
+        直接喂给决策者。"""
+        block, _ = P.regime_block(snap_db, _goal(regime_in_prompt=True),
+                                  _Broker(), now=WED_1600)
+        assert "不得据此调整 size_pct" in block
+        assert "择时无 alpha" in block
+
+
+class TestLatestUsable:
+    def test_reports_reason_but_still_returns_the_row(self, snap_db):
+        """陈旧时仍返回快照 —— tick 日志要能说出「有快照但太旧」。"""
+        snap, reason = P.latest_usable(snap_db, now=datetime(2026, 8, 3, 16, 0))
+        assert snap is not None and snap["date"] == "2026-07-28"
+        assert "陈旧" in reason
+
+    def test_fresh_has_empty_reason(self, snap_db):
+        snap, reason = P.latest_usable(snap_db, now=WED_1600)
+        assert snap["date"] == "2026-07-28" and reason == ""
+
+    def test_timeout_actually_caps(self):
+        """`with ThreadPoolExecutor(...)` 的 __exit__ 会 shutdown(wait=True),
+        在超时之后继续死等挂住的线程 —— 45s 超时形同虚设,后台同步 daemon
+        跟着一起卡死(实测发生过)。这条钉住「超时真的封顶」。"""
+        import time
+        from quanti.regime import news as N
+        t0 = time.perf_counter()
+        got = N._with_timeout(lambda: time.sleep(30) or "never", timeout=0.5)
+        assert got is None
+        assert time.perf_counter() - t0 < 3.0, "超时没封住,又退回死等了"

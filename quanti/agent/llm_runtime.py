@@ -784,6 +784,19 @@ def run_llm_decision(
                    "\n\n以上为多空研究员的辩论。请作为研究主管,"
                    "权衡双方观点后调用 propose_orders。")
 
+    # Market-regime context (opt-in, off by default): the previous session's
+    # full-market breadth, so the judge knows what market these candidates sit
+    # in instead of seeing 20 isolated names. Appended AFTER the debate on
+    # purpose — feeding the same exogenous narrative to Bull and Bear too would
+    # collapse the transcript into an echo of it. User message, never system:
+    # system is the strategy contract, and models follow it far more literally.
+    # Objective numbers only (the report's LLM-written action/sector calls are
+    # stripped upstream) plus an explicit "do not resize on this" — see
+    # quanti/regime/prompt.py for why each field is in or out.
+    from quanti.regime.prompt import regime_block  # noqa: PLC0415
+    regime_ctx, regime_meta = regime_block(db, goal, broker)
+    ctx += regime_ctx
+
     def dispatcher(name: str, inp: dict) -> str:
         if name == "inspect_position":
             code = str(inp.get("code", ""))
@@ -914,6 +927,13 @@ def run_llm_decision(
         "debate_rounds": debate_rounds,
         "risk_review": risk_review,
         "n_reflections": len(reflections),
+        # What the judge actually saw + what it did, so a future A/B has
+        # something to join on. Without these you cannot even tell, after the
+        # fact, whether a given tick had the regime context attached.
+        # (Honest caveat: same-input reruns differ — order Jaccard ≈ 0.40 —
+        # so this enables the comparison, it does not make one conclusive.)
+        **regime_meta,
+        "order_codes": [s.stock_code for s in signals],
     }
     # Summary shows the full fate of the proposed orders in one line:
     # 提议 → 成交 / 挂单 / 拒单(原因). Before this, "N 单提议, 0 成交" looked like
