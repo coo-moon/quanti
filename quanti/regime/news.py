@@ -33,17 +33,29 @@ MAX_CCTV = 25
 
 
 def _with_timeout(fn, timeout: float = FETCH_TIMEOUT):
-    """跑 fn(),超时/异常都返回 None。调用方负责降级。"""
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(fn)
-        try:
-            return fut.result(timeout=timeout)
-        except FutureTimeout:
-            logger.warning("news fetch timed out after %.0fs", timeout)
-            return None
-        except Exception as e:  # noqa: BLE001 - 任一源挂掉都不该炸掉快照
-            logger.warning("news fetch failed: %s", e)
-            return None
+    """跑 fn(),超时/异常都返回 None。调用方负责降级。
+
+    **不要用 `with ThreadPoolExecutor(...)`**:它的 __exit__ 是
+    `shutdown(wait=True)`,会在超时之后继续死等那个挂住的 requests 调用 ——
+    45 秒的超时形同虚设,整个后台同步 daemon 跟着一起卡住(实测发生过)。
+    这里显式 `wait=False` 交回控制权。
+
+    ponytail: 挂住的线程仍会在后台泄漏到它自己的 socket 超时为止 ——
+    Python 没法强杀线程。每天只跑一次、最多泄漏一个,可接受;真要根治得让
+    akshare 走带 timeout 的 session,那是上游的事。
+    """
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(fn).result(timeout=timeout)
+    except FutureTimeout:
+        logger.warning("news fetch timed out after %.0fs (线程后台泄漏,不阻塞)",
+                       timeout)
+        return None
+    except Exception as e:  # noqa: BLE001 - 任一源挂掉都不该炸掉快照
+        logger.warning("news fetch failed: %s", e)
+        return None
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def fetch_cctv(as_of: date) -> list[dict]:

@@ -1000,18 +1000,59 @@ class AgentRuntime:
 
         self._ensure_recent_data(universe)
 
-        # Observe-only regime detection (v1): logs a `regime` decision so we can
-        # eyeball whether it classifies trend/range/high-vol correctly. Does NOT
-        # change candidate generation or sizing. Gated; never raises.
+        # Step 1 of every tick: read the market-regime snapshot (full-market
+        # breadth / rotation / turnover, produced once a day at 17:30 by the
+        # background syncer) and log it. Observe-only here — it changes nothing
+        # about candidate generation or sizing; it only reaches the judge LLM's
+        # context when goal.params["regime_in_prompt"] is on (see
+        # quanti/regime/prompt.py).
+        #
+        # READ, never compute. `_run_one_cycle` holds `_broker_lock` for this
+        # whole body and the intraday guard (stop-loss, portfolio breaker,
+        # fill reconcile) contends for the same lock — production logs already
+        # show a 9-minute guard gap from a slow tick. `load_latest` is one
+        # indexed row (~1ms); `report.generate()` would be 10s of full-market
+        # pandas plus an LLM call up to 300s, i.e. that many minutes with no
+        # stop-loss. Never call generate() from inside a tick.
         if (goal.params or {}).get("regime_detect"):
             try:
-                from quanti.agent.regime import detect_regime, last_regime_label
-                rs = detect_regime(self._provider, date.today(),
-                                   universe=universe,
-                                   prev_label=last_regime_label(self._db))
-                self._db.log_decision("regime", rs.summary(), details=rs.as_dict())
-            except Exception as e:
-                logger.warning(f"regime detect skipped: {e}")
+                from quanti.regime.prompt import PARAM as _REGIME_PROMPT_PARAM
+                from quanti.regime.prompt import fill_mode_ok, latest_usable
+                snap, reason = latest_usable(self._db, provider=self._provider)
+                if snap is None:
+                    self._db.log_decision(
+                        "regime", f"无市场 regime 快照({reason});"
+                                  f"后台每日 17:30 生成,或手动 POST /api/regime/run")
+                else:
+                    m = snap.get("metrics") or {}
+                    fresh = not reason
+                    # 「已注入」必须和 regime_block 的实际条件一致,否则日志
+                    # 会骗人。三个条件缺一不可:开关、next-open 成交模式、
+                    # 本 tick 确实走 LLM 决策路径(ensemble/单策略路径根本
+                    # 没有裁判 LLM 可注入)。
+                    p_ = goal.params or {}
+                    into_prompt = bool(
+                        fresh and p_.get(_REGIME_PROMPT_PARAM)
+                        and fill_mode_ok(self._broker)
+                        and str(p_.get("agent_mode", "")).lower() == "llm"
+                        and not goal.strategy_name)
+                    self._db.log_decision(
+                        "regime",
+                        f"{snap['date']} {snap.get('rule_label', '')}"
+                        f"(投票分 {int(snap.get('rule_score') or 0):+d})"
+                        f" · MA50上方 {float(m.get('above50') or 0):.0f}%"
+                        f" · 涨跌比 {float(m.get('ad_ratio') or 0):.2f}"
+                        f" · 成交额5v20 {float(m.get('amt_chg') or 0):+.1f}%"
+                        + (f" · {reason}" if reason else "")
+                        + (" · 已注入 LLM 上下文" if into_prompt else " · 仅观测"),
+                        details={"date": snap["date"],
+                                 "rule_label": snap.get("rule_label"),
+                                 "rule_score": snap.get("rule_score"),
+                                 "llm_regime": snap.get("llm_regime"),
+                                 "metrics": m, "stale_reason": reason,
+                                 "into_prompt": into_prompt})
+            except Exception as e:  # noqa: BLE001 - observability never breaks a tick
+                logger.warning(f"regime snapshot read skipped: {e}")
 
         candidates = self._run_screener(goal, universe)
         if not candidates:

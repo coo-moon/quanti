@@ -3,14 +3,14 @@
 - :mod:`quanti.regime.breadth` — 全A股宽度/轮动/资金指标,纯数据,可复现
 - :mod:`quanti.regime.news`    — 新闻联播 + 财经快讯,尽力而为
 - :mod:`quanti.regime.report`  — 组装 → DeepSeek 深度思考 → 落库
+- :mod:`quanti.regime.prompt`  — 已落库快照 → tick 日志行 / LLM 上下文段(只读)
 
-纯观测(observe-only):不产生交易信号,不接执行链路。
+**不产生交易信号**。快照每天 17:30 由后台生成一次;agent tick 第一步只
+*读* 它(~1ms)写决策日志,并在 ``regime_in_prompt`` 打开时把其中的客观
+指标拼进裁判 LLM 的上下文 —— 作为环境描述,不作仓位开关。为什么只到这一步、
+哪些字段被刻意剔除,见 :mod:`quanti.regime.prompt` 的模块文档。
 
-与 :mod:`quanti.agent.regime` 的区别(名字像,用途不同,别混):
-
-* ``quanti.agent.regime`` — agent 决策循环内部用的 regime 判定(等权合成
-  指数 + Kaufman 效率比 + 波动分位),输出一个 label 供 agent 倾斜,跑在
-  每个 tick 上。
-* 本包 — 给**人**看的每日快照报告:全市场宽度、板块轮动、资金、时事面,
-  外加 LLM 叙事与仓位框架,每天 17:30 跑一次并落库供 UI 展示。
+(2026-07-29 起本包取代了原 ``quanti.agent.regime``:那套用 universe 前 120
+个代码的等权合成指数 + Kaufman 效率比,在生产里连续 65 条日志全是 high_vol、
+零辨别力,已删除。)
 """

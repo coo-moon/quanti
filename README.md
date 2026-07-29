@@ -117,7 +117,7 @@ quanti/
 │   ├── llm_runtime.py        #   LLM 判断层（交易员/多空辩论/风控三角）
 │   ├── sentiment.py          #   ①新闻情绪 overlay（批量打分+缓存）
 │   ├── reflection.py         #   ④反思记忆（已实现盈亏 FIFO 配对）
-│   ├── regime.py             #   行情状态检测（ER/波动率分位/广度）
+│   │                         #   （行情状态检测见 quanti/regime/）
 │   └── openai_compat.py      #   DeepSeek 等 OpenAI 兼容供应商适配
 │
 ├── factors/                  # 因子引擎
@@ -341,7 +341,8 @@ quanti up --target 0.20 --max-drawdown -0.20 --risk medium
 | ② 多空辩论 | `llm_debate` + `llm_debate_rounds` | 多头/空头研究员就候选清单辩论 N 轮，辩论稿进入交易员上下文，由其作为"研究主管"裁决 |
 | ③ 风控三角 | `llm_risk_debate` | 激进/中性/保守三视角对每笔提议投"保留比例"，按风险偏好聚合（low→最小 / medium→均值 / high→最大），**只能缩仓或否决，不能加仓** |
 | ④ 反思记忆 | `llm_reflection` + `llm_max_reflections` | 已实现盈亏 FIFO 配对成历史回合，按相关度（同股 > 同行业）注入上下文，让 LLM 带着"上次的教训"决策 |
-| 行情状态 | `regime_detect` | 等权合成指数 + Kaufman ER + 波动率分位 + 广度 → 趋势上行/下行/震荡/高波动，observe-only 写决策日志 |
+| 行情状态（观测） | `regime_detect` | tick 第一步读当日/上一交易日的全市场宽度快照（`quanti/regime`，后台 17:30 生成），写决策日志。**只读不现算**——tick 全程持 broker 锁，盘中止损抢同一把锁 |
+| 行情状态（入 prompt） | `regime_in_prompt` | 把上一交易日收盘的**客观**指标（MA20/50/200 上方占比、涨跌家数、大盘 vs 等权、成交额 5v20、规则层标签）拼进裁判 LLM 的 user 上下文，**默认关**。剔除快照里 LLM 写的 `action`/`headline`/板块推荐（板块 20 日动量对未来 20 日 rank IC −0.0725，t=−9.27，且与 `industry_neutral` 对冲），并附「不得据此调仓」的显式禁令。`immediate` 成交模式与陈旧快照自动不注入 |
 
 **供应商**：`llm_provider` 支持 `deepseek`（默认模型 `deepseek-v4-pro`，OpenAI 兼容接口，零额外依赖，`export DEEPSEEK_API_KEY=...` 即可）和 `anthropic`（`pip install -e ".[llm]"` + `ANTHROPIC_API_KEY`）。`claude-*` 模型名在 DeepSeek 路径下自动重映射；v4 思考模式与强制工具调用的兼容性已在客户端处理（结构化输出自动关思考，辩论等自由文本保留思考）。
 
@@ -442,7 +443,7 @@ OpenClaw 配置示例（MCP client config）：
 - [x] **PaperBroker 模拟盘 + A 股 T+1/佣金/印花税完整模拟**（挂单次日开盘成交 + TTL 过期）
 - [x] **MCP server（stdio）— OpenClaw / Claude Desktop 即插即用**
 - [x] **LLM 多智能体增强层**：新闻情绪 / 多空辩论 / 风控三角 / 反思记忆（DeepSeek `deepseek-v4-pro` 默认，Anthropic 可选）
-- [x] **行情 regime 检测 v1**（趋势/震荡/高波动，observe-only）
+- [x] **市场 regime 快照**（全市场宽度/板块轮动/资金/时事 → DeepSeek 深度思考 → 每日落库 + 仪表盘卡片 + 历史回看）；tick 第一步读它写日志，可选注入裁判 LLM 上下文（`regime_in_prompt`，默认关）
 - [x] **走查式调参（walk-forward hyperopt）**：网格搜参 + 多折 OOS 夏普验证，跑赢默认才采纳
 - [x] **防前视因子 DSL + 安全解析**（声明式表达式，禁止未来引用，无 `eval`）
 - [x] **LLM 因子挖掘**：提因子 → IC 闸门去冗余 → 自演化因子库，可选注入实盘排序（默认关）
@@ -454,7 +455,7 @@ OpenClaw 配置示例（MCP client config）：
 - [x] **后台同步守护**：交易时段感知（收盘后自动全市场增量）+ 停牌/死源指数退避
 - [x] 决策日志自动保留（默认 90 天）+ 手动清理 (`quanti agent prune`)
 - [x] 前端按路由懒加载（ECharts 进 Backtest 才下载，首屏 -72%）
-- [ ] regime 检测 v1.1：observe-only 验证后按行情自动切换选股器/仓位
+- [x] ~~regime 检测 v1.1：按行情自动切换选股器/仓位~~ —— **不做**。1035 日重放：规则层「上涨」桶未来 20 日收益 ≤ 基线（t=−2.30），市值加权口径下按 regime 空仓把年化 −9.2pp、夏普 1.45→1.16。regime 只作环境描述进 LLM 上下文，不作仓位开关
 - [~] 接入真实券商 API（QMT / miniQMT）—— **真机只读链路已端到端验证**（江海证券 QMT 实盘、账户 85530137：`/health` mode=xt && trader_connected && datafeed_ok，实时行情 + `connect`/`query_account`/`query_asset` 交易查询通道全通）；**真实下单尚未在真机跑过**（下单总闸 `QMT_BRIDGE_ALLOW_ORDERS=1` 才放行，默认关；冒烟测试待盘中）。后端：`QmtBroker` + `bridge/qmt_bridge.py`，首选**直连 xtquant** 后端 `XtDirectBackend`（`bridge/xt_direct_backend.py`，PR #126；vnpy_xt 降为未验证 fallback）+ `xtdata` 历史源。**接实盘代码债已全部清零**（PR #125–#134）：H1/H2/H3、时区断言（UTC+8）、观察期敞口双闸（`QUANTI_MAX_ORDER_NOTIONAL` 单笔 + `QUANTI_MAX_LIVE_EXPOSURE` 总敞口）、订单幂等（client-order-id 去重 + mirror-before-POST + 对账）、跨进程实盘单例锁、F3/G2。**启用入口**：`QUANTI_ACCOUNT=live` + `QUANTI_LIVE_ACK=I_KNOW_REAL_MONEY`（缺一拒绝构建实盘 broker），实盘不自动拉起 Agent、须手动 `agent_start`。**操作手册**：`docs/live-trading-runbook.md`（历史路线：`docs/plans/2026-06-16-live-trading-qmt.md`）
 - [ ] 实时分钟级行情
 - [ ] PostgreSQL 后端
