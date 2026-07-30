@@ -371,3 +371,61 @@ def test_intraday_guard_sec_env(db, monkeypatch):
     app2 = create_app(db=db, provider=DataProvider(db), strategies_dir="strategies",
                       autostart_background_sync=False)
     assert app2.state.agent._intraday_guard_sec == 13        # env override
+
+
+class TestGoalEndpoint:
+    """POST /api/goal is a PARTIAL patch, not a full replace. Regression guard:
+    a body carrying only `params` (Agent.vue toggleMaster, the factor-mining
+    master switch) used to reset target_annual_return/max_drawdown/enabled to
+    GoalBody's defaults."""
+
+    _FULL = {
+        "target_annual_return": 1.0,
+        "max_drawdown": -0.3,
+        "risk_tolerance": "high",
+        "universe_pool": "mypool",
+        "screener_name": "value",
+        "strategy_name": "ma_cross",
+        "params": {"foo": 1},
+        "rebalance_freq": "weekly",
+        "enabled": True,
+    }
+
+    @pytest.mark.asyncio
+    async def test_params_only_post_keeps_other_fields(self, client):
+        assert (await client.post("/api/goal", json=self._FULL)).status_code == 200
+
+        r = await client.post("/api/goal",
+                              json={"params": {"foo": 1, "use_generated_factors": True}})
+        assert r.status_code == 200
+        g = r.json()["goal"]
+        assert g["target_annual_return"] == 1.0
+        assert g["max_drawdown"] == -0.3
+        assert g["enabled"] is True
+        assert g["risk_tolerance"] == "high"
+        assert g["universe_pool"] == "mypool"
+        assert g["screener_name"] == "value"
+        assert g["strategy_name"] == "ma_cross"
+        assert g["rebalance_freq"] == "weekly"
+        assert g["params"]["use_generated_factors"] is True
+
+        # Persisted, not just echoed back.
+        stored = (await client.get("/api/goal")).json()
+        assert stored["target_annual_return"] == 1.0
+        assert stored["max_drawdown"] == -0.3
+        assert stored["enabled"] is True
+        assert stored["params"]["use_generated_factors"] is True
+
+    @pytest.mark.asyncio
+    async def test_patch_still_updates_given_fields(self, client):
+        await client.post("/api/goal", json=self._FULL)
+        g = (await client.post("/api/goal",
+                               json={"enabled": False})).json()["goal"]
+        assert g["enabled"] is False                 # the patched field lands
+        assert g["target_annual_return"] == 1.0      # the rest untouched
+        assert g["params"] == {"foo": 1}
+
+    @pytest.mark.asyncio
+    async def test_invalid_risk_tolerance_rejected(self, client):
+        r = await client.post("/api/goal", json={"risk_tolerance": "yolo"})
+        assert r.status_code == 422

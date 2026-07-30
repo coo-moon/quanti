@@ -28,7 +28,7 @@ import traceback
 from datetime import date, timedelta
 from typing import Any
 
-from quanti.agent.goal import Goal, RiskTolerance, load_goal, save_goal
+from quanti.agent.goal import load_goal, update_goal
 from quanti.agent.runtime import AgentRuntime
 from quanti.backtest.engine import BacktestEngine
 from quanti.data.database import Database
@@ -302,36 +302,11 @@ def _handle_tool_call(ctx: QuantiContext, name: str, args: dict[str, Any]) -> An
     if name == "get_goal":
         return load_goal(ctx.db).to_db()
     if name == "set_goal":
-        current = load_goal(ctx.db)
-        merged = current.to_db()
-        merged.update({k: v for k, v in args.items() if v is not None})
-        # Coerce + validate the numeric / enum fields before we write back —
-        # the DB has no schema-level type guard so junk would silently rot
-        # until the next agent tick failed at runtime.
         try:
-            target = float(merged["target_annual_return"])
-            dd = float(merged["max_drawdown"])
-        except (TypeError, ValueError) as e:
-            return {"error": f"target_annual_return/max_drawdown must be numbers: {e}"}
-        try:
-            risk = RiskTolerance(merged["risk_tolerance"])
+            goal = update_goal(ctx.db, args)
         except ValueError as e:
-            return {"error": f"invalid risk_tolerance: {e}"}
-        params = merged.get("params", {})
-        if not isinstance(params, dict):
-            return {"error": f"params must be an object, got {type(params).__name__}"}
-        save_goal(ctx.db, Goal(
-            target_annual_return=target,
-            max_drawdown=dd,
-            risk_tolerance=risk,
-            universe_pool=str(merged.get("universe_pool", "") or ""),
-            screener_name=str(merged.get("screener_name", "") or ""),
-            strategy_name=str(merged.get("strategy_name", "") or ""),
-            params=params,
-            rebalance_freq=str(merged.get("rebalance_freq", "daily") or "daily"),
-            enabled=bool(merged.get("enabled", False)),
-        ))
-        return {"ok": True, "goal": load_goal(ctx.db).to_db()}
+            return {"error": str(e)}
+        return {"ok": True, "goal": goal.to_db()}
     if name == "agent_start":
         ctx.agent.start()
         return {"status": "started"}
