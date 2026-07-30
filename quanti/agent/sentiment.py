@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SentimentConfig:
     model: str = DEFAULT_MODEL
-    max_tokens: int = 1024
+    # 30 codes × a Chinese `reason` costs ~1300 output tokens (measured live on
+    # deepseek-v4-pro); the old 1024 cap truncated the tool call mid-JSON, so
+    # the whole batch failed to parse. Keep ~3x headroom.
+    max_tokens: int = 4096
     temperature: float = 0.0       # scoring should be near-deterministic
     max_codes: int = 30            # hard cap on stocks scored per tick (cost)
     max_news_per_code: int = 8     # headlines fed to the LLM per stock
@@ -197,6 +200,19 @@ def _score_with_llm(
 
 # ----------------------------------------------------------- orchestrator
 
+def _is_real_score(row: dict) -> bool:
+    """Is a cached row an actual judgment, or a degraded placeholder?
+
+    Legacy rows written before the write-side fix recorded `score=0.0,
+    reason=''` under a real model name whenever the LLM call failed or its
+    output didn't parse — indistinguishable from a real score in the cache and
+    pinned that (code, date) to neutral forever. Treat them as unscored so
+    they get retried. Both legitimate paths keep a reason ("无近期新闻" for the
+    no-news case), and a non-zero score is real regardless of reason.
+    """
+    return bool(str(row.get("reason") or "")) or float(row.get("score") or 0.0) != 0.0
+
+
 def score_candidates(
     db: Database,
     codes: list[str],
@@ -210,9 +226,12 @@ def score_candidates(
 
     Flow per code: cache hit → use it. Else fetch news; no news → cache a
     neutral 0.0. Codes that have news are scored together in ONE LLM call,
-    then each result is cached. If no LLM client is available, the unscored
-    codes return 0.0 for this tick (NOT cached, so a later LLM-enabled tick
-    can still score them).
+    then each result the LLM actually returned is cached.
+
+    Degraded 0.0s are NEVER cached — no LLM client, a failed call, or a code
+    missing from a partial batch all return 0.0 for this tick only, so a later
+    tick retries them. Caching them would pin the code to neutral for the whole
+    trading day under a real-looking model name.
 
     Never raises — on any failure a code resolves to neutral 0.0.
     """
@@ -229,7 +248,7 @@ def score_candidates(
 
     for code in ordered:
         cached = db.get_news_sentiment(code, as_of_s)
-        if cached is not None:
+        if cached is not None and _is_real_score(cached):
             scores[code] = float(cached["score"])
             continue
         try:
@@ -259,13 +278,26 @@ def score_candidates(
         except Exception as e:
             logger.warning("sentiment LLM scoring failed: %s", e)
             llm_scores = {}
+        missed: list[str] = []
         for item in to_score:
             code = item["code"]
-            score, reason = llm_scores.get(code, (0.0, ""))
+            if code not in llm_scores:
+                # The LLM didn't score this code (call failed, output truncated,
+                # or a partial batch). Neutral for THIS tick, but deliberately
+                # NOT cached — caching a degraded 0.0 under a real model name
+                # would pin the code to neutral for the whole day with no retry.
+                scores[code] = 0.0
+                missed.append(code)
+                continue
+            score, reason = llm_scores[code]
             db.upsert_news_sentiment(code, as_of_s, score, reason=reason,
                                      n_news=len(item["headlines"]),
                                      model=served_model)
             scores[code] = score
+        if missed:
+            logger.warning(
+                "sentiment: %d/%d codes unscored by %s (not cached, will retry): %s",
+                len(missed), len(to_score), served_model, ",".join(missed[:10]))
     else:
         # No LLM this tick — neutral, and intentionally NOT cached.
         for item in to_score:

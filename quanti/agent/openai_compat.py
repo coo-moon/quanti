@@ -159,7 +159,11 @@ def from_openai_response(data: dict) -> dict:
         try:
             parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
         except json.JSONDecodeError:
-            logger.warning("could not parse tool arguments: %r", raw)
+            # finish_reason="length" means max_tokens cut the JSON mid-string —
+            # the usual cause, and the one worth naming in the log.
+            logger.warning("could not parse tool arguments (finish_reason=%s, "
+                           "%d chars): %r", finish, len(raw) if isinstance(raw, str)
+                           else 0, raw)
             parsed = {}
         content_blocks.append({
             "type": "tool_use", "id": tc.get("id", ""),
