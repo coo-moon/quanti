@@ -297,11 +297,25 @@ WED_1600 = datetime(2026, 7, 29, 16, 0)   # 周三收盘后、17:30 快照生成
 
 
 class TestRegimePromptGates:
-    def test_off_by_default(self, snap_db):
+    def test_on_by_default(self, snap_db):
+        """键缺失 = 开(口径同 wf_enabled)。已落库的老 goal 没有这个键,
+        默认开就必须对它们也生效,否则「默认开」只是新建 goal 的默认值。"""
         block, meta = P.regime_block(snap_db, _goal(), _Broker(), now=WED_1600)
+        assert meta["regime_injected"] is True
+        assert "市场环境" in block
+
+    def test_explicit_false_turns_it_off(self, snap_db):
+        block, meta = P.regime_block(snap_db, _goal(regime_in_prompt=False),
+                                     _Broker(), now=WED_1600)
         assert block == ""
         assert meta["regime_injected"] is False
-        assert meta["regime_skip_reason"] == "未开启"
+        assert meta["regime_skip_reason"] == "已显式关闭"
+
+    def test_enabled_reads_both_flags(self):
+        assert P.enabled(_goal()) is True
+        assert P.enabled(_goal(), P.DETECT_PARAM) is True
+        assert P.enabled(_goal(regime_detect=False), P.DETECT_PARAM) is False
+        assert P.enabled(_goal(regime_detect=False)) is True  # 两个开关互不影响
 
     def test_injects_when_enabled(self, snap_db):
         block, meta = P.regime_block(snap_db, _goal(regime_in_prompt=True),
@@ -376,6 +390,42 @@ class TestLatestUsable:
     def test_fresh_has_empty_reason(self, snap_db):
         snap, reason = P.latest_usable(snap_db, now=WED_1600)
         assert snap["date"] == "2026-07-28" and reason == ""
+
+    def test_snapshot_newer_than_decision_day_is_refused(self, snap_db):
+        """快照比决策日还新 = 未来数据。`count_trading_days_between` 在
+        start >= end 时返回 0,陈旧闸会把它读成「很新鲜」,所以要单独一道
+        方向闸 —— 否则任何拿历史 now 回放的调用者都会吃到今天的宽度。"""
+        snap, reason = P.latest_usable(snap_db, now=datetime(2025, 3, 14, 16, 0))
+        assert snap is not None and "晚于决策日" in reason
+        block, meta = P.regime_block(snap_db, _goal(), _Broker(),
+                                     now=datetime(2025, 3, 14, 16, 0))
+        assert block == "" and meta["regime_injected"] is False
+
+    def test_holiday_calendar_needs_the_provider(self, snap_db):
+        """陈旧闸算的是交易日距离。不传 provider 就退化成「工作日」近似,
+        长假会被按交易日计 —— 注入端(llm_runtime)与 tick 日志端必须共用
+        同一份日历,否则日志写「已注入」而 prompt 里一个字都没有。"""
+        class _Cal:      # 2026-10-01..10-07 国庆休市(provider 的日历接口)
+            @staticmethod
+            def is_trade_date(d):
+                return d.weekday() < 5 and not (
+                    d.year == 2026 and d.month == 10 and 1 <= d.day <= 7)
+
+            @staticmethod
+            def get_trade_dates(a, b):
+                return [a]      # 非空 = 日历有数据,缺席日按休市处理
+
+        # 快照 = 节前最后一个交易日(09-30),决策日 = 节后首个交易日(10-08)
+        R.save(snap_db, {
+            "date": "2026-09-30", "rule_label": "震荡(区间/分化)", "rule_score": -1,
+            "llm_regime": "", "llm_confidence": 0, "headline": "", "action": "",
+            "metrics": {"above50": 21.0}, "sectors": {}, "llm": {},
+            "report_md": "", "news": {}, "model": "", "created_at": "x"})
+        after = datetime(2026, 10, 8, 16, 0)
+        _, no_cal = P.latest_usable(snap_db, now=after)          # 工作日近似
+        _, with_cal = P.latest_usable(snap_db, provider=_Cal(), now=after)
+        assert "陈旧" in no_cal, "工作日近似把长假算成了交易日,前提变了"
+        assert with_cal == "", "真日历下 09-30→10-08 只隔 1 个交易日,应放行"
 
     def test_timeout_actually_caps(self):
         """`with ThreadPoolExecutor(...)` 的 __exit__ 会 shutdown(wait=True),
