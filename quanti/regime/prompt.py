@@ -8,8 +8,10 @@ LLM 最长 300s)会把这个空窗拉到 14 分钟以上。这里只做一次 `l
 
 **三道闸**(任何一道不过都返回空,tick 照常跑):
 
-1. `goal.params["regime_in_prompt"]` — opt-in 默认关(对齐 dsr_gate /
-   rotation_enabled 的既有纪律)。
+1. `goal.params["regime_in_prompt"]` — **默认开**(2026-07-30 起,口径同
+   `wf_enabled`:键缺失=开,只有显式 `false` 才关)。默认开的前提是本模块把
+   注入内容压到了「客观数字 + 禁令」这一层(见下),而不是快照里那半边 LLM
+   仓位建议;真要关就在 Web UI「高级开关」里取消勾选,会显式写 `false` 落库。
 2. **成交模式**:只有 next-open 的 `fill_mode="pending"` 才注入。CLI /
    MCP 的 `agent tick` 走 `immediate`,同 bar 以当日 close 成交 —— 拿 T 日
    收盘算出来的全市场宽度去影响 T 日 close 的成交,是教科书级前视。
@@ -46,6 +48,20 @@ MAX_STALE_TRADING_DAYS = 1
 
 PARAM = "regime_in_prompt"
 
+#: tick 第一步的观测日志开关(runtime.py)。放在这里而不是 runtime,是因为
+#: 「默认开」的口径必须和 PARAM 一致 —— 两处各写一遍 `.get(k, True)` 早晚漂移。
+DETECT_PARAM = "regime_detect"
+
+
+def enabled(goal, param: str = PARAM) -> bool:
+    """键缺失即开(同 `wf_enabled`),只有显式 falsy 才关。
+
+    默认开意味着**已落库但没有这个键的 goal 会在下一 tick 自动开始生效**,
+    不需要用户去 UI 点一次保存 —— 这正是「默认开」的语义。要关就在 UI 取消
+    勾选,`syncParamsFromAdv` 会显式写 `false`。
+    """
+    return bool((getattr(goal, "params", None) or {}).get(param, True))
+
 
 def fill_mode_ok(broker) -> bool:
     """只有 next-open 成交才安全。PaperBroker 有 `_fill_mode`;实盘 QmtBroker
@@ -74,6 +90,13 @@ def latest_usable(db, *, provider=None, now: datetime | None = None
     except (ValueError, KeyError, TypeError):
         return None, f"快照日期不可解析: {snap.get('date')!r}"
     decision_d = order_decision_date(now or datetime.now(), provider)
+    if snap_d > decision_d:
+        # 方向闸。count_trading_days_between 在 start >= end 时返回 0(见
+        # utils/market.py),所以「快照比决策日还新」会被陈旧闸读成「0 个交易日,
+        # 很新鲜」直接放行 —— 而 load_latest 拿的是库里最新一行、不带 as_of。
+        # 今天没有历史回放调用者能踩到,但默认开之后,下一个写 LLM 回放的人
+        # 继承到的是「开」,那就是拿今天的全市场宽度去影响去年的决策。
+        return snap, f"快照晚于决策日({snap_d} > {decision_d})"
     stale = count_trading_days_between(snap_d, decision_d, provider)
     if stale > MAX_STALE_TRADING_DAYS:
         return snap, f"快照陈旧({snap_d} 距决策日 {decision_d} 已 {stale} 个交易日)"
@@ -138,8 +161,8 @@ def regime_block(db, goal, broker, *, provider=None,
     """
     meta: dict = {"regime_injected": False, "regime_snapshot_date": None,
                   "regime_skip_reason": ""}
-    if not (goal.params or {}).get(PARAM):
-        meta["regime_skip_reason"] = "未开启"
+    if not enabled(goal):
+        meta["regime_skip_reason"] = "已显式关闭"
         return "", meta
     if not fill_mode_ok(broker):
         # 同 bar close 成交下注入 = 用 T 日收盘信息影响 T 日成交价。

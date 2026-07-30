@@ -341,8 +341,10 @@ quanti up --target 0.20 --max-drawdown -0.20 --risk medium
 | ② 多空辩论 | `llm_debate` + `llm_debate_rounds` | 多头/空头研究员就候选清单辩论 N 轮，辩论稿进入交易员上下文，由其作为"研究主管"裁决 |
 | ③ 风控三角 | `llm_risk_debate` | 激进/中性/保守三视角对每笔提议投"保留比例"，按风险偏好聚合（low→最小 / medium→均值 / high→最大），**只能缩仓或否决，不能加仓** |
 | ④ 反思记忆 | `llm_reflection` + `llm_max_reflections` | 已实现盈亏 FIFO 配对成历史回合，按相关度（同股 > 同行业）注入上下文，让 LLM 带着"上次的教训"决策 |
-| 行情状态（观测） | `regime_detect` | tick 第一步读当日/上一交易日的全市场宽度快照（`quanti/regime`，后台 17:30 生成），写决策日志。**只读不现算**——tick 全程持 broker 锁，盘中止损抢同一把锁 |
-| 行情状态（入 prompt） | `regime_in_prompt` | 把上一交易日收盘的**客观**指标（MA20/50/200 上方占比、涨跌家数、大盘 vs 等权、成交额 5v20、规则层标签）拼进裁判 LLM 的 user 上下文，**默认关**。剔除快照里 LLM 写的 `action`/`headline`/板块推荐（板块 20 日动量对未来 20 日 rank IC −0.0725，t=−9.27，且与 `industry_neutral` 对冲），并附「不得据此调仓」的显式禁令。`immediate` 成交模式与陈旧快照自动不注入 |
+| 行情状态（观测） | `regime_detect`，**默认开** | tick 第一步读当日/上一交易日的全市场宽度快照（`quanti/regime`，后台 17:30 生成），写决策日志。**只读不现算**——盘中止损/熔断的守护链路刻意不接 regime（它与 tick 抢 broker 锁，任何快照读取都是给止损空窗加时间；有回归测试盯着） |
+| 行情状态（入 prompt） | `regime_in_prompt`，**默认开** | 把上一交易日收盘的**客观**指标（MA20/50/200 上方占比、涨跌家数、大盘 vs 等权、成交额 5v20、规则层标签）拼进裁判 LLM 的 user 上下文。剔除快照里 LLM 写的 `action`/`headline`/板块推荐（板块 20 日动量对未来 20 日 rank IC −0.0725，t=−9.27，且与 `industry_neutral` 对冲），并附「不得据此调仓」的显式禁令。`immediate` 成交模式与陈旧快照自动不注入 |
+
+> 两个 regime 开关的口径同 `wf_enabled`：**键缺失即开**，只有 Web UI 里取消勾选（显式写 `false`）才关。已落库的老 goal 不需要重新保存就会生效；决策日志的 `regime_injected` / `regime_skip_reason` 字段可事后逐 tick 审计到底注没注。
 
 **供应商**：`llm_provider` 支持 `deepseek`（默认模型 `deepseek-v4-pro`，OpenAI 兼容接口，零额外依赖，`export DEEPSEEK_API_KEY=...` 即可）和 `anthropic`（`pip install -e ".[llm]"` + `ANTHROPIC_API_KEY`）。`claude-*` 模型名在 DeepSeek 路径下自动重映射；v4 思考模式与强制工具调用的兼容性已在客户端处理（结构化输出自动关思考，辩论等自由文本保留思考）。
 

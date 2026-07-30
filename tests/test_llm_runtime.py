@@ -535,24 +535,42 @@ class TestRegimeContext:
                          llm_client=client, cfg=LLMConfig())
         assert "市场环境" not in _texts_of(client.calls[0])
 
-    def test_off_by_default_and_logged(self, tmp_path):
+    def test_on_by_default_and_logged(self, tmp_path):
+        """键缺失即注入(default-on),且日志要能事后分辨这一 tick 注没注。"""
+        db, provider = _make_llm_db(tmp_path, "regime_default_on.db")
+        broker = PaperBroker(db, provider, initial_cash=1_000_000,
+                             fill_mode="pending")
+        _seed_regime_snapshot(db)
+        client = StubLLMClient([_propose_block(orders=[])])
+        run_llm_decision(db=db, broker=broker, goal=Goal(),  # params 里没这个键
+                         candidates=[FusedCandidate(
+                             code="000001", strategy_score=0.7, factor_score=0.5,
+                             final_score=0.7, industry="银行",
+                             contributing_strategies=["ma_cross"])],
+                         llm_client=client, cfg=LLMConfig())
+        assert "市场环境" in _texts_of(client.calls[0])
+        details = db.list_decisions(kind="llm_cycle")[0]["details"]
+        assert details["regime_injected"] is True
+        assert "order_codes" in details
+        db.close()
+
+    def test_explicit_false_and_logged(self, tmp_path):
         db, provider = _make_llm_db(tmp_path, "regime_off.db")
         broker = PaperBroker(db, provider, initial_cash=1_000_000,
                              fill_mode="pending")
         _seed_regime_snapshot(db)
         client = StubLLMClient([_propose_block(orders=[])])
-        run_llm_decision(db=db, broker=broker, goal=Goal(),  # 没开开关
+        run_llm_decision(db=db, broker=broker,
+                         goal=Goal(params={"regime_in_prompt": False}),
                          candidates=[FusedCandidate(
                              code="000001", strategy_score=0.7, factor_score=0.5,
                              final_score=0.7, industry="银行",
                              contributing_strategies=["ma_cross"])],
                          llm_client=client, cfg=LLMConfig())
         assert "市场环境" not in _texts_of(client.calls[0])
-        # 决策日志要能事后分辨「这一 tick 到底注没注」
         details = db.list_decisions(kind="llm_cycle")[0]["details"]
         assert details["regime_injected"] is False
-        assert details["regime_skip_reason"] == "未开启"
-        assert "order_codes" in details
+        assert details["regime_skip_reason"] == "已显式关闭"
         db.close()
 
     def test_tick_step_one_logs_the_snapshot(self, runtime_with_llm):
@@ -571,9 +589,54 @@ class TestRegimeContext:
         assert d["date"] == date.today().isoformat()
         assert d["rule_label"] == "震荡(区间/分化)"
         assert d["metrics"]["above50"] == 21.0
-        # 开关没开 → 只观测,不进 prompt
+        # llm_setup 的 broker 是 immediate 成交 → 前视闸拦住注入,只观测
         assert d["into_prompt"] is False
         assert "仅观测" in logs[0]["summary"]
+
+    def test_tick_detect_on_by_default(self, runtime_with_llm):
+        """goal.params 里根本没有 regime_detect 也要写观测日志(default-on)。"""
+        db, agent = runtime_with_llm
+        _seed_regime_snapshot(db)
+        agent._llm_client = StubLLMClient([_propose_block(orders=[])])
+        save_goal(db, Goal(target_annual_return=0.20,
+                           params={"agent_mode": "llm", "signal_threshold": 0.0}))
+        agent.tick()
+        assert db.list_decisions(kind="regime"), "默认开时 tick 第一步没写观测"
+
+    def test_tick_detect_explicit_false_is_silent(self, runtime_with_llm):
+        db, agent = runtime_with_llm
+        _seed_regime_snapshot(db)
+        agent._llm_client = StubLLMClient([_propose_block(orders=[])])
+        save_goal(db, Goal(target_annual_return=0.20,
+                           params={"agent_mode": "llm", "regime_detect": False,
+                                   "signal_threshold": 0.0}))
+        agent.tick()
+        assert not db.list_decisions(kind="regime")
+
+    def test_intraday_guard_never_touches_regime(self, runtime_with_llm,
+                                                 monkeypatch):
+        """盘中守护链路(止损/熔断/挂单撮合)不接 regime —— 它和 tick 抢
+        `_broker_lock`,任何快照读取都是给止损空窗加时间。炸掉 regime 读取入口:
+        守护仍须跑完,且不写 regime 日志。"""
+        import quanti.regime.prompt as P
+        import quanti.regime.report as R
+        from quanti.utils import market as M
+        _seed_regime_snapshot(db_ := runtime_with_llm[0])
+        agent = runtime_with_llm[1]
+
+        def boom(*a, **k):
+            raise AssertionError("守护链路读了 regime 快照")
+
+        for mod, name in ((P, "latest_usable"), (P, "regime_block"),
+                          (R, "load_latest"), (R, "generate")):
+            monkeypatch.setattr(mod, name, boom)
+        monkeypatch.setattr(M, "in_trading_session", lambda *a, **k: True)
+        ran = []
+        monkeypatch.setattr(agent._broker, "check_exits",
+                            lambda *a, **k: ran.append(1))
+        agent._intraday_guard()
+        assert ran, "守护根本没跑到 check_exits,这个测试就没在验任何东西"
+        assert not db_.list_decisions(kind="regime")
 
     def test_tick_without_snapshot_says_so(self, runtime_with_llm):
         db, agent = runtime_with_llm       # 没有 seed 快照

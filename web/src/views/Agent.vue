@@ -202,10 +202,25 @@
                    v-model.number="advParams.dsr_min" />
             <em>DSR 门阈值 0~1,越高越严;默认 0.85(校准回测最优,平台 0.70~0.95)</em>
           </label>
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.regime_detect" />
+            <span>regime_detect</span>
+            <em>默认开。tick 第一步读当日/上一交易日的全市场宽度快照写决策日志
+              (只读 ~1ms,盘中守护链路不接它);不影响选股与仓位</em>
+          </label>
+          <label class="adv-check">
+            <input type="checkbox" v-model="advParams.regime_in_prompt" />
+            <span>regime_in_prompt</span>
+            <em>默认开(仅 LLM 决策模式)。把快照里的客观指标(MA20/50/200 上方占比、
+              涨跌家数、大盘 vs 等权、成交额 5v20、规则层标签)拼进裁判 LLM 上下文,
+              附「不得据此调仓」禁令;快照里 LLM 写的 action/板块推荐一律剔除。
+              immediate 成交模式与陈旧快照自动不注入</em>
+          </label>
         </div>
         <div class="adv-note">
-          预设按钮会重置上面四项模式开关(DSR 门独立,不受预设影响);手动改完后下方保存
-          目标按钮才会落库。LLM 模式的供应商与多智能体增强开关见下方「LLM 增强层」。
+          预设按钮会重置上面四项模式开关(DSR 门与 regime 两项独立,不受预设影响);手动改完后
+          下方保存目标按钮才会落库。regime 两项默认开:取消勾选并保存才会显式写
+          <code>false</code> 关掉。LLM 模式的供应商与多智能体增强开关见下方「LLM 增强层」。
         </div>
       </details>
 
@@ -736,6 +751,10 @@ const advParams = reactive({
   // DSR 过拟合门(独立于预设,默认关):赢家夏普做多重检验紧缩,低于 dsr_min 退等权。
   dsr_gate: false,
   dsr_min: 0.85, // 校准回测最优(54 月 OOS,见 scripts/dsr_calibration.py)
+  // 市场 regime(default-on,口径同 wf_enabled:键缺失=开,显式 false 才关)。
+  // detect = tick 第一步只读观测;in_prompt = 客观指标进裁判 LLM 上下文。
+  regime_detect: true,
+  regime_in_prompt: true,
   // LLM enhancement layer (all default-off; ②③④ only apply in LLM mode,
   // ① sentiment also applies in ensemble mode).
   llm_provider: "anthropic" as "anthropic" | "deepseek",
@@ -763,6 +782,8 @@ function syncAdvFromParams() {
   advParams.wf_enabled = p.wf_enabled !== false; // default true if absent
   advParams.dsr_gate = !!p.dsr_gate;
   advParams.dsr_min = typeof p.dsr_min === "number" ? p.dsr_min : 0.85;
+  advParams.regime_detect = p.regime_detect !== false; // default true if absent
+  advParams.regime_in_prompt = p.regime_in_prompt !== false;
   advParams.llm_provider = p.llm_provider === "deepseek" ? "deepseek" : "anthropic";
   advParams.sentiment_enabled = !!p.sentiment_enabled;
   advParams.sentiment_blend =
@@ -793,6 +814,8 @@ function syncParamsFromAdv() {
     wf_enabled: advParams.wf_enabled,
     dsr_gate: advParams.dsr_gate,
     dsr_min: advParams.dsr_min,
+    regime_detect: advParams.regime_detect,
+    regime_in_prompt: advParams.regime_in_prompt,
     llm_provider: advParams.llm_provider,
     sentiment_enabled: advParams.sentiment_enabled,
     sentiment_blend: advParams.sentiment_blend,

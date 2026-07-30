@@ -1070,8 +1070,8 @@ class AgentRuntime:
         # breadth / rotation / turnover, produced once a day at 17:30 by the
         # background syncer) and log it. Observe-only here — it changes nothing
         # about candidate generation or sizing; it only reaches the judge LLM's
-        # context when goal.params["regime_in_prompt"] is on (see
-        # quanti/regime/prompt.py).
+        # context unless goal.params["regime_in_prompt"] is explicitly false
+        # (both flags default ON — see quanti/regime/prompt.py `enabled`).
         #
         # READ, never compute. `load_latest` is one indexed row (~1ms);
         # `report.generate()` would be 10s of full-market pandas plus an LLM
@@ -1079,10 +1079,12 @@ class AgentRuntime:
         # only takes `_broker_lock` for its mutating segments — see
         # `_broker_exec`), but it would still stall the tick's own exits and
         # buys by that long. Never call generate() from inside a tick.
-        if (goal.params or {}).get("regime_detect"):
-            try:
-                from quanti.regime.prompt import PARAM as _REGIME_PROMPT_PARAM
-                from quanti.regime.prompt import fill_mode_ok, latest_usable
+        # 整段(含开关判定)都在 try 里:这是观测,任何异常都不许打掉一个 tick。
+        try:
+            from quanti.regime.prompt import DETECT_PARAM as _DETECT
+            from quanti.regime.prompt import (enabled as _regime_enabled,
+                                              fill_mode_ok, latest_usable)
+            if _regime_enabled(goal, _DETECT):
                 snap, reason = latest_usable(self._db, provider=self._provider)
                 if snap is None:
                     self._db.log_decision(
@@ -1097,7 +1099,7 @@ class AgentRuntime:
                     # 没有裁判 LLM 可注入)。
                     p_ = goal.params or {}
                     into_prompt = bool(
-                        fresh and p_.get(_REGIME_PROMPT_PARAM)
+                        fresh and _regime_enabled(goal)
                         and fill_mode_ok(self._broker)
                         and str(p_.get("agent_mode", "")).lower() == "llm"
                         and not goal.strategy_name)
@@ -1116,8 +1118,8 @@ class AgentRuntime:
                                  "llm_regime": snap.get("llm_regime"),
                                  "metrics": m, "stale_reason": reason,
                                  "into_prompt": into_prompt})
-            except Exception as e:  # noqa: BLE001 - observability never breaks a tick
-                logger.warning(f"regime snapshot read skipped: {e}")
+        except Exception as e:  # noqa: BLE001 - observability never breaks a tick
+            logger.warning(f"regime snapshot read skipped: {e}")
 
         candidates = self._run_screener(goal, universe)
         if not candidates:

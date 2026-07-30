@@ -802,8 +802,19 @@ def run_llm_decision(
     # stripped upstream) plus an explicit "do not resize on this" — see
     # quanti/regime/prompt.py for why each field is in or out.
     from quanti.regime.prompt import regime_block  # noqa: PLC0415
-    regime_ctx, regime_meta = regime_block(db, goal, broker)
-    ctx += regime_ctx
+    # provider 必须传:陈旧闸算的是**交易日**距离,不传就退化成「工作日」近似,
+    # 长假后首个交易日会被判成陈旧而拒注 —— 而 tick 那条 regime 日志用的是真
+    # 日历,于是日志写「已注入」、prompt 里一个字都没有(真实交易日历回放:
+    # 2024-2026 有 19 天出现这个分歧)。两端共用一份日历,日志才不会骗人。
+    regime_ctx, regime_meta = regime_block(
+        db, goal, broker, provider=getattr(broker, "_provider", None))
+    if regime_ctx:
+        # 行动指令必须是整条 user 消息的最后一句。build_context_message 的结尾
+        # 本来就是「请基于以上信息调用 propose_orders」,把环境描述追加在它之后
+        # 等于让一屏偏空读数收尾;而 SYSTEM_PROMPT 里明写「没有合意标的就返回
+        # orders=[],那是合法的 wait」—— 弱通道的禁令压不住强通道的许可。
+        ctx += regime_ctx + ("\n\n请基于以上信息调用 propose_orders"
+                             "(不得因市场环境少下单或压低 size_pct)。")
 
     def dispatcher(name: str, inp: dict) -> str:
         if name == "inspect_position":
@@ -946,6 +957,14 @@ def run_llm_decision(
         # so this enables the comparison, it does not make one conclusive.)
         **regime_meta,
         "order_codes": [s.stock_code for s in signals],
+        # 请求总权重 + 当时的单票上限。计数(n_valid)看不见「单数不变但每单
+        # 权重被压到 1/20」这种退化 —— size_pct 的合法下界是 0.01,校验只查
+        # 上界,风控也只会往下砍。orders.strength 存的是 size_pct/上限 且表里
+        # 不存上限,改一次 max_position_pct 历史就还原不回去。这两个键是
+        # 「注入有没有让它悄悄缩仓」唯一的连续观测量。
+        "weight_requested": round(
+            sum(float(o.get("size_pct") or 0) for o in valid_orders), 4),
+        "max_size_pct": cfg.max_size_pct,
     }
     # Summary shows the full fate of the proposed orders in one line:
     # 提议 → 成交 / 挂单 / 拒单(原因). Before this, "N 单提议, 0 成交" looked like
