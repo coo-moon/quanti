@@ -80,3 +80,45 @@ def load_goal(db: Database) -> Goal:
 
 def save_goal(db: Database, goal: Goal) -> None:
     db.upsert_agent_goal(goal.to_db())
+
+
+def update_goal(db: Database, patch: dict[str, Any]) -> Goal:
+    """Merge a *partial* goal update onto the stored goal, then persist it.
+
+    Keys whose value is None are ignored (absent means keep) so callers may send
+    only the fields they intend to change — a full-replace here silently reset
+    target_annual_return / max_drawdown / enabled whenever a caller (e.g. the
+    factor-mining master switch) posted just `params`.
+
+    Coerces + validates the numeric / enum fields before writing: the DB has no
+    schema-level type guard, so junk would rot until the next agent tick failed.
+    Raises ValueError on invalid input; caller maps that to its own error shape.
+    """
+    merged = load_goal(db).to_db()
+    merged.update({k: v for k, v in patch.items() if v is not None})
+    try:
+        target = float(merged["target_annual_return"])
+        dd = float(merged["max_drawdown"])
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"target_annual_return/max_drawdown must be numbers: {e}") from e
+    try:
+        risk = RiskTolerance(merged["risk_tolerance"])
+    except ValueError:
+        raise ValueError(f"invalid risk_tolerance: {merged['risk_tolerance']!r}; "
+                         "expected 'low' | 'medium' | 'high'") from None
+    params = merged.get("params", {})
+    if not isinstance(params, dict):
+        raise ValueError(f"params must be an object, got {type(params).__name__}")
+    goal = Goal(
+        target_annual_return=target,
+        max_drawdown=dd,
+        risk_tolerance=risk,
+        universe_pool=str(merged.get("universe_pool", "") or ""),
+        screener_name=str(merged.get("screener_name", "") or ""),
+        strategy_name=str(merged.get("strategy_name", "") or ""),
+        params=params,
+        rebalance_freq=str(merged.get("rebalance_freq", "daily") or "daily"),
+        enabled=bool(merged.get("enabled", False)),
+    )
+    save_goal(db, goal)
+    return goal

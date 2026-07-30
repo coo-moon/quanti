@@ -10,7 +10,7 @@ from datetime import date, timedelta
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from quanti.agent.goal import Goal, RiskTolerance, load_goal, save_goal
+from quanti.agent.goal import load_goal, update_goal
 from quanti.backtest.engine import BacktestEngine
 from quanti.models import Direction, Signal
 from quanti.screener.loader import ScreenerLoader
@@ -786,15 +786,19 @@ async def run_screen(body: ScreenRequest, request: Request):
 
 
 class GoalBody(BaseModel):
-    target_annual_return: float = 0.20
-    max_drawdown: float = -0.20
-    risk_tolerance: str = "medium"  # low / medium / high
-    universe_pool: str = ""
-    screener_name: str = ""
-    strategy_name: str = ""
-    params: dict = {}
-    rebalance_freq: str = "daily"
-    enabled: bool = False
+    """Partial goal patch — every field optional, omitted ones keep their stored
+    value (see update_goal). Do NOT give these defaults: a default turns an
+    omitted field into a silent reset of whatever the user had configured."""
+
+    target_annual_return: float | None = None
+    max_drawdown: float | None = None
+    risk_tolerance: str | None = None  # low / medium / high
+    universe_pool: str | None = None
+    screener_name: str | None = None
+    strategy_name: str | None = None
+    params: dict | None = None
+    rebalance_freq: str | None = None
+    enabled: bool | None = None
 
 
 class ManualOrderBody(BaseModel):
@@ -945,23 +949,9 @@ async def get_goal_endpoint(request: Request):
 @router.post("/goal")
 async def set_goal_endpoint(body: GoalBody, request: Request):
     try:
-        risk = RiskTolerance(body.risk_tolerance)
-    except ValueError:
-        raise HTTPException(status_code=422,
-                            detail=f"invalid risk_tolerance: {body.risk_tolerance!r}; "
-                                   "expected 'low' | 'medium' | 'high'")
-    goal = Goal(
-        target_annual_return=body.target_annual_return,
-        max_drawdown=body.max_drawdown,
-        risk_tolerance=risk,
-        universe_pool=body.universe_pool,
-        screener_name=body.screener_name,
-        strategy_name=body.strategy_name,
-        params=body.params,
-        rebalance_freq=body.rebalance_freq,
-        enabled=body.enabled,
-    )
-    save_goal(request.app.state.db, goal)
+        goal = update_goal(request.app.state.db, body.model_dump(exclude_none=True))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     return {"ok": True, "goal": goal.to_db()}
 
 
