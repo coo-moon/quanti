@@ -933,7 +933,7 @@ def run_llm_decision(
 
     log_payload = {
         # Ground truth, not the requested alias: provider clients may remap
-        # (e.g. claude-* → deepseek-v4-pro). Anthropic client has no remap.
+        # (e.g. claude-* → deepseek-v4-flash). Anthropic client has no remap.
         "model": getattr(llm_client, "resolved_model", lambda m: m)(cfg.model),
         "reasoning": reasoning,
         "n_candidates": len(candidates),

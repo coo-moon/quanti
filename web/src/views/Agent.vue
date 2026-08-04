@@ -231,7 +231,7 @@
             <span>供应商 llm_provider</span>
             <select v-model="advParams.llm_provider">
               <option value="anthropic">Anthropic claude(需 ANTHROPIC_API_KEY + pip install .[llm]）</option>
-              <option value="deepseek">DeepSeek deepseek-v4-pro(需 DEEPSEEK_API_KEY，无需额外安装）</option>
+              <option value="deepseek">DeepSeek deepseek-v4-flash(需 DEEPSEEK_API_KEY，无需额外安装）</option>
             </select>
           </label>
         </div>

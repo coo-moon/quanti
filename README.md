@@ -346,7 +346,7 @@ quanti up --target 0.20 --max-drawdown -0.20 --risk medium
 
 > 两个 regime 开关的口径同 `wf_enabled`：**键缺失即开**，只有 Web UI 里取消勾选（显式写 `false`）才关。已落库的老 goal 不需要重新保存就会生效；决策日志的 `regime_injected` / `regime_skip_reason` 字段可事后逐 tick 审计到底注没注。
 
-**供应商**：`llm_provider` 支持 `deepseek`（默认模型 `deepseek-v4-pro`，OpenAI 兼容接口，零额外依赖，`export DEEPSEEK_API_KEY=...` 即可）和 `anthropic`（`pip install -e ".[llm]"` + `ANTHROPIC_API_KEY`）。`claude-*` 模型名在 DeepSeek 路径下自动重映射；v4 思考模式与强制工具调用的兼容性已在客户端处理（结构化输出自动关思考，辩论等自由文本保留思考）。
+**供应商**：`llm_provider` 支持 `deepseek`（默认模型 `deepseek-v4-flash`，OpenAI 兼容接口，零额外依赖，`export DEEPSEEK_API_KEY=...` 即可）和 `anthropic`（`pip install -e ".[llm]"` + `ANTHROPIC_API_KEY`）。`claude-*` 模型名在 DeepSeek 路径下自动重映射；v4 思考模式与强制工具调用的兼容性已在客户端处理（结构化输出自动关思考，辩论等自由文本保留思考）。
 
 开关入口三选一：Web **AI Agent → LLM 增强层**面板 / MCP `set_goal` 的 `params` / `quanti agent set-goal`。每轮 LLM 决策的完整细节（真实模型名、推理、辩论稿、风控保留比例、token 用量）都落在 `llm_cycle` 决策日志里。
 
@@ -444,7 +444,7 @@ OpenClaw 配置示例（MCP client config）：
 - [x] **StrategySelector：按目标自动挑最佳策略**
 - [x] **PaperBroker 模拟盘 + A 股 T+1/佣金/印花税完整模拟**（挂单次日开盘成交 + TTL 过期）
 - [x] **MCP server（stdio）— OpenClaw / Claude Desktop 即插即用**
-- [x] **LLM 多智能体增强层**：新闻情绪 / 多空辩论 / 风控三角 / 反思记忆（DeepSeek `deepseek-v4-pro` 默认，Anthropic 可选）
+- [x] **LLM 多智能体增强层**：新闻情绪 / 多空辩论 / 风控三角 / 反思记忆（DeepSeek `deepseek-v4-flash` 默认，Anthropic 可选）
 - [x] **市场 regime 快照**（全市场宽度/板块轮动/资金/时事 → DeepSeek 深度思考 → 每日落库 + 仪表盘卡片 + 历史回看）；tick 第一步读它写日志，可选注入裁判 LLM 上下文（`regime_in_prompt`，默认关）
 - [x] **走查式调参（walk-forward hyperopt）**：网格搜参 + 多折 OOS 夏普验证，跑赢默认才采纳
 - [x] **防前视因子 DSL + 安全解析**（声明式表达式，禁止未来引用，无 `eval`）
