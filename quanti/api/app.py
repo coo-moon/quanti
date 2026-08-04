@@ -109,7 +109,7 @@ def create_app(
 
     # Once/day after 17:30 (market closed, bars topped up), snapshot the market
     # regime: full-market breadth + sector rotation + news, run through
-    # DeepSeek v4-pro in thinking mode, persisted to market.regime_snapshots.
+    # DeepSeek v4-flash in thinking mode, persisted to market.regime_snapshots.
     # Observe-only — it never emits a trade signal. Without DEEPSEEK_API_KEY the
     # data layer still lands and only the narrative is skipped.
     def _daily_regime() -> None:

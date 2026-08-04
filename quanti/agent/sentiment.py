@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 class SentimentConfig:
     model: str = DEFAULT_MODEL
     # 30 codes × a Chinese `reason` costs ~1300 output tokens (measured live on
-    # deepseek-v4-pro); the old 1024 cap truncated the tool call mid-JSON, so
+    # deepseek-v4-flash); the old 1024 cap truncated the tool call mid-JSON, so
     # the whole batch failed to parse. Keep ~3x headroom.
     max_tokens: int = 4096
     temperature: float = 0.0       # scoring should be near-deterministic
@@ -269,7 +269,7 @@ def score_candidates(
 
     if to_score and llm_client is not None:
         # Record the model that ACTUALLY served the call, not the requested
-        # alias — providers remap (e.g. claude-* → deepseek-v4-pro). Mirrors
+        # alias — providers remap (e.g. claude-* → deepseek-v4-flash). Mirrors
         # the resolved-model logging in run_llm_decision.
         served_model = getattr(llm_client, "resolved_model",
                                lambda m: m)(cfg.model)

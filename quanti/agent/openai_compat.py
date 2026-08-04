@@ -30,7 +30,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro"  # full function-calling support
+DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"  # full function-calling support
 
 
 def _thinking_on_by_default(model: str) -> bool:
@@ -236,7 +236,7 @@ class OpenAICompatLLMClient:
                 # v4 thinking mode 400s on a forced tool_choice, and pure
                 # structured-output calls gain nothing from CoT — turn it
                 # off for this request only. Free-text and multi-tool calls
-                # keep thinking (that's what v4-pro is for).
+                # keep thinking (that's what the v4 thinking tier is for).
                 if _thinking_on_by_default(payload["model"]):
                     payload["thinking"] = {"type": "disabled"}
         resp = self._client.post(self._url, headers=self._headers, json=payload)

@@ -133,7 +133,7 @@ class TestCreateMessage:
             tools=ONE_TOOL, max_tokens=256, temperature=0.0)
 
         p = cap["payload"]
-        assert p["model"] == "deepseek-v4-pro"        # claude id remapped
+        assert p["model"] == "deepseek-v4-flash"      # claude id remapped
         assert p["messages"][0] == {"role": "system", "content": "SYS"}
         assert p["messages"][1] == {"role": "user", "content": "score it"}
         assert p["tools"][0]["function"]["name"] == "submit_sentiment"
@@ -188,8 +188,8 @@ class TestCreateMessage:
 
     def test_resolved_model_is_public(self):
         client, _ = _client_capturing(_oai_text_resp("ok"))
-        assert client.resolved_model("claude-sonnet-4-5") == "deepseek-v4-pro"
-        assert client.resolved_model(None) == "deepseek-v4-pro"
+        assert client.resolved_model("claude-sonnet-4-5") == "deepseek-v4-flash"
+        assert client.resolved_model(None) == "deepseek-v4-flash"
         assert client.resolved_model("deepseek-chat") == "deepseek-chat"
 
     def test_reasoning_content_is_ignored(self):

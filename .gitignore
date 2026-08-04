@@ -27,3 +27,9 @@ web/dist/
 htmlcov/
 .coverage
 nohup.out
+.gstack/
+# 本机 IDE / 插件产物（caveman 等给各家 agent 装的 skill 副本）
+.agents/
+.trae/
+skills-lock.json
+.claude/worktrees/

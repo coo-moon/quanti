@@ -119,7 +119,7 @@ class TestThinkingModePreserved:
         llm = ScriptedLLM(GOOD)
         R.run_llm("prompt", llm=llm)
         assert llm.calls[0]["tools"] is None
-        assert llm.calls[0]["model"] == "deepseek-v4-pro"
+        assert llm.calls[0]["model"] == "deepseek-v4-flash"
 
     def test_empty_response_is_an_error_not_a_blank_report(self):
         class Empty:
