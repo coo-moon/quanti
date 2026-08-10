@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from datetime import date, datetime
 
@@ -177,6 +178,31 @@ def run_llm(prompt: str, llm=None) -> tuple[str, dict, str]:
 
 # ------------------------------------------------------------------ 持久化
 
+def _json_safe(obj):
+    """递归把非有限浮点(NaN/±Inf)换成 None,其余原样返回。
+
+    裸 `NaN`/`Infinity` **不是合法 JSON**,但 `json.dumps` 默认 allow_nan=True
+    照写不误,于是非法 JSON 进了库;`json.loads` 默认又能把它读回 float('nan'),
+    所以本地读写都「看着正常」,直到 FastAPI/starlette 用 allow_nan=False 序列化
+    响应 —— 整条 /api/regime/* 直接 500(2026-08-06 真实发生:那天全市场只同步到
+    1 只股票,breadth 对空切片求 mean/median 得 NaN)。前端 `JSON.parse` 同样吃
+    不下裸 NaN。
+
+    指标算不出来的语义就是「无值」,对应 JSON null —— 前端 num() 已按 null 显示
+    「—」,所以这里统一收敛到 None,而不是丢字段或填 0(填 0 会被读成「真的是 0%」)。
+
+    写侧(save)与读侧(_row_to_dict)都过一遍:写侧保证新数据干净,读侧兜住修复
+    前已落库的污染行(否则历史接口永远 500,除非手工改库)。
+    """
+    if isinstance(obj, float):        # np.float64 是 float 子类,一并覆盖
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def _sectors_payload(r: dict) -> dict:
     """板块榜 DataFrame → 可 JSON 化的三张表。"""
     def rows(df):
@@ -212,24 +238,32 @@ def save(db, snap: dict) -> None:
              created_at=excluded.created_at""",
         (snap["date"], snap["rule_label"], snap["rule_score"],
          snap["llm_regime"], snap["llm_confidence"], snap["headline"],
-         snap["action"], json.dumps(snap["metrics"], ensure_ascii=False),
-         json.dumps(snap["sectors"], ensure_ascii=False),
-         json.dumps(snap["llm"], ensure_ascii=False), snap["report_md"],
-         json.dumps(snap["news"], ensure_ascii=False), snap["model"],
+         snap["action"],
+         # 每个 JSON 列都过 _json_safe:NaN/Inf 绝不能进库(非法 JSON)。
+         # llm/news 也过 —— LLM 吐的 json 块里同样可能带裸 NaN,
+         # _extract_json 的 json.loads 默认会照单全收。
+         json.dumps(_json_safe(snap["metrics"]), ensure_ascii=False),
+         json.dumps(_json_safe(snap["sectors"]), ensure_ascii=False),
+         json.dumps(_json_safe(snap["llm"]), ensure_ascii=False),
+         snap["report_md"],
+         json.dumps(_json_safe(snap["news"]), ensure_ascii=False), snap["model"],
          snap["created_at"]))
     db.conn.commit()
 
 
 def _row_to_dict(row, *, full: bool) -> dict:
+    # 读侧净化:修复前落库的行仍带裸 NaN,json.loads 会把它读回 float('nan'),
+    # 直接返回就会让 /api/regime/* 在响应序列化时 500。过一遍 _json_safe,
+    # 老数据无需迁移即可正常读出(NaN → null)。
     d = {"date": row[0], "rule_label": row[1], "rule_score": row[2],
          "llm_regime": row[3], "llm_confidence": row[4], "headline": row[5],
-         "action": row[6], "metrics": json.loads(row[7] or "{}"),
+         "action": row[6], "metrics": _json_safe(json.loads(row[7] or "{}")),
          "model": row[12], "created_at": row[13]}
     if full:
-        d.update(sectors=json.loads(row[8] or "{}"),
-                 llm=json.loads(row[9] or "{}"),
+        d.update(sectors=_json_safe(json.loads(row[8] or "{}")),
+                 llm=_json_safe(json.loads(row[9] or "{}")),
                  report_md=row[10] or "",
-                 news=json.loads(row[11] or "{}"))
+                 news=_json_safe(json.loads(row[11] or "{}")))
     return d
 
 
