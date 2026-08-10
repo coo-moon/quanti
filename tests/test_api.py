@@ -429,3 +429,36 @@ class TestGoalEndpoint:
     async def test_invalid_risk_tolerance_rejected(self, client):
         r = await client.post("/api/goal", json={"risk_tolerance": "yolo"})
         assert r.status_code == 422
+
+
+class TestRegimeHistoryEndpoint:
+    """GET /api/regime/history 曾整条 500:库里有一行 metrics_json 带裸 NaN
+    (2026-08-06 全市场只同步到 1 只股票),starlette 用 allow_nan=False 序列化
+    时抛 ValueError。端到端钉住它返回 200 且把 NaN 呈现为 null。"""
+
+    def _insert_polluted_row(self, db):
+        db.conn.execute(
+            "INSERT INTO regime_snapshots (date, rule_label, rule_score, "
+            "llm_regime, llm_confidence, headline, action, metrics_json, "
+            "sectors_json, llm_json, report_md, news_json, model, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-08-06", "震荡(区间/分化)", -1, "", 0, "", "",
+             '{"above20": NaN, "above50": 44.6, "turn": NaN, "n_stocks": 1}',
+             "{}", "{}", "", "{}", "", "2026-08-06T17:35:00"))
+        db.conn.commit()
+
+    @pytest.mark.asyncio
+    async def test_history_survives_nan_row(self, client, db):
+        self._insert_polluted_row(db)
+        r = await client.get("/api/regime/history?limit=90")
+        assert r.status_code == 200
+        item = r.json()["items"][0]
+        assert item["metrics"]["above20"] is None      # NaN → null
+        assert item["metrics"]["above50"] == 44.6
+
+    @pytest.mark.asyncio
+    async def test_single_day_survives_nan_row(self, client, db):
+        self._insert_polluted_row(db)
+        r = await client.get("/api/regime/2026-08-06")
+        assert r.status_code == 200
+        assert r.json()["metrics"]["turn"] is None

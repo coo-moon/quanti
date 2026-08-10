@@ -20,6 +20,7 @@ metrics and the LLM with a scripted client. What actually needs guarding:
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from types import SimpleNamespace
 
@@ -183,6 +184,59 @@ class TestPersistence:
             "SELECT 1 FROM main.sqlite_master WHERE type='table' "
             "AND name='regime_snapshots'").fetchone()
         assert in_main is None
+
+
+# ------------------------------------------------------- 非有限浮点(NaN/Inf)
+
+class TestNonFiniteMetrics:
+    """NaN/±Inf 不是合法 JSON,一旦落库整条 /api/regime/* 就会 500。
+
+    真实发生过(2026-08-06):那天全市场只同步到 1 只股票,breadth 对空切片求
+    mean/median 得 NaN(above20/50/200、eq1、turn),`json.dumps` 默认
+    allow_nan=True 把裸 `NaN` 写进 metrics_json;读回是 float('nan'),而
+    starlette 的 JSONResponse 用 allow_nan=False 序列化 → ValueError → 500。
+
+    指标算不出来的语义就是「无值」= JSON null,前端 num() 已按 null 显示「—」。
+    """
+
+    def test_non_finite_metrics_persist_as_null(self, db, monkeypatch):
+        r = _fake_breadth()
+        r.update(above20=float("nan"), turn=float("nan"), eq1=float("inf"))
+        monkeypatch.setattr(R.breadth, "build", lambda path: r)
+        R.generate(db, llm=ScriptedLLM(GOOD), with_news=False)
+
+        raw = db.conn.execute(
+            "SELECT metrics_json FROM regime_snapshots").fetchone()[0]
+        assert "NaN" not in raw and "Infinity" not in raw, f"裸 NaN 落库了: {raw}"
+
+        m = R.load_latest(db)["metrics"]
+        assert m["above20"] is None and m["turn"] is None and m["eq1"] is None
+        assert m["above50"] == 21.0      # 正常值不受影响
+
+    def test_legacy_nan_row_still_loads_and_serializes(self, db):
+        """修复前写进库的污染行也必须能读出来 —— 否则历史接口永远 500,
+        除非手工改库。这条钉住「读侧也做净化」。"""
+        db.conn.execute(
+            "INSERT INTO regime_snapshots (date, rule_label, rule_score, "
+            "llm_regime, llm_confidence, headline, action, metrics_json, "
+            "sectors_json, llm_json, report_md, news_json, model, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-08-06", "震荡(区间/分化)", -1, "", 0, "", "",
+             # 老代码写出来的形态:裸 NaN(非法 JSON)
+             '{"above20": NaN, "above50": 44.6, "turn": NaN, "n_stocks": 1}',
+             '{"top20": [{"industry": "黄金", "ret": NaN, "n": 5}]}',
+             "{}", "", "{}", "", "2026-08-06T17:35:00"))
+        db.conn.commit()
+
+        rows = R.load_history(db)
+        assert rows[0]["metrics"]["above20"] is None
+        assert rows[0]["metrics"]["above50"] == 44.6
+        # starlette 就是这么序列化的 —— 不许抛
+        json.dumps({"items": rows}, allow_nan=False)
+
+        full = R.load_one(db, "2026-08-06")
+        assert full["sectors"]["top20"][0]["ret"] is None
+        json.dumps(full, allow_nan=False)
 
 
 # --------------------------------------------------------------- scheduling
