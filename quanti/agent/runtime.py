@@ -1103,13 +1103,19 @@ class AgentRuntime:
                         and fill_mode_ok(self._broker)
                         and str(p_.get("agent_mode", "")).lower() == "llm"
                         and not goal.strategy_name)
+                    # 算不出来的指标写「—」,不写 0:「MA50上方 0%」是一个极端
+                    # 看空的读数,而真相是「那天没数据」(2026-08-06 就是),
+                    # 两件事在事后排查时必须分得开。
+                    def _n(v, digits=0, unit="%", sign=""):
+                        return ("—" if v is None
+                                else f"{float(v):{sign}.{digits}f}{unit}")
                     self._db.log_decision(
                         "regime",
                         f"{snap['date']} {snap.get('rule_label', '')}"
                         f"(投票分 {int(snap.get('rule_score') or 0):+d})"
-                        f" · MA50上方 {float(m.get('above50') or 0):.0f}%"
-                        f" · 涨跌比 {float(m.get('ad_ratio') or 0):.2f}"
-                        f" · 成交额5v20 {float(m.get('amt_chg') or 0):+.1f}%"
+                        f" · MA50上方 {_n(m.get('above50'))}"
+                        f" · 涨跌比 {_n(m.get('ad_ratio'), 2, '')}"
+                        f" · 成交额5v20 {_n(m.get('amt_chg'), 1, '%', '+')}"
                         + (f" · {reason}" if reason else "")
                         + (" · 已注入 LLM 上下文" if into_prompt else " · 仅观测"),
                         details={"date": snap["date"],

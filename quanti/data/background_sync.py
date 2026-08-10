@@ -117,6 +117,14 @@ class BackgroundSyncConfig:
     max_queue_size: int = 6000
     """Safety valve: cap queue size so a buggy scan can't OOM."""
 
+    regime_retry_sec: int = 900
+    """How long to wait before re-running a regime snapshot that came back
+    *data-insufficient*. The 17:30 snapshot can land while the day's quotes are
+    still being synced (2026-08-06: `daily_quotes` held exactly one code at that
+    moment, so every breadth metric was NaN). That is not a failure to give up
+    on — once the bars land a re-run produces the real snapshot. Without a retry
+    the day stays a permanent "数据不足" hole, since the job only fires once."""
+
     max_topup_days: int = 10
     """By-date (tushare) fast-path: if the library is more than this many trading
     days behind, the daemon tops up only the newest `max_topup_days` and defers
@@ -169,6 +177,7 @@ class BackgroundQuoteSyncer:
         self._last_mine_day = None  # date of the last factor mining (once/day)
         self._regime_fn = regime_fn
         self._last_regime_day = None  # date of the last regime snapshot
+        self._regime_retry_at = None  # datetime; set when the day's data was thin
 
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
@@ -318,6 +327,11 @@ class BackgroundQuoteSyncer:
         Weekends/holidays: no new bar lands, so the snapshot would just re-run
         on a stale date. `generate` keys on the latest bar date and UPSERTs, so
         a weekend run is a harmless no-op rewrite — not worth a calendar lookup.
+
+        One case *does* get a second chance: a snapshot whose data layer came
+        back insufficient (`usable=False`) ran before the day's bars finished
+        landing, so it is retried after `regime_retry_sec`. Everything else —
+        success or exception — still latches the day.
         """
         if self._regime_fn is None:
             return
@@ -327,9 +341,25 @@ class BackgroundQuoteSyncer:
         today = now.date()
         if self._last_regime_day == today:
             return
+        if self._regime_retry_at is not None:
+            if now < self._regime_retry_at:
+                return          # cooling off — a re-run is a 10-20s full scan
+            self._regime_retry_at = None
         self._last_regime_day = today  # set first → a failure won't retry till tomorrow
         try:
-            self._regime_fn()
+            snap = self._regime_fn()
+            # Insufficient data is not a failure to give up on: the marker row
+            # is already persisted, but the real snapshot is still recoverable
+            # once the quotes land. Release the day's latch and come back later.
+            # A non-dict return (older wiring, tests) always latches.
+            if isinstance(snap, dict) and snap.get("usable") is False:
+                self._last_regime_day = None
+                self._regime_retry_at = now + timedelta(
+                    seconds=self._cfg.regime_retry_sec)
+                logger.warning(
+                    "bg-sync regime data insufficient (%s), retrying after %ds",
+                    snap.get("unusable_reason", ""), self._cfg.regime_retry_sec)
+                return
             logger.info("bg-sync regime snapshot done")
         except Exception as e:  # noqa: BLE001 - optional; never kills the loop
             logger.warning("bg-sync regime snapshot failed: %s", e)

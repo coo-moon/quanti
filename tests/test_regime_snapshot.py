@@ -16,12 +16,16 @@ metrics and the LLM with a scripted client. What actually needs guarding:
   * **the three gates on prompt injection** (TestRegimePromptGates below):
     opt-in off / immediate fill mode / stale snapshot each yield no context,
     and the payload never carries the report's LLM-written position advice.
+  * **the data-sufficiency gate** (TestDataSufficiencyGate below): a day whose
+    quotes only half-landed must not produce a normal-looking rule label. This
+    one runs against a *synthetic market.db* rather than a stub, because the
+    bug lived in the arithmetic (empty slice → NaN → every comparison False).
 """
 
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 import pandas as pd
@@ -29,6 +33,7 @@ import pytest
 
 from quanti.data.background_sync import BackgroundQuoteSyncer
 from quanti.data.database import Database
+from quanti.regime import breadth as B
 from quanti.regime import prompt as P
 from quanti.regime import report as R
 
@@ -56,6 +61,7 @@ def _fake_breadth(latest: str = "2026-07-29") -> dict:
         "amt_today": 23117.0, "amt5": 21187.0, "amt20": 26751.0,
         "amt_chg": -20.8, "turn": 2.22,
         "label": "震荡(区间/分化)", "score": -1, "reasons": ["MA50上方仅21%"],
+        "usable": True, "unusable_reason": "",
         "ind_top": ind, "ind_bot": ind, "ind5_top": ind,
     }
 
@@ -491,3 +497,312 @@ class TestLatestUsable:
         got = N._with_timeout(lambda: time.sleep(30) or "never", timeout=0.5)
         assert got is None
         assert time.perf_counter() - t0 < 3.0, "超时没封住,又退回死等了"
+
+
+# ------------------------------------------------- 数据充足性闸(合成 market.db)
+#
+# 这一组不 stub breadth —— bug 就长在算术里(空切片 .mean() → NaN,而 NaN 的
+# 每一个比较都是 False),只有跑真的 build() 才钉得住。
+
+HIST_DAYS = 210          # 够算 MA200(rolling min_periods=200)
+N_CODES = 600            # > breadth.MIN_STOCKS,健康对照组必须过闸
+LATEST = "2026-08-06"    # 事故当天
+
+
+def _seed_market(db, *, days=HIST_DAYS, n_codes=N_CODES, latest_codes=None,
+                 latest_are_new=False, basic=True, latest=LATEST) -> str:
+    """在 market.db 里造一份合成全市场行情,返回最后一个交易日。
+
+    价格单调上行 → 健康对照组会被判「上涨(多头)」,和「数据不足」区分得开。
+
+    `latest_codes` 限制最后一天落了多少只票 —— 这就是 2026-08-06 的形态:
+    17:30 的快照撞上当天行情还没同步完。`latest_are_new=True` 时这几只票
+    **只有最后一天这一行**,线上那只票正是如此,所以 MA/涨跌家数全部算不
+    出来;`False` 则它们有完整历史,MA 算得出来(只是只覆盖 1 只票)——
+    两种形态都必须被挡住,不能只靠「算出 NaN」来发现问题。
+    """
+    dates = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(end=latest, periods=days)]
+    codes = [f"{600000 + i:06d}" for i in range(n_codes)]
+    n_last = n_codes if latest_codes is None else latest_codes
+    hist_days = dates[:-1] if latest_are_new else dates
+    quotes, stocks = [], []
+    for i, c in enumerate(codes):
+        stocks.append((c, f"股{i}", "SH", dates[0], f"行业{i // 100}", None))
+        keep = hist_days if (latest_are_new or i < n_last) else hist_days[:-1]
+        quotes += [(c, d, p, p, p, p, 1e6, p * 1e6, 1.0, 1.0, "t")
+                   for k, d in enumerate(keep)
+                   for p in (10.0 + 0.01 * k + 0.001 * i,)]
+    last_codes = codes[:n_last]
+    if latest_are_new:                      # 当天唯一有行情的票是「没有历史」的新票
+        last_codes = [f"{301000 + i:06d}" for i in range(n_last)]
+        for i, c in enumerate(last_codes):
+            stocks.append((c, f"新股{i}", "SZ", dates[-1], "行业新", None))
+        quotes += [(c, dates[-1], 12.0, 12.0, 12.0, 12.0, 1e6, 3.965e8 / n_last,
+                    1.0, 1.0, "t") for c in last_codes]
+    db.conn.executemany(
+        "INSERT OR REPLACE INTO market.daily_quotes (code,date,open,high,low,"
+        "close,volume,amount,turnover,adj_factor,source) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)", quotes)
+    db.conn.executemany(
+        "INSERT OR REPLACE INTO market.stocks (code,name,exchange,list_date,"
+        "industry,delist_date) VALUES (?,?,?,?,?,?)", stocks)
+    if basic:      # 事故当天 daily_basic 一行都没有 → turn 是空 median
+        db.conn.executemany(
+            "INSERT OR REPLACE INTO market.daily_basic (code,date,total_mv,"
+            "turnover_rate) VALUES (?,?,?,?)",
+            [(c, dates[-1], 1e10, 2.0) for c in last_codes])
+    db.conn.commit()
+    return dates[-1]
+
+
+@pytest.fixture
+def market_path(tmp_path):
+    return str(tmp_path / "market.db")
+
+
+class TestDataSufficiencyGate:
+    """2026-08-06 复现:那天 17:30 的快照撞上当天行情还没同步完(daily_quotes
+    只有 1 只票、daily_basic 一行都没有)。上游算出 NaN 只是症状,真正的隐患
+    是 `classify()` 拿 NaN 做比较 —— `nan >= 60` 和 `nan <= 40` **都是 False**,
+    于是静默落进 else 分支,垃圾数据产出一个看着完全正常的「震荡(区间/分化)」
+    标签和投票分,还会被注入 LLM 决策 prompt。
+
+    PR #153 修的是序列化层(NaN 不再落库),这一组钉的是根因。
+    """
+
+    def test_healthy_day_still_classifies(self, db, market_path):
+        """先立对照组:完整的一天必须照常产出正常判定,否则这道闸就是在
+        制造假阴性 —— 那比原来的假阳性更糟。"""
+        _seed_market(db)
+        r = B.build(market_path)
+        assert r["usable"] is True and r["unusable_reason"] == ""
+        assert r["n_stocks"] == N_CODES
+        assert r["label"].startswith("上涨")      # 合成数据单调上行
+        assert r["above20"] is not None and r["above200"] is not None
+
+    def test_thin_day_is_marked_unusable(self, db, market_path):
+        """事故形态:当天只有 1 只**没有历史**的票 → 宽度指标全部算不出来。"""
+        _seed_market(db, latest_codes=1, latest_are_new=True, basic=False)
+        r = B.build(market_path)
+        assert r["n_stocks"] == 1
+        assert r["usable"] is False
+        assert r["unusable_reason"], "不可用必须给出原因,否则没法排查"
+        # 核心断言:不许再产出一个看着正常的判定
+        assert r["label"] == B.UNUSABLE_LABEL
+        for normal in ("上涨", "震荡", "下跌"):
+            assert normal not in r["label"], f"垃圾数据产出了「{normal}」判定"
+        assert r["score"] == 0
+        # NaN 换成 None:语义是「无值」,且 None 不会静默穿过比较
+        for k in ("above20", "above50", "above200", "turn", "eq1"):
+            assert r[k] is None, f"{k} 应为 None,实际 {r[k]!r}"
+
+    def test_thin_day_with_computable_ma_is_still_unusable(self, db, market_path):
+        """同样只覆盖 1 只票,但这只票有完整历史 → above* 算得出来且是 100%,
+        一个 NaN 都没有。这比 NaN 更危险:100% 看着像「全市场普涨」,而真相是
+        「那一只涨了」—— 拿真库倒回事故当天复放时正好撞上这一种。光靠「算出
+        NaN」发现不了它,必须有覆盖度闸。"""
+        _seed_market(db, latest_codes=1, latest_are_new=False)
+        r = B.build(market_path)
+        assert r["n_stocks"] == 1
+        assert r["above20"] == 100.0, "前提变了:这条测的就是没有 NaN 的情况"
+        # 这几个数字喂给 classify 会得到一个货真价实的「上涨(多头)」——
+        # 也就是说,救下这一天的只能是覆盖度闸,不是 NaN 的可疑性。
+        assert B.classify(100.0, 100.0, 100.0, None, None,
+                          1.0, 0.0)[0].startswith("上涨")
+        assert r["usable"] is False and r["label"] == B.UNUSABLE_LABEL
+
+    def test_half_synced_day_is_unusable(self, db, market_path, monkeypatch):
+        """同步到一半就快照:票数过了绝对下限,但只有平时的一半 —— 算出来的
+        宽度是有偏的,数值上却看不出任何异常。这条钉相对覆盖度闸。"""
+        monkeypatch.setattr(B, "MIN_STOCKS", 100)   # 关掉绝对闸,单独验相对闸
+        _seed_market(db, latest_codes=N_CODES // 2)
+        r = B.build(market_path)
+        assert r["n_stocks"] == N_CODES // 2
+        assert r["usable"] is False and r["label"] == B.UNUSABLE_LABEL
+        assert "覆盖" in r["unusable_reason"]
+
+    def test_render_survives_missing_metrics(self, db, market_path):
+        """render() 原来用 `f"{r['above20']:.0f}%"`,对 None 直接 TypeError ——
+        而不可用那天的 report_md 正是靠它生成的。"""
+        _seed_market(db, latest_codes=1, latest_are_new=True, basic=False)
+        out = B.render(B.build(market_path))
+        assert B.UNUSABLE_LABEL in out
+        assert "—" in out                     # 算不出来的指标显示为破折号
+
+    def test_classify_refuses_nan_structure(self):
+        """兜底:即使有人绕过 build() 的闸直接调 classify(),NaN 也不许再
+        变成「震荡」。`nan >= 60` 与 `nan <= 40` 同时为 False 就是原来的 bug。"""
+        nan = float("nan")
+        label, reasons, score = B.classify(nan, nan, nan, None, None, 0.0, 0.0)
+        assert label == B.UNUSABLE_LABEL and score == 0
+        assert reasons, "至少要说清哪个指标缺失"
+        label2, _, _ = B.classify(50.0, 50.0, None, 1.0, 1.0, 1.0, 0.0)
+        assert label2 == B.UNUSABLE_LABEL     # None 同样挡
+
+    def test_classify_unchanged_for_good_input(self):
+        """签名和既有行为不许动 —— _selfcheck 和调用方都依赖它。"""
+        assert B.classify(99, 99, 99, 3.0, 3.0, 5.0, 0)[0].startswith("上涨")
+        assert B.classify(10, 10, 10, -3.0, -3.0, 0.2, 0)[0].startswith("下跌")
+        assert B.classify(50, 50, 45, 0.0, 0.0, 1.0, 0)[0].startswith("震荡")
+
+
+class TestUnusableReasonPredicate:
+    """同一把尺子既量新算出来的 dict,也量**已落库的行** —— 包括修复前那些
+    带裸 NaN(读侧被 _json_safe 读成 None)的污染行,所以不需要数据迁移。"""
+
+    def test_polluted_legacy_row_is_flagged(self):
+        """2026-08-06 真实落库的 metrics(NaN 经读侧净化后变 None)。"""
+        assert B.unusable_reason(
+            {"above20": None, "above50": None, "above200": None,
+             "turn": None, "n_stocks": 1}, "震荡(区间/分化)")
+
+    def test_healthy_row_passes(self):
+        assert B.unusable_reason(
+            {"above20": 87.0, "above50": 44.6, "above200": 21.0,
+             "n_stocks": 5535}, "震荡(区间/分化)") == ""
+
+    def test_unusable_label_alone_is_enough(self):
+        """相对覆盖度闸算不出来时(落库的 metrics 里没有历史中位数),标签
+        本身就是凭据。"""
+        assert B.unusable_reason({"n_stocks": 3000}, B.UNUSABLE_LABEL)
+
+    def test_absent_keys_are_not_evidence(self):
+        """键缺失 ≠ 数据不足。_metrics_payload 会丢掉 None,老快照也可能只存
+        了几个字段 —— 把「没写」当成「不足」会把历史快照全部误杀。"""
+        assert B.unusable_reason({"above50": 21.0}) == ""
+        assert B.unusable_reason({}) == ""
+
+
+class TestUnusableSnapshotPersistence:
+    """不可用的一天:落库留痕(比开天窗好排查),但不喂 LLM、不进 prompt。"""
+
+    @pytest.fixture
+    def thin(self, monkeypatch):
+        r = _fake_breadth("2026-08-06")
+        r.update(usable=False, unusable_reason="当日仅 1 只个股有行情",
+                 label=B.UNUSABLE_LABEL, score=0, reasons=["当日仅 1 只个股有行情"],
+                 n_stocks=1, above20=None, above50=None, above200=None, turn=None)
+        monkeypatch.setattr(R.breadth, "build", lambda path: r)
+        return r
+
+    def test_saves_marker_and_skips_the_llm(self, db, thin):
+        """拿 1 只票的宽度让模型写千字报告,只会得到一篇自信的胡话,还要花
+        一次思考调用。"""
+        llm = ScriptedLLM(GOOD)
+        snap = R.generate(db, llm=llm, with_news=False)
+        assert llm.calls == [], "数据不足还是调了 LLM"
+        assert snap["usable"] is False
+        assert snap["rule_label"] == B.UNUSABLE_LABEL and snap["rule_score"] == 0
+        assert snap["llm_regime"] == "" and snap["headline"] == ""
+        loaded = R.load_latest(db)
+        assert loaded["rule_label"] == B.UNUSABLE_LABEL
+        assert "数据不足" in loaded["report_md"]
+
+    def test_marker_row_serializes_clean(self, db, thin):
+        R.generate(db, llm=ScriptedLLM(GOOD), with_news=False)
+        raw = db.conn.execute(
+            "SELECT metrics_json FROM regime_snapshots").fetchone()[0]
+        assert "NaN" not in raw and "Infinity" not in raw
+        json.dumps(R.load_history(db), allow_nan=False)
+
+    def test_marker_row_carries_no_market_metrics(self, db, monkeypatch):
+        """不可用那天的「指标」量的是当天恰好落库的那几只票,不是市场。若那只票
+        正好有完整历史,above20 就是 100% —— 前端会照着画一个「九成个股站上
+        MA20」的卡片。这种数字比 NaN 更危险,一律不落库。"""
+        r = _fake_breadth("2026-08-06")
+        r.update(usable=False, unusable_reason="当日仅 1 只个股有行情",
+                 label=B.UNUSABLE_LABEL, score=0, reasons=["x"], n_stocks=1,
+                 above20=100.0, above50=100.0, above200=100.0)
+        monkeypatch.setattr(R.breadth, "build", lambda path: r)
+        m = R.generate(db, llm=ScriptedLLM(GOOD), with_news=False)["metrics"]
+        assert m == {"n_stocks": 1}, f"垃圾指标落库了: {m}"
+        # 只剩 n_stocks 也照样挡得住注入(绝对覆盖 + 标签,双保险)
+        assert B.unusable_reason(m, B.UNUSABLE_LABEL)
+        assert B.unusable_reason(m)
+
+    def test_not_injected_into_prompt(self, db, thin):
+        """最重要的一条:垃圾快照不许进决策 prompt。"""
+        R.generate(db, llm=ScriptedLLM(GOOD), with_news=False)
+        now = datetime(2026, 8, 7, 16, 0)      # 次日,陈旧闸放行
+        snap, reason = P.latest_usable(db, now=now)
+        assert snap is not None, "仍要返回行,tick 日志才能说出「有快照但不可用」"
+        assert "数据不足" in reason
+        block, meta = P.regime_block(db, _goal(), _Broker(), now=now)
+        assert block == ""
+        assert meta["regime_injected"] is False
+        assert "数据不足" in meta["regime_skip_reason"]
+
+    def test_legacy_polluted_row_is_not_injected(self, db):
+        """修复前落库的行(rule_label 是正常的「震荡」、metrics 带 NaN)也必须
+        被挡 —— 否则要么手工改库,要么它一直在往 prompt 里注入垃圾。"""
+        db.conn.execute(
+            "INSERT INTO regime_snapshots (date, rule_label, rule_score, "
+            "llm_regime, llm_confidence, headline, action, metrics_json, "
+            "sectors_json, llm_json, report_md, news_json, model, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-08-06", "震荡(区间/分化)", -1, "", 0, "", "",
+             '{"above20": NaN, "above50": NaN, "above200": NaN, "n_stocks": 1}',
+             "{}", "{}", "", "{}", "", "2026-08-06T17:35:00"))
+        db.conn.commit()
+        block, meta = P.regime_block(db, _goal(), _Broker(),
+                                     now=datetime(2026, 8, 7, 16, 0))
+        assert block == "" and meta["regime_injected"] is False
+        assert "数据不足" in meta["regime_skip_reason"]
+
+    def test_usable_day_still_injects(self, db, stub_breadth):
+        """对照组:正常的一天照旧注入,这道闸没有顺手把好数据也挡了。"""
+        R.generate(db, llm=ScriptedLLM(GOOD), with_news=False)   # 2026-07-29
+        block, meta = P.regime_block(db, _goal(), _Broker(),
+                                     now=datetime(2026, 7, 30, 16, 0))
+        assert meta["regime_injected"] is True and "市场环境" in block
+
+
+class TestRegimeRetryOnInsufficientData:
+    """17:30 的快照可能撞上当天行情还没同步完(2026-08-06 就是)。不重试的话
+    这一天永久是个「数据不足」的洞 —— 生成器一天只有一次机会。"""
+
+    def _syncer(self, db, now_box, results):
+        return BackgroundQuoteSyncer(
+            db=db, now_fn=lambda: now_box[0], regime_fn=lambda: results.pop(0))
+
+    def test_unusable_result_retries_after_cooldown(self, db):
+        now = [datetime(2026, 8, 6, 17, 31)]
+        results = [{"usable": False, "unusable_reason": "仅 1 只"},
+                   {"usable": True}]
+        s = self._syncer(db, now, results)
+        s._maybe_run_regime()
+        assert len(results) == 1, "第一次没跑"
+        now[0] += timedelta(minutes=1)          # 冷却期内不许重复全市场扫描
+        s._maybe_run_regime()
+        assert len(results) == 1, "冷却期内又跑了一次"
+        now[0] += timedelta(seconds=s._cfg.regime_retry_sec)
+        s._maybe_run_regime()
+        assert results == [], "补齐后没有重试"
+
+    def test_usable_result_latches_the_day(self, db):
+        now = [datetime(2026, 8, 6, 17, 31)]
+        results = [{"usable": True}, {"usable": True}]
+        s = self._syncer(db, now, results)
+        s._maybe_run_regime()
+        now[0] += timedelta(hours=3)
+        s._maybe_run_regime()
+        assert len(results) == 1, "成功之后当天不该再跑"
+
+    def test_non_dict_result_still_latches(self, db):
+        """老口径 regime_fn 返回 None(app.py 以前就是),不能因此变成天天重试。"""
+        calls = []
+        s = BackgroundQuoteSyncer(db=db, now_fn=lambda: datetime(2026, 8, 6, 18, 0),
+                                  regime_fn=lambda: calls.append(1))
+        s._maybe_run_regime()
+        s._maybe_run_regime()
+        assert len(calls) == 1
+
+    def test_app_wiring_returns_the_snapshot(self):
+        """`_daily_regime` 必须把 snap 传出来,否则重试判断永远拿不到
+        usable=False —— 这个 wiring 断了不会有任何报错,只是静默失效。"""
+        import inspect
+
+        from quanti.api import app as app_mod
+        src = inspect.getsource(app_mod.create_app)
+        assert "return regime_report.generate(" in src, \
+            "_daily_regime 丢掉了返回值,数据不足重试会静默失效"
