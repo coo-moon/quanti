@@ -213,6 +213,13 @@ def _sectors_payload(r: dict) -> dict:
 
 
 def _metrics_payload(r: dict) -> dict:
+    if not r.get("usable", True):
+        # 数据面不可用时这些「指标」量的不是市场,而是当天恰好落了库的那几只票
+        # ——2026-08-06 只有 1 只,若它正好有完整历史,above20 就是 100%:那不是
+        # 「九成个股站上 MA20」,而是「那一只站上了」。这种数字比 NaN 更危险
+        # (NaN 至少一眼可疑),所以不落库、UI 也不显示,只留能解释原因的
+        # n_stocks。前端 num() 对缺失字段已经显示「—」。
+        return {"n_stocks": r.get("n_stocks")}
     keys = ("above20", "above50", "above200", "cap1", "eq1", "cap5", "eq5",
             "cap20", "eq20", "up", "dn", "fl", "ad_ratio", "nh", "nl",
             "amt_today", "amt5", "amt20", "amt_chg", "turn", "n_stocks")
@@ -295,23 +302,9 @@ def load_history(db, limit: int = 90) -> list[dict]:
 
 # ------------------------------------------------------------------ 入口
 
-def generate(db, db_path: str | None = None, llm=None,
-             with_news: bool = True) -> dict:
-    """跑一次完整快照并落库,返回快照 dict。
-
-    LLM 失败不代表整次失败:宽度指标是确定性的、当天唯一,照样存下来(LLM
-    字段留空),UI 至少还有规则层判定和全部指标 —— 比整天开天窗强。
-    """
-    path = db_path or getattr(db, "market_db_path", None) or breadth.DB
-    r = breadth.build(path)
-    news = news_mod.fetch_news() if with_news else {"cctv": [], "flash": []}
-    report_md, parsed, model = "", {}, ""
-    try:
-        report_md, parsed, model = run_llm(build_prompt(r, news), llm=llm)
-    except Exception as e:  # noqa: BLE001 - 数据面永远要落库
-        logger.warning("regime LLM failed, saving data-only snapshot: %s", e)
-        report_md = f"(LLM 报告生成失败:{e};以下仅数据面)\n\n" + breadth.render(r)
-    snap = {
+def _snapshot(r: dict, news: dict, report_md: str, parsed: dict,
+              model: str) -> dict:
+    return {
         "date": r["latest"],
         "rule_label": r["label"], "rule_score": int(r["score"]),
         "llm_regime": parsed.get("regime", ""),
@@ -321,7 +314,45 @@ def generate(db, db_path: str | None = None, llm=None,
         "metrics": _metrics_payload(r), "sectors": _sectors_payload(r),
         "llm": parsed, "report_md": report_md, "news": news,
         "model": model, "created_at": datetime.now().isoformat(timespec="seconds"),
+        # 不落库(没有这一列,也不值得为它开一次迁移):rule_label 已经是持久化
+        # 的凭据。放在返回值里是给调用方看的 —— background_sync 靠它决定当天
+        # 要不要重试,POST /api/regime/run 靠它告诉用户这次为什么没有报告。
+        "usable": bool(r.get("usable", True)),
+        "unusable_reason": r.get("unusable_reason", ""),
     }
+
+
+def generate(db, db_path: str | None = None, llm=None,
+             with_news: bool = True) -> dict:
+    """跑一次完整快照并落库,返回快照 dict。
+
+    LLM 失败不代表整次失败:宽度指标是确定性的、当天唯一,照样存下来(LLM
+    字段留空),UI 至少还有规则层判定和全部指标 —— 比整天开天窗强。
+
+    **数据面不可用**(见 `breadth.build` 的充足性闸)则完全不同:那天连指标
+    都不能信,所以既不调 LLM 也不产出判定,只落一行「数据不足」的标记。
+    """
+    path = db_path or getattr(db, "market_db_path", None) or breadth.DB
+    r = breadth.build(path)
+    if not r.get("usable", True):
+        # 不喂 LLM:拿 1 只票的宽度让模型写千字报告,得到的只会是一篇自信的
+        # 胡话,还要花一次思考调用 + 一次新闻抓取。也不产出判定 —— 落库留痕
+        # 是为了可排查(「那天到底跑没跑」),不是为了凑一个标签。
+        reason = r.get("unusable_reason") or "数据不足"
+        logger.warning("regime data insufficient (%s), saving marker only", reason)
+        note = (f"(数据不足,本次快照不可用:{reason}。未调用 LLM;当日行情"
+                f"补齐后后台会自动重跑。)\n\n") + breadth.render(r)
+        snap = _snapshot(r, news={}, report_md=note, parsed={}, model="")
+        save(db, snap)
+        return snap
+    news = news_mod.fetch_news() if with_news else {"cctv": [], "flash": []}
+    report_md, parsed, model = "", {}, ""
+    try:
+        report_md, parsed, model = run_llm(build_prompt(r, news), llm=llm)
+    except Exception as e:  # noqa: BLE001 - 数据面永远要落库
+        logger.warning("regime LLM failed, saving data-only snapshot: %s", e)
+        report_md = f"(LLM 报告生成失败:{e};以下仅数据面)\n\n" + breadth.render(r)
+    snap = _snapshot(r, news, report_md, parsed, model)
     save(db, snap)
     logger.info("regime snapshot saved: %s rule=%s llm=%s",
                 snap["date"], snap["rule_label"], snap["llm_regime"] or "-")

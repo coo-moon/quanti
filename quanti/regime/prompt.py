@@ -6,7 +6,7 @@
 LLM 最长 300s)会把这个空窗拉到 14 分钟以上。这里只做一次 `load_latest`
 (实测 0.9ms),快照由 17:30 的后台任务负责生产。
 
-**三道闸**(任何一道不过都返回空,tick 照常跑):
+**四道闸**(任何一道不过都返回空,tick 照常跑):
 
 1. `goal.params["regime_in_prompt"]` — **默认开**(2026-07-30 起,口径同
    `wf_enabled`:键缺失=开,只有显式 `false` 才关)。默认开的前提是本模块把
@@ -17,6 +17,11 @@ LLM 最长 300s)会把这个空窗拉到 14 分钟以上。这里只做一次 `l
    收盘算出来的全市场宽度去影响 T 日 close 的成交,是教科书级前视。
 3. **陈旧闸**:快照与决策日相隔超过 1 个交易日就不注入(长假、后台任务挂了、
    数据没同步上)。宁可没有环境描述,也不要拿上周的宽度当今天的。
+4. **数据充足性闸**:快照本身标记了「数据不足」,或从 metrics 反推得出当日
+   覆盖过低 / 宽度指标为空,就不注入。2026-08-06 全市场只同步到 1 只票,
+   `classify()` 拿 NaN 做比较(`nan >= 60` 与 `nan <= 40` 同时为 False)静默
+   落进 else 分支,于是垃圾数据产出了一个看着正常的「震荡(区间/分化)」标签
+   —— 这道闸挡的就是那种「假装正常」的快照,含修复前已落库的污染行。
 
 **注入什么、不注入什么**——这是本模块最重要的部分,别随手加字段:
 
@@ -78,7 +83,7 @@ def latest_usable(db, *, provider=None, now: datetime | None = None
 
     tick 日志和 prompt 注入共用这一个判断,免得两处口径漂移。
     """
-    from quanti.regime import report  # noqa: PLC0415 - 懒加载,避免 import 环
+    from quanti.regime import breadth, report  # noqa: PLC0415 - 懒加载,避免 import 环
     from quanti.utils.market import (  # noqa: PLC0415
         count_trading_days_between, order_decision_date)
 
@@ -89,6 +94,15 @@ def latest_usable(db, *, provider=None, now: datetime | None = None
         snap_d = date.fromisoformat(str(snap["date"]))
     except (ValueError, KeyError, TypeError):
         return None, f"快照日期不可解析: {snap.get('date')!r}"
+    # 数据充足性闸。2026-08-06:全市场只同步到 1 只票,宽度指标全是 NaN,而
+    # NaN 静默穿过 classify() 的每一个比较,照样产出了「震荡(区间/分化)」——
+    # 一个看着完全正常的判定。这里既认新快照的 UNUSABLE_LABEL,也从 metrics
+    # 反推(n_stocks 过小 / 宽度指标为空),所以修复前落库的污染行不用迁移
+    # 也进不来。宁可没有环境描述,也不要拿垃圾数据当今天的大盘。
+    bad = breadth.unusable_reason(snap.get("metrics") or {},
+                                  snap.get("rule_label") or "")
+    if bad:
+        return snap, f"数据不足({bad})"
     decision_d = order_decision_date(now or datetime.now(), provider)
     if snap_d > decision_d:
         # 方向闸。count_trading_days_between 在 start >= end 时返回 0(见

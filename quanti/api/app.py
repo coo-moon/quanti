@@ -112,9 +112,11 @@ def create_app(
     # DeepSeek v4-flash in thinking mode, persisted to market.regime_snapshots.
     # Observe-only — it never emits a trade signal. Without DEEPSEEK_API_KEY the
     # data layer still lands and only the narrative is skipped.
-    def _daily_regime() -> None:
+    # 返回值不能丢:数据面不可用时 bg_sync 靠 snap["usable"] 决定当天要不要
+    # 重试(17:30 可能撞上当天行情还没同步完 —— 2026-08-06 就是)。
+    def _daily_regime() -> dict:
         from quanti.regime import report as regime_report
-        regime_report.generate(db)
+        return regime_report.generate(db)
 
     bg_sync = BackgroundQuoteSyncer(db=db, financials_fn=_sync_latest_financials,
                                     mining_fn=_auto_mine_factors,
