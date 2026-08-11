@@ -1999,11 +1999,17 @@ class Database:
                      code: str = "", details: dict | None = None) -> int:
         import json
         from datetime import datetime
+
+        from quanti.utils.jsonsafe import json_safe
         cur = self.conn.execute(
             "INSERT INTO agent_decisions (ts, kind, code, summary, details_json) "
             "VALUES (?, ?, ?, ?, ?)",
+            # details 是各条决策路径自由塞进来的(指标、评分、仓位…),里头混进
+            # NaN/±Inf 的机会很多,而 json.dumps 默认 allow_nan=True 会把非法
+            # JSON 写进库 —— 真实发生过:regime 的 NaN 指标经这里落库,
+            # /api/agent/decisions 整条 500。净化后再落。
             (datetime.now().isoformat(), kind, code, summary,
-             json.dumps(details or {})),
+             json.dumps(json_safe(details or {}))),
         )
         self.conn.commit()
         return int(cur.lastrowid or 0)

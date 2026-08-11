@@ -462,3 +462,47 @@ class TestRegimeHistoryEndpoint:
         r = await client.get("/api/regime/2026-08-06")
         assert r.status_code == 200
         assert r.json()["metrics"]["turn"] is None
+
+
+class TestDecisionLogNonFinite:
+    """/api/agent/decisions 曾整条 500:一条 kind=regime 的决策把带 NaN 的
+    宽度指标塞进了 details_json(log_decision 用默认 allow_nan=True 落库),
+    读回后 starlette 以 allow_nan=False 序列化即抛 ValueError。
+
+    与 /api/regime/* 那次是同一个根因、不同出口,所以这里守的是两条边界:
+    写侧不再落非法 JSON,读侧(响应层)兜住已经落库的旧行。
+    """
+
+    @pytest.mark.asyncio
+    async def test_log_decision_persists_nan_as_null(self, client, db):
+        db.log_decision("regime", "宽度快照",
+                        details={"metrics": {"above20": float("nan"),
+                                             "above50": 44.6,
+                                             "turn": float("inf")}})
+        raw = db.conn.execute(
+            "SELECT details_json FROM agent_decisions ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        assert "NaN" not in raw and "Infinity" not in raw, f"裸 NaN 落库了: {raw}"
+
+        r = await client.get("/api/agent/decisions?limit=50")
+        assert r.status_code == 200
+        m = r.json()[0]["details"]["metrics"]
+        assert m["above20"] is None and m["turn"] is None
+        assert m["above50"] == 44.6
+
+    @pytest.mark.asyncio
+    async def test_endpoint_survives_legacy_nan_row(self, client, db):
+        """修复前落库的污染行(裸 NaN)也必须能读出来 —— 这正是线上那条
+        500 的形态,响应层兜底就是为它准备的。"""
+        db.conn.execute(
+            "INSERT INTO agent_decisions (ts, kind, code, summary, details_json) "
+            "VALUES (?,?,?,?,?)",
+            ("2026-08-07T17:30:43", "regime", "", "宽度快照",
+             '{"metrics": {"above20": NaN, "above50": 44.6, "turn": NaN}}'))
+        db.conn.commit()
+
+        r = await client.get("/api/agent/decisions?limit=50")
+        assert r.status_code == 200
+        m = r.json()[0]["details"]["metrics"]
+        assert m["above20"] is None and m["turn"] is None
+        assert m["above50"] == 44.6

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from quanti.agent.runtime import AgentRuntime
@@ -16,12 +16,37 @@ from quanti.data.background_sync import BackgroundQuoteSyncer
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.execution.factory import make_broker
+from quanti.utils.jsonsafe import json_safe
 
 # Resolve web/dist relative to project root
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _DIST_DIR = _PROJECT_ROOT / "web" / "dist"
 
 logger = logging.getLogger(__name__)
+
+
+class SafeJSONResponse(JSONResponse):
+    """响应里的 NaN/±Inf 渲染成 `null`,而不是让整个端点 500。
+
+    starlette 的 JSONResponse 用 `allow_nan=False` 序列化(合规做法:裸 NaN
+    不是合法 JSON,前端 JSON.parse 也解不了),于是**任何一个**混进 NaN 的字段
+    都会把整条响应打成 500。这在本项目已经发生过两次、且在两个不同端点
+    (/api/regime/* 与 /api/agent/decisions),数据源头各不相同 —— 说明这是边界
+    问题,不该在每个模块各修一次。
+
+    先按原样严格序列化,**只有**抛 ValueError 时才做一次净化重试:正常响应
+    (绝大多数)零额外开销,不会给 /api/stocks 这类大响应白加一遍递归。
+
+    注意这是最后一道兜底,不是许可证 —— 数据仍应在落库前净化(见
+    quanti.utils.jsonsafe 的模块说明),否则库里会攒下解析不了的非法 JSON。
+    """
+
+    def render(self, content) -> bytes:
+        try:
+            return super().render(content)
+        except ValueError:
+            logger.warning("响应含非有限浮点(NaN/Inf),已降级为 null 后返回")
+            return super().render(json_safe(content))
 
 
 def create_app(
@@ -158,7 +183,8 @@ def create_app(
         except Exception:
             pass
 
-    app = FastAPI(title="Quanti", version="0.2.0", lifespan=_lifespan)
+    app = FastAPI(title="Quanti", version="0.2.0", lifespan=_lifespan,
+                  default_response_class=SafeJSONResponse)
 
     app.add_middleware(
         CORSMiddleware,

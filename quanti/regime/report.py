@@ -24,11 +24,11 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
 from datetime import date, datetime
 
 from quanti.regime import breadth, news as news_mod
+from quanti.utils.jsonsafe import json_safe
 
 logger = logging.getLogger(__name__)
 
@@ -178,29 +178,10 @@ def run_llm(prompt: str, llm=None) -> tuple[str, dict, str]:
 
 # ------------------------------------------------------------------ 持久化
 
-def _json_safe(obj):
-    """递归把非有限浮点(NaN/±Inf)换成 None,其余原样返回。
-
-    裸 `NaN`/`Infinity` **不是合法 JSON**,但 `json.dumps` 默认 allow_nan=True
-    照写不误,于是非法 JSON 进了库;`json.loads` 默认又能把它读回 float('nan'),
-    所以本地读写都「看着正常」,直到 FastAPI/starlette 用 allow_nan=False 序列化
-    响应 —— 整条 /api/regime/* 直接 500(2026-08-06 真实发生:那天全市场只同步到
-    1 只股票,breadth 对空切片求 mean/median 得 NaN)。前端 `JSON.parse` 同样吃
-    不下裸 NaN。
-
-    指标算不出来的语义就是「无值」,对应 JSON null —— 前端 num() 已按 null 显示
-    「—」,所以这里统一收敛到 None,而不是丢字段或填 0(填 0 会被读成「真的是 0%」)。
-
-    写侧(save)与读侧(_row_to_dict)都过一遍:写侧保证新数据干净,读侧兜住修复
-    前已落库的污染行(否则历史接口永远 500,除非手工改库)。
-    """
-    if isinstance(obj, float):        # np.float64 是 float 子类,一并覆盖
-        return obj if math.isfinite(obj) else None
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(v) for v in obj]
-    return obj
+#: 全项目共用一份净化实现(见 quanti.utils.jsonsafe 的模块说明:同一个 NaN
+#: 坑先后从 /api/regime/* 和 /api/agent/decisions 两个出口冒出来过)。
+#: 保留这个别名,下面写侧/读侧的调用点与注释都不必改。
+_json_safe = json_safe
 
 
 def _sectors_payload(r: dict) -> dict:
