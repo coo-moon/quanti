@@ -214,6 +214,12 @@ class OpenAICompatLLMClient:
         name — lets callers log ground truth instead of the alias."""
         return self._resolve_model(model)
 
+    # 对暂时性失败(限流/服务端错误/超时)的指数退避重试。止损点位与盘中
+    # 守护的决策链现在都过这个 client——之前全链路零重试,一次 429 就等于
+    # 本轮空手(红队可用性面 F1)。4xx(除 429)不重试:请求本身有病。
+    _RETRIES = 2
+    _BACKOFF_SEC = (1.0, 4.0)
+
     def create_message(self, *, model, system, messages, tools,
                         max_tokens, temperature) -> dict:
         payload: dict = {
@@ -239,9 +245,27 @@ class OpenAICompatLLMClient:
                 # keep thinking (that's what the v4 thinking tier is for).
                 if _thinking_on_by_default(payload["model"]):
                     payload["thinking"] = {"type": "disabled"}
-        resp = self._client.post(self._url, headers=self._headers, json=payload)
-        resp.raise_for_status()
-        return from_openai_response(resp.json())
+        import time as _time
+        last_exc: Exception | None = None
+        for attempt in range(self._RETRIES + 1):
+            try:
+                resp = self._client.post(self._url, headers=self._headers,
+                                         json=payload)
+                resp.raise_for_status()
+                return from_openai_response(resp.json())
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status != 429 and status < 500:
+                    raise  # client error — retrying the same payload is futile
+                last_exc = e
+            except httpx.HTTPError as e:  # timeouts, transport errors
+                last_exc = e
+            if attempt < self._RETRIES:
+                delay = self._BACKOFF_SEC[min(attempt, len(self._BACKOFF_SEC) - 1)]
+                logger.warning("LLM call failed (%s), retry %d/%d in %.0fs",
+                               last_exc, attempt + 1, self._RETRIES, delay)
+                _time.sleep(delay)
+        raise last_exc
 
     def close(self) -> None:
         self._client.close()

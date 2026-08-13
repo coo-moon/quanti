@@ -63,7 +63,7 @@ def main() -> int:
     ap.add_argument("--start", default="")
     ap.add_argument("--end", default="")
     ap.add_argument("--cash", type=float, default=1_000_000.0)
-    ap.add_argument("--strategies", default="ma_cross,turtle_breakout,ma_volume,macd_cross")
+    ap.add_argument("--strategies", default="ma_cross,turtle_breakout,kdj_cross,macd_cross")
     args = ap.parse_args()
 
     db = Database(args.db)

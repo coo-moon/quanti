@@ -88,7 +88,8 @@ class TestDecisionLoop:
             ], reasoning="选 1 单"),
         ])
         loop = LLMDecisionLoop(client, LLMConfig(max_tool_iterations=3))
-        proposed, reasoning, debug = loop.run("ctx", lambda n, i: "{}")
+        terminal, reasoning, debug = loop.run("ctx", lambda n, i: "{}")
+        proposed = terminal.get("orders") or []
         assert len(proposed) == 1
         assert proposed[0]["code"] == "000001"
         assert reasoning == "选 1 单"
@@ -106,9 +107,9 @@ class TestDecisionLoop:
             return '{"recent": []}'
 
         loop = LLMDecisionLoop(client, LLMConfig(max_tool_iterations=3))
-        proposed, reasoning, debug = loop.run("ctx", dispatcher)
+        terminal, reasoning, debug = loop.run("ctx", dispatcher)
         assert dispatch_calls == ["inspect_decision_history"]
-        assert proposed == []
+        assert (terminal.get("orders") or []) == []
         assert "不开仓" in reasoning
         assert debug["iterations"] == 2
 
@@ -120,8 +121,8 @@ class TestDecisionLoop:
             _inspect_block("inspect_decision_history", {"limit": 1}, tool_id="t3"),
         ])
         loop = LLMDecisionLoop(client, LLMConfig(max_tool_iterations=3))
-        proposed, reasoning, debug = loop.run("ctx", lambda n, i: "{}")
-        assert proposed == []
+        terminal, reasoning, debug = loop.run("ctx", lambda n, i: "{}")
+        assert terminal == {}
         assert debug["iterations"] == 3
 
     def test_llm_exception_returns_empty(self):
@@ -130,8 +131,8 @@ class TestDecisionLoop:
                 raise RuntimeError("simulated transport error")
 
         loop = LLMDecisionLoop(Bad(), LLMConfig())
-        proposed, reasoning, debug = loop.run("ctx", lambda n, i: "{}")
-        assert proposed == []
+        terminal, reasoning, debug = loop.run("ctx", lambda n, i: "{}")
+        assert terminal == {}
         assert "error" in debug
 
 

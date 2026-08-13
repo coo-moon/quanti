@@ -278,6 +278,9 @@ export interface LiveStopPosition {
   stop_pct: number;
   atr_driven: boolean;
   entry_strategy: string;
+  // llm_full 模式:止损价来自 LLM 落库点位,并附加仓价。
+  llm_plan?: boolean;
+  add_price?: number;
 }
 
 export interface LiveStatus {
@@ -288,11 +291,30 @@ export interface LiveStatus {
     running: boolean;
     connected: boolean | null;
     in_session: boolean;
+    llm_guard?: { mode: boolean; interval_sec: number; running: boolean };
   };
   positions: LiveStopPosition[];
 }
 
 export const fetchLiveStatus = () => api.get<LiveStatus>("/agent/live-status");
+
+// --- llm_full 模式:每持仓 LLM 点位计划 ---
+export interface PositionPlan {
+  code: string;
+  name: string;
+  quantity: number;
+  avg_cost: number;
+  current_price: number;
+  stop_price: number;
+  add_price: number;
+  add_size_pct: number;
+  plan_reason: string;
+  plan_updated_at: string;
+}
+export const fetchPositionPlans = () =>
+  api.get<PositionPlan[]>("/agent/position-plans");
+export const fetchLlmAudit = (limit = 10) =>
+  api.get<DecisionRecord[]>("/agent/llm-audit", { params: { limit } });
 
 export interface OrderRecord {
   order_id: string;
@@ -445,6 +467,8 @@ export interface RiskControl {
   rotation_margin: number;
   max_position_pct: number;
   max_industry_pct: number;
+  // llm_full 模式的每标的灾难地板(0=关;仅兜底 LLM 点位缺失/被穿透)。
+  llm_disaster_floor_pct: number;
 }
 export const fetchRiskControl = () =>
   api.get<RiskControl>("/config/risk-control");

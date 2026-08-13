@@ -122,6 +122,11 @@ class PaperBroker:
         self._strategies_dir = strategies_dir
         self._realtime_quote_fn = realtime_quote_fn
         self._strategy_cache: dict | None = None  # name → strategy instance
+        # LLM 全权模式 (agent_mode="llm_full") 开关。runtime 每个 tick / guard
+        # 轮按 goal 同步,单一真源是 goal.params。True 时:离场只看 LLM 落库
+        # 点位+灾难地板(check_exits 分支)、加仓触发生效(check_llm_adds)、
+        # 买入护栏只剩 risk caps(protections 旁路)、盘中 BUY 走实时价即时成交。
+        self.llm_managed = False
         # Idempotent — only writes if no row exists.
         self._db.ensure_portfolio(initial_cash)
 
@@ -135,7 +140,15 @@ class PaperBroker:
     def _entry_allowed(self, signal: Signal,
                        portfolio) -> tuple[bool, str, str]:
         """Risk caps + protections gate for an entry, via the shared helper.
-        Returns (ok, reason, reject_kind). Protections only gate BUY."""
+        Returns (ok, reason, reject_kind). Protections only gate BUY.
+
+        LLM 全权模式:四守卫(StoplossGuard/MaxDrawdown/Correlation/Unlock)
+        整体旁路——买入判断权归 LLM;只保留 RiskManager 的 sanity caps
+        (单票/日内开仓数,UI 可调大)。protections 代码不动,ensemble/live
+        链路照旧。"""
+        if self.llm_managed:
+            ok, reason = self._risk.check(signal, portfolio)
+            return ok, reason, ("" if ok else "risk_reject")
         from quanti.risk.protection_context import evaluate_entry
         return evaluate_entry(self._risk, self._protections, self._db,
                               self._provider, signal, portfolio)
@@ -338,6 +351,15 @@ class PaperBroker:
                     # now, instead of parking a doomed pending order.
                     landed, reason = self._sell_now(signal, strategy_name, price)
                     return ("filled" if landed else "rejected"), reason
+        elif self.llm_managed:
+            # LLM 全权模式的实时买入(live-mirror,对称 SELL 分支):盘中有
+            # 可用实时报价且非涨停锁板 → 立即按当前价成交,LLM 的决策不再等
+            # 次日开盘。无报价/盘外/涨停锁 → 照旧排队 next-open(腾讯源无
+            # SLA,回退必须保留)。极端高开熔断在 _buy_now 内检查。
+            price = self._intraday_marks([signal.stock_code]).get(signal.stock_code)
+            if price and not self._limit_up_locked(signal.stock_code, price):
+                landed, reason = self._buy_now(signal, strategy_name, price)
+                return ("filled" if landed else "rejected"), reason
         landed, reason = self._queue_pending_signal(signal, strategy_name)
         return ("pending" if landed else "rejected"), reason
 
@@ -725,6 +747,52 @@ class PaperBroker:
                      "filled": result.filled, "pending": result.pending})
         return acted
 
+    def _limit_up_locked(self, code: str, hfq_price: float) -> bool:
+        """A market buy can't fill into a limit-up lock — mirror of
+        `_limit_down_locked` on the up side (incl. 一字板)."""
+        ref = self._db.get_latest_quote_before(code, date.today() + timedelta(days=1))
+        if ref is None or ref[0] <= 0:
+            return False
+        raw_close, factor = ref
+        raw_now = hfq_price / (factor if factor > 0 else 1.0)
+        stock = self._db.get_stock(code)
+        band = (0.05 if stock and "ST" in (stock.name or "")
+                else board_limit_pct(code))
+        return raw_now >= raw_close * (1 + band) - 1e-9
+
+    def _buy_now(self, signal: Signal, strategy_name: str,
+                 price: float) -> tuple[bool, str]:
+        """Fill a BUY immediately at the given in-session realtime mark (hfq
+        axis) — LLM 全权模式的实时买入,对称 `_sell_now`。风控 sanity 闸、
+        极端高开熔断、资金/整手/参与率全部走既有 `_fill_buy` 检查;昨日 bar
+        turnover 代理今日参与率上限(同 _sell_now)。"""
+        portfolio = self._build_runtime_portfolio()
+        ok, reason, kind = self._entry_allowed(signal, portfolio)
+        if not ok:
+            self._record_order(signal, strategy_name, status="rejected",
+                               reason=reason)
+            self._db.log_decision(
+                kind, f"风控拒绝 buy {signal.stock_code}: {reason}",
+                code=signal.stock_code,
+                details={"signal_reason": signal.reason, "stage": "realtime"})
+            return False, reason
+        # 极端高开熔断(唯一实证毒尾,PR#121):实时价 vs 昨收(同 hfq 轴)。
+        bar = self._latest_bar(signal.stock_code)
+        pc = float(bar.close) if bar else None
+        if extreme_gap_up_blocked(price, pc,
+                                  self._risk.config.extreme_gap_up_block_pct):
+            r = (f"极端高开 {(price / pc - 1):.1%} ≥ "
+                 f"{self._risk.config.extreme_gap_up_block_pct:.0%},放弃追高")
+            self._record_order(signal, strategy_name, status="rejected", reason=r)
+            self._db.log_decision(
+                "order_gap_abandoned",
+                f"放弃追高 买入 {signal.stock_code}: {r}",
+                code=signal.stock_code, details={"gap": price / pc - 1})
+            return False, r
+        filled = self._fill_buy(signal, price, date.today(), strategy_name,
+                                bar_amount=float(bar.amount or 0) if bar else 0.0)
+        return filled, ("" if filled else "买入未成交(资金/容量不足)")
+
     def _limit_down_locked(self, code: str, hfq_price: float) -> bool:
         """A market sell can't fill into a limit-down lock. Judge on the raw
         quote (hfq mark ÷ factor) vs the last raw close with the stock's band
@@ -962,6 +1030,8 @@ class PaperBroker:
                 frozen_qty=min(kept, remaining), frozen_date=bar_date)
         else:
             self._db.delete_position(signal.stock_code)
+            # 全平后同步删 LLM 计划行,旧点位不许粘到未来同名新仓上。
+            self._db.delete_llm_plan(signal.stock_code)
         self._db.update_order_filled(order_id, "filled", price, quantity)
         trade_id = "t_" + uuid.uuid4().hex[:10]
         self._db.insert_trade({
@@ -1198,6 +1268,8 @@ class PaperBroker:
                 frozen_qty=min(kept, remaining), frozen_date=bar_date)
         else:
             self._db.delete_position(signal.stock_code)
+            # 全平后同步删 LLM 计划行,旧点位不许粘到未来同名新仓上。
+            self._db.delete_llm_plan(signal.stock_code)
 
         order_id = self._record_order(
             signal, strategy_name,
@@ -1254,6 +1326,19 @@ class PaperBroker:
             if price:
                 position.current_price = price
 
+        # LLM 全权模式:唯一的日常离场 = LLM 落库点位 + 灾难地板。ATR/固定
+        # 地板/策略离场重放/移动止盈/削峰全部不跑——离场判断权归 LLM。
+        # LLM API 失联时这里读到的仍是最后一次成功落库的点位,保护不断档。
+        if self.llm_managed:
+            llm_stops = {p["code"]: float(p.get("stop_price") or 0.0)
+                         for p in self._db.list_llm_plans()}
+            sells = self._risk.check_llm_exits(portfolio, llm_stops)
+            landed = 0
+            for s in sells:
+                if self.execute_signal(s, strategy_name="risk_exit"):
+                    landed += 1
+            return landed
+
         positions = self._db.list_positions()
         peaks = self._compute_peaks(positions)
         strategy_sells = self._compute_strategy_exits(positions)
@@ -1276,6 +1361,49 @@ class PaperBroker:
         for s in trims:
             if self.execute_signal(s, strategy_name=DRIFT_TRIM_STRATEGY):
                 landed += 1
+        return landed
+
+    def check_llm_adds(self) -> int:
+        """LLM 全权模式的加仓触发:实时价回落到 LLM 设定的 add_price 以下 →
+        按 add_size_pct 买入(走正常买入链路:sanity 闸/资金/整手/参与率/涨停
+        锁自然生效)。提交(成交或排队)后立即清掉该点位,防 5 秒机械 guard
+        重复触发;若被拒,LLM 下一轮守护自会看到并重设。非 LLM 模式 no-op。"""
+        if not self.llm_managed:
+            return 0
+        plans = [p for p in self._db.list_llm_plans()
+                 if float(p.get("add_price") or 0.0) > 0]
+        if not plans:
+            return 0
+        held = {p["code"]: p for p in self._db.list_positions()}
+        plans = [p for p in plans if p["code"] in held]
+        if not plans:
+            return 0
+        marks = self._intraday_marks([p["code"] for p in plans])
+        cap = max(0.01, float(self._risk.config.max_position_pct or 0.20))
+        landed = 0
+        for p in plans:
+            price = marks.get(p["code"])
+            if not price or price > float(p["add_price"]):
+                continue
+            size_pct = float(p.get("add_size_pct") or 0.0) or 0.05
+            sig = Signal(
+                stock_code=p["code"], direction=Direction.BUY,
+                strength=min(1.0, size_pct / cap),
+                reason=(f"LLM加仓 现价{price:.2f} ≤ 点位{p['add_price']:.2f}"
+                        + (f" ({p.get('reason', '')})" if p.get("reason") else "")))
+            status, _reason = self._submit_one(sig, "llm_guard")
+            # 触发即消费:成交/排队都清点位(排队单已带着买入意图);被拒
+            # (资金/风控)也清——留着只会每 5 秒再拒一次刷屏,LLM 下轮重设。
+            self._db.clear_llm_add_price(p["code"])
+            if status != "rejected":
+                landed += 1
+                self._db.log_decision(
+                    "llm_add_triggered",
+                    f"LLM加仓触发 {p['code']} @ {price:.2f} ≤ {p['add_price']:.2f}"
+                    f" ({status})",
+                    code=p["code"],
+                    details={"add_price": p["add_price"], "price": price,
+                             "add_size_pct": size_pct, "status": status})
         return landed
 
     # Back-compat alias — older callers / tests may still call this name.

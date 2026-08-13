@@ -167,6 +167,21 @@
           <div class="mode-title">LLM 决策</div>
           <div class="mode-desc">ensemble 候选 → LLM 拍板 · 默认 DeepSeek，可切 Anthropic</div>
         </button>
+        <button
+          type="button"
+          class="mode-pill"
+          :class="{ 'mode-active mode-llm-active': advParams.agent_mode === 'llm_full' }"
+          @click="applyPreset('llm_full')"
+        >
+          <div class="mode-title">LLM 全权</div>
+          <div class="mode-desc">100 候选直达 LLM · 买卖/止损/加仓点位全归 LLM · 盘中 LLM 守护 · 仅模拟盘</div>
+        </button>
+      </div>
+      <div class="adv-note" v-if="advParams.agent_mode === 'llm_full'">
+        全权模式:买入护栏只剩单票上限/日内开仓数等 sanity 闸;止损=LLM 落库点位
+        (本地机械守护 5 秒比价执行,LLM 失联沿用最后点位)+ 灾难地板(风控审计页可调);
+        盘中每 {{ advParams.llm_guard_interval_sec }}s 由 LLM 复核持仓并即刻执行。
+        实盘账户拒绝此模式。
       </div>
       <details class="advanced">
         <summary>高级开关(单独细调,会覆盖预设)</summary>
@@ -268,6 +283,18 @@
             <span>llm_reflection</span>
             <em>④ 历史经验(按相关度 + 已实现盈亏;仅 LLM 模式)</em>
           </label>
+          <label class="adv-num">
+            <span>llm_guard_interval_sec</span>
+            <input type="number" step="60" min="60" max="3600"
+                   v-model.number="advParams.llm_guard_interval_sec" />
+            <em>盘中 LLM 守护间隔秒数(仅 LLM 全权模式;默认 300 = 5 分钟)</em>
+          </label>
+          <label class="adv-num">
+            <span>llm_max_orders</span>
+            <input type="number" step="1" min="1" max="30"
+                   v-model.number="advParams.llm_max_orders" />
+            <em>LLM 单轮订单数上限(仅 LLM 全权模式;默认 10)</em>
+          </label>
         </div>
         <div class="adv-note">
           ②③④ 仅在 <b>LLM 决策</b>模式生效;① 情绪在 ensemble 也生效。需配置对应供应商
@@ -351,6 +378,13 @@
               : (liveStatus.guard.connected ? "已连通" : "未连通")
           }}</span>
           · 交易时段 {{ liveStatus.guard.in_session ? "是" : "否" }}
+          <span v-if="liveStatus.guard.llm_guard?.mode">
+            · LLM 守护
+            <span :class="liveStatus.guard.llm_guard.running ? 'ok' : 'bad'">{{
+              liveStatus.guard.llm_guard.running ? "运行中" : "未运行"
+            }}</span>
+            · 每 {{ liveStatus.guard.llm_guard.interval_sec }}s
+          </span>
           <span v-if="!liveStatus.is_live" class="asof">· 模拟盘(paper)</span>
         </div>
       </div>
@@ -359,7 +393,7 @@
           <thead>
             <tr>
               <th>代码</th><th>名称</th><th>数量</th>
-              <th>买入价</th><th>当前价</th><th>强制止损价</th><th>距止损</th><th>盈亏 %</th><th>进场策略</th><th></th>
+              <th>买入价</th><th>当前价</th><th>止损价</th><th>加仓价</th><th>距止损</th><th>盈亏 %</th><th>进场策略</th><th></th>
             </tr>
           </thead>
           <tbody>
@@ -370,9 +404,16 @@
               <td>{{ p.avg_cost.toFixed(2) }}</td>
               <td>{{ p.current_price.toFixed(2) }}</td>
               <td>
-                {{ p.stop_price.toFixed(2) }}
-                <span class="asof">{{ p.atr_driven ? "ATR" : "地板" }}</span>
+                <template v-if="p.llm_plan && !p.stop_price">
+                  <span class="bad">未设</span>
+                  <span class="asof">LLM</span>
+                </template>
+                <template v-else>
+                  {{ p.stop_price.toFixed(2) }}
+                  <span class="asof">{{ p.llm_plan ? "LLM" : (p.atr_driven ? "ATR" : "地板") }}</span>
+                </template>
               </td>
+              <td>{{ p.llm_plan && p.add_price ? p.add_price.toFixed(2) : "—" }}</td>
               <td :class="stopDistance(p) <= 0.03 ? 'bad' : ''">{{ formatPct(stopDistance(p)) }}</td>
               <td :class="p.pnl_pct >= 0 ? 'up' : 'down'">{{ formatPct(p.pnl_pct) }}</td>
               <td>{{ p.entry_strategy || "—" }}</td>
@@ -655,6 +696,26 @@
       <p v-else class="muted">尚未挖掘。点击"运行挖掘"让 LLM 提因子，IC 闸门筛选后入库。</p>
     </div>
 
+    <!-- LLM 全权模式:tick 全流程时间线(候选→LLM→校验→执行→点位落库) -->
+    <div class="card" v-if="tickFlow.length">
+      <div class="card-header">
+        <h2>LLM tick 流程</h2>
+        <div class="muted">每日决策与盘中守护的分阶段执行流(最近 {{ tickFlow.length }} 轮)</div>
+      </div>
+      <div class="tick-flow">
+        <div class="tick-group" v-for="g in tickFlow" :key="g.ts">
+          <div class="tick-group-head">
+            <span class="kind">{{ g.phase === "guard" ? "盘中守护" : "每日决策" }}</span>
+            <span class="ts">{{ formatTs(g.ts) }}</span>
+          </div>
+          <div class="tick-step" v-for="s in g.steps" :key="s.id">
+            <span class="tick-stage">{{ s.stage }}</span>
+            <span class="tick-summary">{{ s.summary }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Decision log -->
     <div class="card">
       <div class="card-header">
@@ -741,7 +802,7 @@ const goalDraft = reactive<Goal>({
 // for direct UI binding. Synced both directions: loadAll() pulls server →
 // advParams via syncAdvFromParams; saveGoal() pushes advParams → goalDraft.params
 // via syncParamsFromAdv right before sending.
-type AgentMode = "rule" | "ensemble" | "llm";
+type AgentMode = "rule" | "ensemble" | "llm" | "llm_full";
 const advParams = reactive({
   agent_mode: "rule" as AgentMode,
   ensemble_enabled: false,
@@ -764,6 +825,9 @@ const advParams = reactive({
   llm_debate_rounds: 1,
   llm_risk_debate: false,
   llm_reflection: false,
+  // LLM 全权模式:盘中 LLM 守护间隔 + 单轮订单上限。
+  llm_guard_interval_sec: 300,
+  llm_max_orders: 10,
   // 每日定时调度（cron-lite）：开启后每天在 daily_run_time 跑一次，
   // 否则按 tick_interval_sec 间隔跑。daily_schedule_enabled 仅 UI 本地状态。
   daily_schedule_enabled: false,
@@ -775,8 +839,10 @@ function syncAdvFromParams() {
   const p = (goalDraft.params || {}) as Record<string, unknown>;
   const ensemble = !!p.ensemble_enabled;
   const isLLM = p.agent_mode === "llm";
-  advParams.agent_mode = isLLM ? "llm" : ensemble ? "ensemble" : "rule";
-  advParams.ensemble_enabled = ensemble || isLLM;
+  const isLLMFull = p.agent_mode === "llm_full";
+  advParams.agent_mode = isLLMFull ? "llm_full"
+    : isLLM ? "llm" : ensemble ? "ensemble" : "rule";
+  advParams.ensemble_enabled = ensemble || isLLM || isLLMFull;
   advParams.industry_neutral = !!p.industry_neutral;
   advParams.liquidity_filter = !!p.liquidity_filter;
   advParams.wf_enabled = p.wf_enabled !== false; // default true if absent
@@ -793,6 +859,10 @@ function syncAdvFromParams() {
     typeof p.llm_debate_rounds === "number" ? p.llm_debate_rounds : 1;
   advParams.llm_risk_debate = !!p.llm_risk_debate;
   advParams.llm_reflection = !!p.llm_reflection;
+  advParams.llm_guard_interval_sec =
+    typeof p.llm_guard_interval_sec === "number" ? p.llm_guard_interval_sec : 300;
+  advParams.llm_max_orders =
+    typeof p.llm_max_orders === "number" ? p.llm_max_orders : 10;
   const drt = typeof p.daily_run_time === "string" ? p.daily_run_time : "";
   advParams.daily_schedule_enabled = drt !== "";
   if (drt) advParams.daily_run_time = drt;
@@ -804,11 +874,15 @@ function syncParamsFromAdv() {
   const existing = (goalDraft.params || {}) as Record<string, unknown>;
   const params: Record<string, unknown> = {
     ...existing,
-    agent_mode: advParams.agent_mode === "llm" ? "llm" : "",
+    agent_mode:
+      advParams.agent_mode === "llm" || advParams.agent_mode === "llm_full"
+        ? advParams.agent_mode
+        : "",
     ensemble_enabled:
       advParams.ensemble_enabled ||
       advParams.agent_mode === "ensemble" ||
-      advParams.agent_mode === "llm",
+      advParams.agent_mode === "llm" ||
+      advParams.agent_mode === "llm_full",
     industry_neutral: advParams.industry_neutral,
     liquidity_filter: advParams.liquidity_filter,
     wf_enabled: advParams.wf_enabled,
@@ -823,6 +897,8 @@ function syncParamsFromAdv() {
     llm_debate_rounds: advParams.llm_debate_rounds,
     llm_risk_debate: advParams.llm_risk_debate,
     llm_reflection: advParams.llm_reflection,
+    llm_guard_interval_sec: advParams.llm_guard_interval_sec,
+    llm_max_orders: advParams.llm_max_orders,
   };
   if (advParams.daily_schedule_enabled && advParams.daily_run_time) {
     params.daily_run_time = advParams.daily_run_time;
@@ -855,6 +931,13 @@ function applyPreset(mode: AgentMode) {
     advParams.industry_neutral = false;
     advParams.liquidity_filter = false;
     advParams.wf_enabled = true;
+  } else if (mode === "llm_full") {
+    // 全权模式:候选管线只做流动性清洗 + 策略跑分,alpha 过滤(行业中性等)
+    // 由 runtime 在该模式下自动旁路;行业集中度交给 LLM 判断。
+    advParams.ensemble_enabled = true;
+    advParams.industry_neutral = false;
+    advParams.liquidity_filter = true;
+    advParams.wf_enabled = true;
   } else {
     // ensemble and llm share the same selection-side configuration; LLM
     // just adds the Claude decision layer on top of those candidates.
@@ -874,6 +957,35 @@ function stopDistance(p: { current_price: number; stop_price: number }): number 
 }
 const agent = ref<AgentStatus | null>(null);
 const decisions = ref<DecisionRecord[]>([]);
+
+// LLM tick 流程时间线:tick_stage / llm_guard 事件按 tick_ts 聚组,倒序前 6 轮。
+interface TickStep { id: number; stage: string; summary: string }
+interface TickGroup { ts: string; phase: string; steps: TickStep[] }
+const tickFlow = computed<TickGroup[]>(() => {
+  const kinds = new Set(["tick_stage", "llm_guard", "llm_guard_skip",
+                         "llm_add_triggered"]);
+  const groups = new Map<string, TickGroup>();
+  for (const d of decisions.value) {
+    if (!kinds.has(d.kind)) continue;
+    const det = (d.details || {}) as Record<string, unknown>;
+    const ts = (det.tick_ts as string) || d.ts;
+    const phase = d.kind === "tick_stage"
+      ? ((det.phase as string) || "tick")
+      : "guard";
+    const key = `${phase}:${ts}`;
+    if (!groups.has(key)) groups.set(key, { ts, phase, steps: [] });
+    groups.get(key)!.steps.push({
+      id: d.id,
+      stage: d.kind === "tick_stage" ? ((det.stage as string) || "?") : d.kind,
+      summary: d.summary,
+    });
+  }
+  const out = [...groups.values()];
+  out.sort((a, b) => (a.ts < b.ts ? 1 : -1));
+  // 组内按 id 升序 = 阶段实际发生顺序。
+  for (const g of out) g.steps.sort((a, b) => a.id - b.id);
+  return out.slice(0, 6);
+});
 const strategies = ref<StrategyInfo[]>([]);
 const screeners = ref<ScreenerInfo[]>([]);
 const pendingOrders = ref<PendingOrderDetail[]>([]);
@@ -1629,6 +1741,44 @@ onUnmounted(() => {
   gap: 10px;
   align-items: center;
 }
+.tick-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.tick-group {
+  border-left: 3px solid var(--accent, #4a7cf7);
+  padding: 4px 0 4px 12px;
+}
+.tick-group-head {
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.tick-group-head .kind {
+  font-weight: 600;
+  margin-right: 8px;
+}
+.tick-group-head .ts {
+  color: var(--muted, #8a8f98);
+  font-size: 12px;
+}
+.tick-step {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+  padding: 2px 0;
+}
+.tick-stage {
+  flex: 0 0 110px;
+  color: var(--muted, #8a8f98);
+  font-family: monospace;
+  font-size: 12px;
+}
+.tick-summary {
+  flex: 1;
+  word-break: break-all;
+}
+
 .decision-list {
   display: flex;
   flex-direction: column;

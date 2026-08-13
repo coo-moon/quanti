@@ -278,6 +278,9 @@ class Database:
             # Extreme gap-up entry guard — abandon a BUY gapping up >= this
             # fraction. Legacy rows backfill to the dataclass default (10%).
             ("risk_config", "extreme_gap_up_block_pct", "REAL DEFAULT 0.10"),
+            # LLM 全权模式的灾难地板(每标的):仅当 LLM 点位缺失或被幻觉点位
+            # 穿透时兜底强平;0 = 关闭。不参与 LLM 日常点位决策。
+            ("risk_config", "llm_disaster_floor_pct", "REAL DEFAULT -0.25"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -641,6 +644,20 @@ class Database:
                 code TEXT PRIMARY KEY,
                 final_score REAL NOT NULL,
                 as_of TEXT NOT NULL
+            );
+
+            -- LLM 全权模式 (agent_mode="llm_full") 的每持仓交易计划:止损价 /
+            -- 加仓价由 LLM 每日 tick + 盘中守护改写,本地机械 guard 毫秒级比价
+            -- 执行。持久化是可用性兜底的核心:LLM API 失联时沿用最后一次成功
+            -- 落库的点位,止损保护永不依赖外部 API 在线。价格为 hfq 轴(与
+            -- positions.current_price / avg_cost 同轴,直接可比)。
+            CREATE TABLE IF NOT EXISTS llm_position_plans (
+                code TEXT PRIMARY KEY,
+                stop_price REAL NOT NULL DEFAULT 0,
+                add_price REAL NOT NULL DEFAULT 0,
+                add_size_pct REAL NOT NULL DEFAULT 0,
+                reason TEXT DEFAULT '',
+                updated_at TEXT NOT NULL
             );
             """
         )
@@ -1877,7 +1894,8 @@ class Database:
             "strategy_exit_enabled, atr_stop_k, atr_stop_n, "
             "drift_trim_enabled, drift_trim_to_pct, drift_trim_band, "
             "rotation_enabled, rotation_margin, "
-            "max_position_pct, max_industry_pct, extreme_gap_up_block_pct "
+            "max_position_pct, max_industry_pct, extreme_gap_up_block_pct, "
+            "llm_disaster_floor_pct "
             "FROM risk_config WHERE id=1"
         ).fetchone()
         if row is None:
@@ -1892,6 +1910,7 @@ class Database:
             "rotation_enabled": bool(row[10]), "rotation_margin": row[11],
             "max_position_pct": row[12], "max_industry_pct": row[13],
             "extreme_gap_up_block_pct": row[14],
+            "llm_disaster_floor_pct": row[15],
         }
 
     def upsert_risk_config(self, cfg: dict) -> None:
@@ -1908,8 +1927,8 @@ class Database:
                 drift_trim_enabled, drift_trim_to_pct, drift_trim_band,
                 rotation_enabled, rotation_margin,
                 max_position_pct, max_industry_pct,
-                extreme_gap_up_block_pct, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                extreme_gap_up_block_pct, llm_disaster_floor_pct, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 stop_loss_pct=excluded.stop_loss_pct,
                 portfolio_stop_loss_pct=excluded.portfolio_stop_loss_pct,
@@ -1926,6 +1945,7 @@ class Database:
                 max_position_pct=excluded.max_position_pct,
                 max_industry_pct=excluded.max_industry_pct,
                 extreme_gap_up_block_pct=excluded.extreme_gap_up_block_pct,
+                llm_disaster_floor_pct=excluded.llm_disaster_floor_pct,
                 updated_at=excluded.updated_at
             """,
             (cfg["stop_loss_pct"], cfg["portfolio_stop_loss_pct"],
@@ -1938,8 +1958,54 @@ class Database:
              cfg.get("rotation_margin", 0.15),
              cfg.get("max_position_pct", 0.20), cfg.get("max_industry_pct", 0.30),
              cfg.get("extreme_gap_up_block_pct", 0.10),
+             cfg.get("llm_disaster_floor_pct", -0.25),
              now),
         )
+        self.conn.commit()
+
+    # --- LLM 全权模式:每持仓交易计划(止损价/加仓价) ---
+
+    def upsert_llm_plan(self, code: str, stop_price: float,
+                        add_price: float = 0.0, add_size_pct: float = 0.0,
+                        reason: str = "") -> None:
+        """写入/覆盖一只持仓的 LLM 交易计划。价格为 hfq 轴;0 = 无该点位。"""
+        from datetime import datetime
+        self.conn.execute(
+            """
+            INSERT INTO llm_position_plans
+                (code, stop_price, add_price, add_size_pct, reason, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+                stop_price=excluded.stop_price,
+                add_price=excluded.add_price,
+                add_size_pct=excluded.add_size_pct,
+                reason=excluded.reason,
+                updated_at=excluded.updated_at
+            """,
+            (code, float(stop_price or 0.0), float(add_price or 0.0),
+             float(add_size_pct or 0.0), reason or "",
+             datetime.now().isoformat()))
+        self.conn.commit()
+
+    def list_llm_plans(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT code, stop_price, add_price, add_size_pct, reason, "
+            "updated_at FROM llm_position_plans").fetchall()
+        return [{"code": r[0], "stop_price": r[1], "add_price": r[2],
+                 "add_size_pct": r[3], "reason": r[4], "updated_at": r[5]}
+                for r in rows]
+
+    def clear_llm_add_price(self, code: str) -> None:
+        """加仓触发成交后清掉 add_price,防止 5 秒机械 guard 重复加仓。"""
+        self.conn.execute(
+            "UPDATE llm_position_plans SET add_price=0, add_size_pct=0 "
+            "WHERE code=?", (code,))
+        self.conn.commit()
+
+    def delete_llm_plan(self, code: str) -> None:
+        """持仓清掉后删除其计划行(避免旧点位粘到未来的同名新仓上)。"""
+        self.conn.execute(
+            "DELETE FROM llm_position_plans WHERE code=?", (code,))
         self.conn.commit()
 
     # --- Agent goal & decisions ---
