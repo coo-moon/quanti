@@ -244,10 +244,29 @@
         <div class="adv-llm-provider">
           <label>
             <span>供应商 llm_provider</span>
-            <select v-model="advParams.llm_provider">
+            <select v-model="advParams.llm_provider" @change="onProviderChange">
               <option value="anthropic">Anthropic claude(需 ANTHROPIC_API_KEY + pip install .[llm]）</option>
               <option value="deepseek">DeepSeek deepseek-v4-flash(需 DEEPSEEK_API_KEY，无需额外安装）</option>
             </select>
+          </label>
+          <label>
+            <span>模型 llm_model</span>
+            <select v-model="advParams.llm_model">
+              <option value="">默认({{ advParams.llm_provider === "deepseek" ? "deepseek-v4-flash" : "claude-sonnet-4-6" }})</option>
+              <option v-for="m in llmModelOptions" :key="m.id" :value="m.id">
+                {{ m.id }} — {{ m.desc }}
+              </option>
+              <option value="__custom__">自定义…</option>
+            </select>
+            <input
+              v-if="llmModelCustom"
+              type="text"
+              v-model.trim="advParams.llm_model_custom"
+              placeholder="输入模型 id,如 deepseek-v4-pro"
+            />
+            <em class="muted">决策/守护/情绪打分共用此模型。留默认最稳;DeepSeek 侧
+              v4-pro 思考更深但更慢更贵,盘中守护(每 5 分钟)用 flash 性价比更高。
+              选了对侧供应商的模型 id 时 DeepSeek 会自动回落自家默认。</em>
           </label>
         </div>
         <div class="adv-grid">
@@ -803,6 +822,26 @@ const goalDraft = reactive<Goal>({
 // advParams via syncAdvFromParams; saveGoal() pushes advParams → goalDraft.params
 // via syncParamsFromAdv right before sending.
 type AgentMode = "rule" | "ensemble" | "llm" | "llm_full";
+
+// 各供应商的模型预设(id 会原样写入 goal.params.llm_model)。DeepSeek 对
+// claude-* id 自动回落自家默认,选错供应商侧的 id 不会炸;Anthropic 侧则
+// 必须是有效 claude id。
+const LLM_MODEL_PRESETS: Record<
+  "anthropic" | "deepseek",
+  { id: string; desc: string }[]
+> = {
+  deepseek: [
+    { id: "deepseek-v4-flash", desc: "默认 · 快,function-calling 全支持" },
+    { id: "deepseek-v4-pro", desc: "思考最深 · 慢且贵,适合每日决策" },
+    { id: "deepseek-chat", desc: "legacy 别名(当前由 v4-flash 服务)" },
+  ],
+  anthropic: [
+    { id: "claude-sonnet-4-6", desc: "后端默认 · 均衡" },
+    { id: "claude-sonnet-5", desc: "新一代 Sonnet · 编码/agentic 更强" },
+    { id: "claude-opus-5", desc: "最强推理 · 最贵" },
+    { id: "claude-haiku-4-5", desc: "最快最便宜 · 简单任务" },
+  ],
+};
 const advParams = reactive({
   agent_mode: "rule" as AgentMode,
   ensemble_enabled: false,
@@ -819,6 +858,9 @@ const advParams = reactive({
   // LLM enhancement layer (all default-off; ②③④ only apply in LLM mode,
   // ① sentiment also applies in ensemble mode).
   llm_provider: "anthropic" as "anthropic" | "deepseek",
+  // 模型选择:"" = 用后端默认;"__custom__" = 手输(实际值在 llm_model_custom)。
+  llm_model: "",
+  llm_model_custom: "",
   sentiment_enabled: false,
   sentiment_blend: 0.2,
   llm_debate: false,
@@ -851,6 +893,17 @@ function syncAdvFromParams() {
   advParams.regime_detect = p.regime_detect !== false; // default true if absent
   advParams.regime_in_prompt = p.regime_in_prompt !== false;
   advParams.llm_provider = p.llm_provider === "deepseek" ? "deepseek" : "anthropic";
+  const model = typeof p.llm_model === "string" ? p.llm_model : "";
+  if (!model) {
+    advParams.llm_model = "";
+    advParams.llm_model_custom = "";
+  } else if (LLM_MODEL_PRESETS[advParams.llm_provider].some((m) => m.id === model)) {
+    advParams.llm_model = model;
+    advParams.llm_model_custom = "";
+  } else {
+    advParams.llm_model = "__custom__";
+    advParams.llm_model_custom = model;
+  }
   advParams.sentiment_enabled = !!p.sentiment_enabled;
   advParams.sentiment_blend =
     typeof p.sentiment_blend === "number" ? p.sentiment_blend : 0.2;
@@ -907,6 +960,17 @@ function syncParamsFromAdv() {
     delete params.daily_run_time;
     delete params.daily_trading_days_only;
   }
+  // 模型选择:空 = 用后端默认。必须删键而非写空串——空串会原样传给
+  // Anthropic client 直接 400(DeepSeek client 对 falsy 会回落默认)。
+  const effModel =
+    advParams.llm_model === "__custom__"
+      ? advParams.llm_model_custom
+      : advParams.llm_model;
+  if (effModel) {
+    params.llm_model = effModel;
+  } else {
+    delete params.llm_model;
+  }
   goalDraft.params = params;
 }
 
@@ -922,6 +986,23 @@ function captureActiveSchedule() {
     time,
     tradingOnly: p.daily_trading_days_only !== false,
   };
+}
+
+const llmModelOptions = computed(() => LLM_MODEL_PRESETS[advParams.llm_provider]);
+const llmModelCustom = computed(() => advParams.llm_model === "__custom__");
+
+function onProviderChange() {
+  // 切供应商时,若选中的是旧供应商的预设 id,重置回「默认」;
+  // 自定义手输值保留(用户显式写的,不背着改)。
+  if (
+    advParams.llm_model &&
+    advParams.llm_model !== "__custom__" &&
+    !LLM_MODEL_PRESETS[advParams.llm_provider].some(
+      (m) => m.id === advParams.llm_model,
+    )
+  ) {
+    advParams.llm_model = "";
+  }
 }
 
 function applyPreset(mode: AgentMode) {
