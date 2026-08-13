@@ -874,6 +874,8 @@ class RiskControlBody(BaseModel):
     # omit them still validate; also the LLM's per-order size ceiling.
     max_position_pct: float = 0.20
     max_industry_pct: float = 0.30
+    # llm_full 模式的每标的灾难地板(仅兜底 LLM 点位缺失/被穿透;0=关)。
+    llm_disaster_floor_pct: float = -0.25
 
 
 def _risk_config_dict(db) -> dict:
@@ -896,6 +898,7 @@ def _risk_config_dict(db) -> dict:
         "rotation_margin": cfg.rotation_margin,
         "max_position_pct": cfg.max_position_pct,
         "max_industry_pct": cfg.max_industry_pct,
+        "llm_disaster_floor_pct": cfg.llm_disaster_floor_pct,
     }
 
 
@@ -934,6 +937,8 @@ async def set_risk_control(body: RiskControlBody, request: Request):
         errs.append("单票上限 max_position_pct 必须在 (0, 50%]")
     if not (0 < body.max_industry_pct <= 1):
         errs.append("行业上限 max_industry_pct 必须在 (0, 100%]")
+    if not (-0.9 <= body.llm_disaster_floor_pct <= 0):
+        errs.append("灾难地板 llm_disaster_floor_pct 必须在 [-90%, 0](0=关闭)")
     if errs:
         raise HTTPException(status_code=422, detail="; ".join(errs))
     request.app.state.db.upsert_risk_config(body.model_dump())
@@ -980,13 +985,30 @@ async def live_status(request: Request):
     snap = broker.snapshot_portfolio()
     positions = snap.get("positions", [])
     risk = getattr(broker, "_risk", None)
-    atr_n = risk.config.atr_stop_n if risk else 14
-    ratios = (compute_atr_ratios(st.provider, [{"code": p["code"]} for p in positions],
-                                 atr_n) if positions else {})
+    llm_managed = bool(getattr(broker, "llm_managed", False))
+    if llm_managed:
+        # llm_full 模式:止损价 = LLM 落库点位(唯一日常止损),不再现算。
+        plans = {p["code"]: p for p in st.db.list_llm_plans()}
+        ratios = {}
+    else:
+        atr_n = risk.config.atr_stop_n if risk else 14
+        ratios = (compute_atr_ratios(st.provider,
+                                     [{"code": p["code"]} for p in positions],
+                                     atr_n) if positions else {})
     out = []
     for p in positions:
-        info = (risk.stop_info(p["avg_cost"], ratios.get(p["code"])) if risk
-                else {"stop_pct": 0.0, "stop_price": 0.0, "atr_driven": False})
+        if llm_managed:
+            plan = plans.get(p["code"]) or {}
+            sp = float(plan.get("stop_price") or 0)
+            info = {"stop_pct": (sp / p["avg_cost"] - 1) if p["avg_cost"] and sp
+                    else 0.0,
+                    "stop_price": sp, "atr_driven": False,
+                    "llm_plan": True,
+                    "add_price": float(plan.get("add_price") or 0)}
+        else:
+            info = (risk.stop_info(p["avg_cost"], ratios.get(p["code"])) if risk
+                    else {"stop_pct": 0.0, "stop_price": 0.0,
+                          "atr_driven": False})
         out.append({
             "code": p["code"], "name": p.get("name", p["code"]),
             "quantity": p.get("quantity", 0),
@@ -1241,7 +1263,44 @@ async def agent_status(request: Request):
 
 @router.get("/agent/decisions")
 async def agent_decisions(request: Request, limit: int = 100, kind: str | None = None):
-    return request.app.state.db.list_decisions(limit=limit, kind=kind)
+    rows = request.app.state.db.list_decisions(limit=limit, kind=kind)
+    if kind != "llm_audit":
+        # llm_audit 行携带完整 prompt/raw output(几十 KB/条),默认列表把
+        # details 瘦身,完整体走 /agent/llm-audit 按需拉。
+        for r in rows:
+            if r.get("kind") == "llm_audit":
+                r["details"] = {"heavy": True}
+    return rows
+
+
+@router.get("/agent/llm-audit")
+async def agent_llm_audit(request: Request, limit: int = 20):
+    """llm_full 决策审计(完整 prompt / 原始输出 / 校验与执行结果)。"""
+    return request.app.state.db.list_decisions(limit=limit, kind="llm_audit")
+
+
+@router.get("/agent/position-plans")
+async def agent_position_plans(request: Request):
+    """每持仓的 LLM 点位计划(止损价/加仓价),join 持仓现价方便 UI 展示。"""
+    db = request.app.state.db
+    plans = {p["code"]: p for p in db.list_llm_plans()}
+    out = []
+    for pos in db.list_positions():
+        code = pos["code"]
+        stock = db.get_stock(code)
+        plan = plans.get(code) or {}
+        out.append({
+            "code": code, "name": stock.name if stock else code,
+            "quantity": pos.get("quantity", 0),
+            "avg_cost": pos.get("avg_cost", 0),
+            "current_price": pos.get("current_price", 0),
+            "stop_price": plan.get("stop_price", 0) or 0,
+            "add_price": plan.get("add_price", 0) or 0,
+            "add_size_pct": plan.get("add_size_pct", 0) or 0,
+            "plan_reason": plan.get("reason", ""),
+            "plan_updated_at": plan.get("updated_at", ""),
+        })
+    return out
 
 
 @router.post("/agent/decisions/prune")

@@ -8,7 +8,6 @@ def test_param_spaces_declared_sane():
     strats = {s.name: s for s in StrategyLoader().load_directory("strategies")}
     expected = {
         "ma_cross": {"short_period", "long_period"},
-        "ma_volume": {"short_period", "long_period", "vol_ratio"},
         "macd_cross": {"fast", "slow"},
         "bollinger_band": {"period", "std_dev"},
         "rsi_ob_os": {"period", "oversold", "overbought"},

@@ -14,7 +14,8 @@ from quanti.models import BarData, Direction
 # strategies/ is a plugin dir, not an importable package — load by path.
 _SPEC = importlib.util.spec_from_file_location(
     "supertrend_under_test",
-    Path(__file__).resolve().parent.parent / "strategies" / "supertrend.py")
+    Path(__file__).resolve().parent.parent / "strategies" / "attic"
+    / "supertrend.py")
 _MOD = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MOD)
 SuperTrendStrategy = _MOD.SuperTrendStrategy

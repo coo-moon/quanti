@@ -83,6 +83,14 @@ class RiskConfig:
     atr_stop_n: int = 14
     """Lookback (trading days) for the ATR behind atr_stop_k."""
 
+    # --- LLM 全权模式 (agent_mode="llm_full") ---
+    llm_disaster_floor_pct: float = -0.25
+    """LLM 全权模式的每标的灾难地板。该模式下日常止损点位完全由 LLM 决定
+    (llm_position_plans 表,不受任何 clamp);此地板只接两种尾部:持仓没有
+    LLM 点位(新开仓当日 / LLM 输出缺漏),或点位被设得过深而浮亏已穿透地板
+    (幻觉点位)。0 = 关闭,完全信赖 LLM 点位。仅 check_exits 收到 llm_stops
+    时生效,经典模式(ATR+地板)不读它。"""
+
     # --- Extreme gap-up entry guard ---
     extreme_gap_up_block_pct: float = 0.10
     """Abandon a pending BUY when the fill price gaps up >= this fraction above
@@ -233,6 +241,36 @@ class RiskManager:
             "stop_price": round(avg_cost * (1 + stop_pct), 3) if avg_cost > 0 else 0.0,
             "atr_driven": atr_driven,
         }
+
+    def check_llm_exits(self, portfolio: Portfolio,
+                        llm_stops: dict[str, float]) -> list[Signal]:
+        """LLM 全权模式的离场检查:唯一的日常止损 = LLM 落库点位。
+
+        对每个持仓:现价 ≤ llm_stops[code](hfq 轴,>0 有效)→ 全平;
+        无点位或点位没拦住、浮亏已穿 llm_disaster_floor_pct → 灾难地板全平
+        (floor=0 时关闭)。ATR、stop_loss_pct 地板、策略离场、移动止盈在此
+        模式一概不跑——离场判断权完全归 LLM(每日 tick + 盘中守护随时改点位
+        或直接下卖单)。组合级 -30% 熔断仍由 check_portfolio_stop 独立兜底。
+        """
+        cfg = self.config
+        floor = float(cfg.llm_disaster_floor_pct or 0.0)
+        signals: list[Signal] = []
+        for code, pos in portfolio.positions.items():
+            stop = float(llm_stops.get(code) or 0.0)
+            if stop > 0 and pos.current_price > 0 \
+                    and pos.current_price <= stop:
+                signals.append(Signal(
+                    stock_code=code, direction=Direction.SELL, strength=1.0,
+                    reason=(f"{STOP_LOSS_REASON_PREFIX} 现价{pos.current_price:.2f}"
+                            f" ≤ LLM点位{stop:.2f}")))
+                continue
+            if floor < 0 and pos.pnl_pct <= floor:
+                tag = "无LLM点位" if stop <= 0 else "点位未拦住"
+                signals.append(Signal(
+                    stock_code=code, direction=Direction.SELL, strength=1.0,
+                    reason=(f"{STOP_LOSS_REASON_PREFIX} {pos.pnl_pct:.1%}"
+                            f" ≤ {floor:.0%} (灾难地板·{tag})")))
+        return signals
 
     def check_exits(
         self,

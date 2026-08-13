@@ -35,7 +35,7 @@ N_CAND = 100          # 流动性候选池(= runtime no_screener_take 默认 100
 TOP_K = 10            # 每月选 top-K
 FACTOR_BLEND = 0.5    # agent 默认:一半策略投票,一半因子模型
 THRESHOLD = 0.30
-STRAT_NAMES = ["ma_cross", "macd_cross", "supertrend", "bollinger_band"]
+STRAT_NAMES = ["ma_cross", "macd_cross", "kdj_cross", "bollinger_band"]
 COST_PER_TURN = 0.003  # 0.3% 单边换手(佣金+印花+滑点)
 
 

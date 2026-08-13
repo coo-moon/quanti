@@ -109,6 +109,7 @@ class LLMConfig:
     max_decisions_in_context: int = 5
     max_size_pct: float = 0.10  # LLM's per-order size ceiling; set from RiskConfig.max_position_pct so the limit is parameter-driven, not hard-coded
     temperature: float = 0.3  # mild creativity, mostly deterministic
+    max_orders: int = 5  # 单轮订单数上限;llm_full 模式默认放宽到 10
     debate_enabled: bool = False     # run a Bull/Bear debate before judgment
     debate_rounds: int = 1           # Bull→Bear exchanges before the manager decides
     risk_debate_enabled: bool = False  # aggressive/neutral/conservative size review
@@ -300,30 +301,41 @@ class LLMDecisionLoop:
     tool-call cycles when the LLM gets stuck inspecting things.
     """
 
-    def __init__(self, llm: LLMClient, cfg: LLMConfig | None = None) -> None:
+    def __init__(self, llm: LLMClient, cfg: LLMConfig | None = None, *,
+                 terminal_tool: str = "propose_orders",
+                 system_prompt: str | None = None,
+                 tools: list[dict] | None = None) -> None:
+        """`terminal_tool` / `system_prompt` / `tools` 让 llm_full 模式复用同
+        一个多轮 tool 循环(终结 tool 是 submit_decision / submit_guard_actions
+        而非 propose_orders),默认值保持经典 LLM 判断路径原样。"""
         self._llm = llm
         self._cfg = cfg or LLMConfig()
+        self._terminal_tool = terminal_tool
+        self._system_prompt = system_prompt or SYSTEM_PROMPT
+        self._tools = tools
 
     def run(
         self,
         context_user_message: str,
         tool_dispatcher,
-    ) -> tuple[list[dict], str, dict]:
-        """Returns (proposed_orders, reasoning, debug_info).
+    ) -> tuple[dict, str, dict]:
+        """Returns (terminal_input, reasoning, debug_info).
 
-        On any failure (LLM error, max_iterations hit without propose_orders,
-        validation error), returns ([], "", debug_info) — the agent falls
-        back to "no LLM-proposed orders this tick".
+        `terminal_input` is the terminal tool's full input dict ({} when the
+        LLM never called it). On any failure (LLM error, max_iterations hit
+        without the terminal call, validation error), returns ({}, "",
+        debug_info) — the agent falls back to "no LLM action this tick".
         """
-        debug = {"iterations": 0, "tool_calls": [], "usage": {}}
+        debug = {"iterations": 0, "tool_calls": [], "usage": {},
+                 "stop_reason": ""}
         # Use list-of-blocks form for `system` to enable prompt-cache control.
         system_blocks: list[dict] = [{
-            "type": "text", "text": SYSTEM_PROMPT,
+            "type": "text", "text": self._system_prompt,
             "cache_control": {"type": "ephemeral"},
         }]
         messages: list[dict] = [{"role": "user", "content": context_user_message}]
 
-        proposed_orders: list[dict] = []
+        terminal_input: dict = {}
         reasoning = ""
 
         for i in range(self._cfg.max_tool_iterations):
@@ -333,17 +345,19 @@ class LLMDecisionLoop:
                     model=self._cfg.model,
                     system=system_blocks,
                     messages=messages,
-                    tools=_tools_schema(self._cfg.max_size_pct),
+                    tools=(self._tools if self._tools is not None
+                           else _tools_schema(self._cfg.max_size_pct)),
                     max_tokens=self._cfg.max_tokens,
                     temperature=self._cfg.temperature,
                 )
             except Exception as e:
                 logger.warning(f"LLM call failed at iter {i}: {e}")
                 debug["error"] = str(e)
-                return [], "", debug
+                return {}, "", debug
 
             debug["usage"] = resp.get("usage", {})
             stop = resp.get("stop_reason")
+            debug["stop_reason"] = stop
             blocks = resp.get("content", [])
 
             tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
@@ -364,8 +378,8 @@ class LLMDecisionLoop:
                 tu_id = tu.get("id", "")
                 inp = tu.get("input", {}) or {}
                 debug["tool_calls"].append({"name": name, "input": inp})
-                if name == "propose_orders":
-                    proposed_orders = list(inp.get("orders") or [])
+                if name == self._terminal_tool:
+                    terminal_input = dict(inp)
                     reasoning = str(inp.get("reasoning") or "")
                     terminal = True
                     break
@@ -387,7 +401,7 @@ class LLMDecisionLoop:
             if stop == "end_turn":
                 break
 
-        return proposed_orders, reasoning, debug
+        return terminal_input, reasoning, debug
 
 
 # ------------------------------------------------------- bull/bear debate
@@ -835,7 +849,8 @@ def run_llm_decision(
         return json.dumps({"error": f"unknown tool {name}"})
 
     loop = LLMDecisionLoop(llm_client, cfg)
-    proposed, reasoning, debug = loop.run(ctx, dispatcher)
+    terminal_input, reasoning, debug = loop.run(ctx, dispatcher)
+    proposed = list(terminal_input.get("orders") or [])
 
     # Validate proposals: filter to candidates the pipeline already vetted.
     allowed_codes = {c.code for c in candidates}

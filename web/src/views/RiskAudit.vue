@@ -84,6 +84,10 @@
             <input type="number" step="1" min="0" max="50"
                    v-model.number="form.extreme_gap_up_block_pct" />
           </label>
+          <label>LLM 灾难地板 (%,0=关闭;仅 LLM 全权模式)
+            <input type="number" step="1" min="-90" max="0"
+                   v-model.number="form.llm_disaster_floor_pct" />
+          </label>
           <label class="chk">
             <input type="checkbox" v-model="form.strategy_exit_enabled" />
             启用策略离场
@@ -358,6 +362,9 @@ const form = reactive({
   drift_trim_enabled: false, drift_trim_to_pct: 10, drift_trim_band: 25,
   // 分数门换仓(margin 是 final_score 差值,0–1 原值,不按 % 换算)
   rotation_enabled: false, rotation_margin: 0.15,
+  // LLM 全权模式灾难地板(% 显示;后端存分数;0=关闭)。日常止损=LLM 点位,
+  // 此地板只接点位缺失/被幻觉点位穿透的尾部。
+  llm_disaster_floor_pct: -25,
 });
 
 async function toggleEdit() {
@@ -383,6 +390,7 @@ async function toggleEdit() {
     form.drift_trim_band = +(c.drift_trim_band * 100).toFixed(2);
     form.rotation_enabled = c.rotation_enabled;
     form.rotation_margin = c.rotation_margin;
+    form.llm_disaster_floor_pct = +((c.llm_disaster_floor_pct ?? -0.25) * 100).toFixed(2);
     editing.value = true;
   } catch (e: any) {
     err.value = e?.message || "读取风控配置失败";
@@ -410,6 +418,7 @@ async function save() {
       drift_trim_band: form.drift_trim_band / 100,
       rotation_enabled: form.rotation_enabled,
       rotation_margin: form.rotation_margin,
+      llm_disaster_floor_pct: form.llm_disaster_floor_pct / 100,
     });
     editing.value = false;
     await load();

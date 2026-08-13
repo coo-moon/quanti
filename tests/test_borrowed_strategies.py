@@ -1,7 +1,11 @@
 """Smoke tests for the borrowed strategies (supertrend / connors_rsi2 / kdj /
 cci). Each asserts a BUY fires in an unambiguous designed scenario, plus the
-loader discovers all of them with unique names (catches name collisions, which
-would silently clobber DB/Goal keys)."""
+loader discovers the active classics with unique names (catches name
+collisions, which would silently clobber DB/Goal keys).
+
+策略精简(2026-08):supertrend/connors_rsi2/cci_reversion/ma_volume 移入
+strategies/attic/(不再参与生产加载,只留经典策略)。行为测试保留、从 attic
+加载——移回主目录时它们仍受测。"""
 
 from datetime import date, timedelta
 from pathlib import Path
@@ -10,6 +14,7 @@ from quanti.models import BarData, Direction
 from quanti.strategy.loader import StrategyLoader
 
 STRAT_DIR = str(Path(__file__).resolve().parent.parent / "strategies")
+ATTIC_DIR = str(Path(STRAT_DIR) / "attic")
 
 
 def _bar(i: int, close: float, high: float | None = None, low: float | None = None) -> BarData:
@@ -33,18 +38,22 @@ def _has_buy(sigs):
 
 
 def _load():
-    return {s.name: s for s in StrategyLoader().load_directory(STRAT_DIR)}
+    """Active classics + attic'd borrowed strategies, for behavior tests."""
+    out = {s.name: s for s in StrategyLoader().load_directory(STRAT_DIR)}
+    out.update({s.name: s
+                for s in StrategyLoader().load_directory(ATTIC_DIR)})
+    return out
 
 
-def test_loader_discovers_all_with_unique_names():
-    strats = _load()
-    for name in ("supertrend", "connors_rsi2", "kdj_cross", "cci_reversion"):
-        assert name in strats, f"{name} not discovered by loader"
-    # 6 built-in + 4 borrowed; names are the DB/Goal key → must be unique.
+def test_loader_discovers_classics_with_unique_names():
     instances = StrategyLoader().load_directory(STRAT_DIR)
     names = [s.name for s in instances]
+    # 精简后的经典六件套;attic 里的不参与生产加载。
+    for name in ("ma_cross", "macd_cross", "bollinger_band", "rsi_ob_os",
+                 "kdj_cross", "turtle_breakout"):
+        assert name in names, f"{name} not discovered by loader"
     assert len(names) == len(set(names)), f"duplicate strategy name: {names}"
-    assert len(names) >= 10
+    assert len(names) == 6, f"unexpected strategies in production dir: {names}"
 
 
 def test_supertrend_buys_on_uptrend_flip():

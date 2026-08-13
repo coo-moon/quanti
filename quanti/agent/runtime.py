@@ -33,6 +33,7 @@ from quanti.agent.goal import Goal, load_goal, save_goal
 from quanti.agent.params import resolve_params
 from quanti.agent.selector import StrategySelector
 from quanti.agent.signal_pipeline import (
+    FusedCandidate,
     collect_signals_per_strategy,
     filter_by_threshold,
     fuse_buy_signals,
@@ -145,6 +146,10 @@ class AgentRuntime:
         # observe-only "pool_vs_passive" active-vs-passive guardrail log
         self._thread: threading.Thread | None = None
         self._guard_thread: threading.Thread | None = None
+        # 盘中 LLM 守护线程(llm_full 模式,默认每 300s 一轮)。独立于 5 秒
+        # 机械 guard:LLM 单轮是分钟级网络 I/O,塞进机械线程会让止损停摆。
+        self._llm_guard_thread: threading.Thread | None = None
+        self._llm_full_live_warned: date | None = None  # 每日一次的降级告警去重
         # Serializes broker MUTATIONS between the tick and the intraday guard
         # thread. Held only for the short mutating segments of a tick (see
         # `_broker_exec`), never across the compute stages — those can take
@@ -184,6 +189,13 @@ class AgentRuntime:
             self._guard_thread = threading.Thread(
                 target=self._guard_loop, name="quanti-intraday-guard", daemon=True)
             self._guard_thread.start()
+        if (self._llm_guard_thread is None
+                or not self._llm_guard_thread.is_alive()):
+            # 无条件启动:线程每轮自判 agent_mode,非 llm_full 时纯空转等待。
+            self._llm_guard_thread = threading.Thread(
+                target=self._llm_guard_loop, name="quanti-llm-guard",
+                daemon=True)
+            self._llm_guard_thread.start()
         if self._singleton_owner and (
                 self._singleton_thread is None
                 or not self._singleton_thread.is_alive()):
@@ -223,7 +235,8 @@ class AgentRuntime:
         self._stop_flag.set()
         with self._lock:
             self._status.running = False
-        for th in (self._thread, self._guard_thread, self._singleton_thread):
+        for th in (self._thread, self._guard_thread, self._llm_guard_thread,
+                   self._singleton_thread):
             if th is not None:
                 try:
                     th.join(timeout=2)
@@ -286,10 +299,22 @@ class AgentRuntime:
 
     def guard_status(self) -> dict:
         """Intraday-guard daemon state for the live status card."""
+        try:
+            params = load_goal(self._db).params or {}
+        except Exception:  # noqa: BLE001
+            params = {}
+        llm_full = str(params.get("agent_mode", "")).lower() == "llm_full"
         return {
             "enabled": self._intraday_guard_sec > 0,
             "interval_sec": self._intraday_guard_sec,
             "running": bool(self._guard_thread and self._guard_thread.is_alive()),
+            "llm_guard": {
+                "mode": llm_full,
+                "interval_sec": int(float(
+                    params.get("llm_guard_interval_sec", 300) or 300)),
+                "running": bool(self._llm_guard_thread
+                                and self._llm_guard_thread.is_alive()),
+            },
         }
 
     def _guard_loop(self) -> None:
@@ -316,6 +341,12 @@ class AgentRuntime:
         is_conn = getattr(self._broker, "is_connected", None)
         if callable(is_conn) and not is_conn():
             return
+        # llm_full 模式同步(锁外读 goal):机械 guard 的 check_exits 走 LLM
+        # 点位分支、check_llm_adds 生效,都取决于 broker.llm_managed。
+        try:
+            self._sync_llm_mode(load_goal(self._db))
+        except Exception as e:  # noqa: BLE001 - 同步失败保持上次模式
+            logger.warning("guard llm-mode sync failed: %s", e)
         with self._broker_lock:  # never overlap the full tick's broker mutations
             try:
                 self._broker.try_fill_pending_orders()
@@ -335,6 +366,69 @@ class AgentRuntime:
                 self._broker.check_exits()
             except Exception as e:  # noqa: BLE001
                 logger.warning("guard check_exits failed: %s", e)
+            # LLM 加仓点位触发(仅 llm_full;paper broker 才有此方法)。
+            try:
+                adds = getattr(self._broker, "check_llm_adds", None)
+                if callable(adds):
+                    adds()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("guard check_llm_adds failed: %s", e)
+
+    # ------------------------------------------ 盘中 LLM 守护 (llm_full)
+    def _llm_guard_loop(self) -> None:
+        """盘中 LLM 守护:每 llm_guard_interval_sec(默认 300s,goal.params
+        可调)把持仓明细+实时价+现行点位交给 LLM,输出卖出/加仓/改点位并即刻
+        执行。单线程顺序执行天然单飞(上一轮没跑完不会发下一轮)。任何一轮
+        失败只跳过本轮——5 秒机械 guard 的点位执行从不依赖这里。"""
+        while not self._stop_flag.is_set():
+            if self._stop_flag.wait(self._llm_guard_interval()):
+                return
+            try:
+                self._llm_guard_cycle()
+            except Exception as e:  # noqa: BLE001 - 一轮失败不许杀线程
+                logger.warning("llm guard cycle failed: %s", e)
+                try:
+                    self._db.log_decision(
+                        "llm_guard_skip", f"盘中 LLM 守护异常跳过: {e}")
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _llm_guard_interval(self) -> float:
+        try:
+            params = load_goal(self._db).params or {}
+            return max(60.0, float(params.get("llm_guard_interval_sec", 300)))
+        except Exception:  # noqa: BLE001
+            return 300.0
+
+    def _llm_guard_cycle(self) -> None:
+        from quanti.utils.market import in_trading_session
+        goal = load_goal(self._db)
+        if not self._sync_llm_mode(goal):
+            return  # 非 llm_full:线程空转
+        if not in_trading_session(datetime.now(), self._provider):
+            return
+        is_conn = getattr(self._broker, "is_connected", None)
+        if callable(is_conn) and not is_conn():
+            return
+        params = goal.params or {}
+        client = getattr(self, "_llm_client", None)
+        if client is None:
+            try:
+                client = self._build_llm_client(params)
+            except (ImportError, ValueError) as e:
+                self._db.log_decision(
+                    "llm_guard_skip",
+                    f"盘中 LLM 守护跳过(LLM 不可用): {e}",
+                    details={"error": str(e)})
+                return
+        from quanti.agent.llm_full import run_llm_guard_decision
+        cfg = self._llm_full_cfg(params)
+        cfg.max_tokens = int(params.get("llm_guard_max_tokens", 4096))
+        cfg.max_tool_iterations = 4
+        run_llm_guard_decision(
+            db=self._db, broker=self._broker, provider=self._provider,
+            goal=goal, llm_client=client, cfg=cfg,
+            broker_gate=self._broker_exec)
 
     def restart(self) -> None:
         """Reschedule cleanly: stop the running loop thread (joining it) then
@@ -619,13 +713,17 @@ class AgentRuntime:
         return [v[1] for v in latest.values()]
 
     def _compute_fused_candidates(
-        self, goal: Goal, candidates: list[str],
+        self, goal: Goal, candidates: list[str], include_all: bool = False,
     ) -> tuple[list, list[dict], dict[str, float]]:
         """Run top-K Selector + factor pipeline → FusedCandidate list.
 
         Shared between the rule-ensemble and LLM paths. Returns
         (fused_candidates, evaluations, strategy_weights). Empty list
         means "no actionable candidates this cycle".
+
+        `include_all=True`(llm_full 模式):策略没投票的候选也按因子分补进
+        列表——LLM 全权模式要看到整个候选池,策略票只是打分信号之一,不再是
+        入场闸门。
 
         Logs a `strategy_ensemble` decision as a side-effect — this is the
         only place we have full attribution and weights, and the audit
@@ -699,6 +797,24 @@ class AgentRuntime:
                                  sentiment_scores=sentiment_scores,
                                  sentiment_blend=(sentiment_blend
                                                   if sentiment_scores else 0.0))
+
+        if include_all:
+            from quanti.agent.signal_pipeline import (_factor_score,
+                                                      _industry_for, _sigmoid)
+            have = {c.code for c in fused}
+            extras = []
+            for code in candidates:
+                if code in have:
+                    continue
+                fs = _factor_score(panel, code)
+                extras.append(FusedCandidate(
+                    code=code, strategy_score=0.0, factor_score=fs,
+                    sentiment_score=0.0,
+                    final_score=factor_blend * _sigmoid(fs, k=1.0),
+                    contributing_strategies=[], dominant_strategy="",
+                    industry=_industry_for(panel, code)))
+            fused = sorted(fused + extras,
+                           key=lambda c: c.final_score, reverse=True)
 
         if industry_neutral:
             fused = industry_cap(fused, n_per_industry=n_per_industry)
@@ -908,6 +1024,94 @@ class AgentRuntime:
         from quanti.agent.llm_runtime import AnthropicLLMClient
         return AnthropicLLMClient()
 
+    def _sync_llm_mode(self, goal: Goal) -> bool:
+        """把 goal 的 agent_mode 同步到 broker.llm_managed(单一真源=goal)。
+
+        返回本进程是否处于 llm_full 模式。实盘 QmtBroker 一律拒绝 llm_full
+        (代码层 paper-only,晋级唯一通道=paper 先跑出可信记录),降级为普通
+        "llm" 模式并落告警日志。"""
+        params = goal.params or {}
+        want = (str(params.get("agent_mode", "")).lower() == "llm_full"
+                and not goal.strategy_name)
+        if want and getattr(self._broker, "_require_live", False):
+            if self._llm_full_live_warned != date.today():
+                self._llm_full_live_warned = date.today()
+                self._db.log_decision(
+                    "llm_full_refused",
+                    "llm_full(LLM 全权模式)仅限模拟盘:实盘链路保持机械风控,"
+                    "本进程降级为普通 llm 模式。")
+            want = False
+        if hasattr(self._broker, "llm_managed"):
+            self._broker.llm_managed = want
+        return want
+
+    def _llm_full_path(self, goal: Goal, candidates: list[str]) -> dict:
+        """LLM 全权决策路径 (agent_mode="llm_full")。
+
+        与 _llm_path 的区别:候选管线不设阈值/行业cap/持仓数上限(alpha 过滤
+        全部旁路,策略跑分只作为打分信号),全候选直达 LLM;LLM 可买可卖,
+        并为每个持仓落止损/加仓点位(llm_position_plans),由 5 秒机械 guard
+        比价执行。LLM 不可用时本 tick 不产生新决策——存量点位继续机械保护,
+        不回退到任何规则决策者。"""
+        import copy
+
+        from quanti.agent.llm_full import run_llm_full_decision
+        from quanti.agent.llm_runtime import LLMConfig
+
+        params = goal.params or {}
+        g2 = copy.copy(goal)
+        g2.params = dict(params)
+        g2.params.update({
+            "signal_threshold": 0.0,   # 不设分数闸——LLM 看全部候选
+            "industry_neutral": False,  # 行业集中度交给 LLM 判断
+            "max_holdings": 0,          # 广度上限交给 LLM 判断
+        })
+        fused, evaluations, _weights = self._compute_fused_candidates(
+            g2, candidates, include_all=True)
+        if not fused:
+            self._db.log_decision(
+                "cycle_skip", "llm_full 模式: 无候选股",
+                details={"evaluations": evaluations})
+            return {"ok": False, "reason": "llm_full 模式: 无候选股",
+                    "evaluations": evaluations}
+
+        cfg = self._llm_full_cfg(params)
+        client = getattr(self, "_llm_client", None)
+        if client is None:
+            try:
+                client = self._build_llm_client(params)
+            except (ImportError, ValueError) as e:
+                # llm_full 没有规则决策者可回退:本 tick 空过,存量点位继续
+                # 由机械 guard 执行(fail-loud,不静默降级成别的策略)。
+                logger.warning("llm_full: LLM unavailable, tick skipped: %s", e)
+                self._db.log_decision(
+                    "llm_unavailable",
+                    "llm_full 模式: LLM 不可用,本轮不产生新决策"
+                    "(存量止损点位由机械守护继续执行)",
+                    details={"error": str(e)})
+                return {"ok": False, "reason": "LLM 不可用",
+                        "evaluations": evaluations}
+
+        return run_llm_full_decision(
+            db=self._db, broker=self._broker, provider=self._provider,
+            goal=goal, candidates=fused, llm_client=client, cfg=cfg,
+            broker_gate=self._broker_exec,
+        ) | {"evaluations": evaluations, "strategy": "llm_full"}
+
+    @staticmethod
+    def _llm_full_cfg(params: dict):
+        """llm_full 的 LLMConfig:上下文放宽到 100 候选、输出 8192 tokens
+        (截断硬拒,PR#149 教训)、单轮最多 10 单。均可经 goal.params 覆盖。"""
+        from quanti.agent.llm_runtime import DEFAULT_MODEL, LLMConfig
+        return LLMConfig(
+            model=str(params.get("llm_model", DEFAULT_MODEL)),
+            max_tokens=int(params.get("llm_max_tokens", 8192)),
+            max_tool_iterations=int(params.get("llm_max_iterations", 8)),
+            max_candidates_in_context=int(params.get("llm_max_candidates", 100)),
+            temperature=float(params.get("llm_temperature", 0.3)),
+            max_orders=int(params.get("llm_max_orders", 10)),
+        )
+
     def _llm_path(self, goal: Goal, candidates: list[str]) -> dict:
         """LLM-driven path. Uses ensemble for candidate generation, then
         hands the candidates to Claude for the final pick/sizing decision.
@@ -1023,6 +1227,9 @@ class AgentRuntime:
         ts = datetime.now().isoformat()
         self._breaker_flag.clear()  # fresh cycle; the breaker re-runs below
         goal = load_goal(self._db)
+        # llm_full 模式同步要先于本 tick 的一切 broker 调用(check_exits 的
+        # LLM 点位分支、护栏旁路、实时 BUY 都读 broker.llm_managed)。
+        is_llm_full = self._sync_llm_mode(goal)
 
         # FIRST: try to fill any pending orders from prior ticks. This must
         # happen before new signal generation so today's fills update cash
@@ -1203,15 +1410,19 @@ class AgentRuntime:
         # A pinned strategy ALWAYS wins — it's the user's explicit override.
         params = goal.params or {}
         agent_mode = str(params.get("agent_mode", "")).lower()
-        if agent_mode == "llm" and not goal.strategy_name:
-            llm_result = self._llm_path(goal, candidates)
+        if agent_mode in ("llm", "llm_full") and not goal.strategy_name:
+            # llm_full 被拒(实盘)时 is_llm_full=False → 降级走普通 llm 终审。
+            llm_result = (self._llm_full_path(goal, candidates) if is_llm_full
+                          else self._llm_path(goal, candidates))
             # Maintain the cycle-end status snapshot so the UI stays fresh.
             with self._lock:
                 self._status.last_tick_at = ts
                 self._status.last_tick_summary = (
-                    f"LLM 决策: {llm_result.get('filled', 0)} 成交, "
+                    f"LLM {'全权' if is_llm_full else ''}决策: "
+                    f"{llm_result.get('filled', 0)} 成交, "
                     f"{llm_result.get('rejected', 0)} 拒绝")
-                self._status.last_strategy = llm_result.get("strategy", "llm")
+                self._status.last_strategy = llm_result.get(
+                    "strategy", "llm_full" if is_llm_full else "llm")
                 self._status.last_evaluations = llm_result.get("evaluations", [])
                 snap = llm_result.get("snapshot") or self._broker.snapshot_portfolio()
                 self._status.total_value = snap.get("total_value", 0)

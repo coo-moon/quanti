@@ -111,6 +111,12 @@ def compute_strategy_exits(provider, strategies: dict,
         name = p.get("entry_strategy") or ""
         strat_cls = strategies.get(name)
         if strat_cls is None:
+            if name:
+                # 归属策略已被移除(如精简进 attic)→ 该持仓失去策略离场,
+                # 只剩止损/止盈。显式告警而非静默跳过(#96 教训)。
+                logger.warning(
+                    "entry_strategy %r for %s not loaded — strategy exit "
+                    "degraded to stop-loss/TP only", name, p["code"])
             continue
         try:
             bars = provider.get_daily_bars(p["code"], start, end)
