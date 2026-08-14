@@ -53,16 +53,17 @@
       </div>
     </div>
 
-    <!-- Strategy-exit degradation warning: holdings whose owning strategy was
-         retired (e.g. into strategies/attic) lose their strategy exit and only
-         keep stop-loss / take-profit. Operator must act or accept it. -->
+    <!-- Strategy-exit degradation warning: holdings whose owning strategy is
+         gone from BOTH strategies/ and strategies/attic lose their strategy
+         exit and only keep stop-loss / take-profit. (Attic retirement alone
+         no longer degrades exits — replay falls back to the attic.) -->
     <div class="card degraded-card" v-if="(agent?.degraded_exits?.length ?? 0) > 0">
       <div class="card-header">
         <h2>⚠️ 持仓策略离场降级</h2>
         <span class="stat-label">{{ agent?.degraded_exits?.length }} 个持仓</span>
       </div>
       <p class="degraded-desc">
-        以下持仓的入场策略已不在 strategies 目录(通常是被精简进 attic)——策略离场已失效,只剩止损/止盈兜底:
+        以下持仓的入场策略已同时不在 strategies/ 与 strategies/attic——策略离场已失效,只剩止损/止盈兜底:
       </p>
       <ul class="degraded-list">
         <li v-for="d in agent?.degraded_exits ?? []" :key="d.code">
@@ -71,7 +72,7 @@
         </li>
       </ul>
       <p class="degraded-desc">
-        处理:把策略移回 strategies/ 目录,或平掉这些仓位,或确认可接受仅止损/止盈离场。
+        处理:把策略文件放回 strategies/ 或 strategies/attic/,或平掉这些仓位,或确认可接受仅止损/止盈离场。
         (<code>quanti doctor</code> 会持续体检此项)
       </p>
     </div>

@@ -43,10 +43,18 @@ DEFAULT_MAX_STALE_DAYS = 3
 
 # ---------------------------------------------------------------- exit coverage
 def load_strategy_names(strategies_dir: str) -> set[str]:
-    """Names of every loadable strategy class under strategies_dir."""
+    """Names of every loadable strategy class under strategies_dir AND its
+    attic — exit replay (exits.load_strategies) falls back to attic, so a
+    holding whose strategy was retired there is NOT degraded."""
+    from pathlib import Path
     try:
         from quanti.strategy.loader import StrategyLoader
-        return {s.name for s in StrategyLoader().load_directory(strategies_dir)}
+        loader = StrategyLoader()
+        names = {s.name for s in loader.load_directory(strategies_dir)}
+        attic = Path(strategies_dir) / "attic"
+        if attic.is_dir():
+            names |= {s.name for s in loader.load_directory(str(attic))}
+        return names
     except Exception as e:  # noqa: BLE001 - a broken dir must not kill the check
         logger.warning("strategy scan failed for %r: %s", strategies_dir, e)
         return set()
@@ -84,7 +92,7 @@ def exit_coverage(db, strategies_dir: str) -> dict:
             degraded.append({"code": code, "entry_strategy": strat,
                              "name": name})
     if degraded:
-        detail = (f"{len(degraded)} 个持仓的入场策略已不在 strategies 目录,"
+        detail = (f"{len(degraded)} 个持仓的入场策略已不在 strategies/attic,"
                   f"策略离场降级为仅止损/止盈:"
                   + "; ".join(f"{d['code']}({d['entry_strategy']})"
                               for d in degraded))
