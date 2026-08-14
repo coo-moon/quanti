@@ -281,6 +281,19 @@ quanti factor-watch --json # 机器可读
 
 ---
 
+## 离线 LLM 评估(`scripts/llm_eval.py`)
+
+把历史交易日重放给 LLM 决策层 vs 机械基线(生产融合口径:0.5×策略分 + 0.5×sigmoid(因子分))的**离线实验**——衡量「LLM 选的票」vs「机械排名的票」的未来收益,llm_full 模式上实盘前的信任前提。只读、不交易、不做任何账户写入(可选 `--log-decision` 落审计流)。
+
+```bash
+# 需要 DEEPSEEK_API_KEY(或 --provider anthropic)
+python scripts/llm_eval.py --end 2026-07-31 --days 30 --k 5
+```
+
+关键参数:`--days` 评估日数(默认 30,每周一次采样)、`--stride` 采样间隔(默认 5 个交易日)、`--max-codes` 每日候选上限(默认 60,LLM 上下文友好)、`--horizon` 前视窗口(默认 5/10 个交易日)。LLM 输出经防御解析(限候选集、去重、≤K);解析失败有一次纠正重试,仍失败按当日错误记账——绝不静默回退。报告 JSON 落 `data/llm_eval_<date>.json`,摘要含各臂均值收益/胜率/重合度。
+
+---
+
 ## `mcp` — MCP server
 
 以 stdio JSON-RPC 启动 MCP server,供 OpenClaw / Claude Desktop / Cursor 接入(暴露目标读写、Agent 控制、账户视图、试跑回测/选股、数据同步等工具)。
