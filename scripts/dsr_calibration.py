@@ -40,7 +40,6 @@ from quanti.agent.goal import Goal
 from quanti.agent.params import resolve_params
 from quanti.agent.selector import StrategySelector, _MIN_OOS_TRADES
 from quanti.backtest.engine import BacktestEngine
-from quanti.backtest.metrics import annualized_sharpe
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
 from quanti.risk.manager import RiskConfig, RiskManager
@@ -238,7 +237,7 @@ def analyze(rows: list[dict], args) -> None:
     if best_ret <= max(smax.mean(), eq.mean()) + 1e-9:
         winner_base = "always-equal(门全开)" if eq.mean() >= smax.mean() else "always-softmax(门全关)"
         print(f"    无 dsr_min 阈值能超过基线;{winner_base} 更优 → 门在此数据上无净增益。")
-        print(f"    → 保持 dsr_gate 默认关;dsr_min 取保守统计默认 0.90(LdP 惯例区间 0.90~0.95)。")
+        print("    → 保持 dsr_gate 默认关;dsr_min 取保守统计默认 0.90(LdP 惯例区间 0.90~0.95)。")
     else:
         print(f"    最优 dsr_min ≈ {best_thr:.2f}(前瞻 {best_ret*100:+.3f}%/月,超两条基线)。")
         print(f"    → dsr_gate 仍建议默认关(policy),但 dsr_min 默认可定 {best_thr:.2f}。")

@@ -70,3 +70,8 @@ line-length = 100
 # as defaults.
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# QMT 策略在券商的 mini-python 运行时内执行,timetag_to_datetime /
+# get_trade_detail_data / passorder 等由 QMT 注入的全局名在仓库里不存在。
+"strategies/qmt/*.py" = ["F821"]

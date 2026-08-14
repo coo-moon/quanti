@@ -193,10 +193,11 @@ def test_positions_fails_closed_on_none(monkeypatch):
 
 
 def test_orders_status_mapping(monkeypatch):
-    mk = lambda st, ot=23: types.SimpleNamespace(
-        order_id=1, stock_code="000001.SZ", order_type=ot, order_volume=100,
-        price=10.0, order_status=st, traded_volume=0, traded_price=0.0,
-        order_time=0)
+    def mk(st, ot=23):
+        return types.SimpleNamespace(
+            order_id=1, stock_code="000001.SZ", order_type=ot, order_volume=100,
+            price=10.0, order_status=st, traded_volume=0, traded_price=0.0,
+            order_time=0)
     orders = [mk(FakeConst.ORDER_SUCCEEDED), mk(FakeConst.ORDER_PART_SUCC),
               mk(FakeConst.ORDER_CANCELED), mk(FakeConst.ORDER_JUNK),
               mk(FakeConst.ORDER_REPORTED), mk(FakeConst.ORDER_SUCCEEDED, ot=24)]

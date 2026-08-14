@@ -11,7 +11,6 @@ CLI: .venv/bin/python scripts/breadth_snapshot.py [--json|--selfcheck]
 import math
 import sqlite3
 import sys
-from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -205,33 +204,45 @@ def classify(above20, above50, above200, cap5, eq5, ad_ratio, amt_chg):
     reasons = []
     # 中期结构:MA50 上方占比
     if above50 >= 60:
-        votes.append(1); reasons.append(f"MA50上方{above50:.0f}%(多头结构)")
+        votes.append(1)
+        reasons.append(f"MA50上方{above50:.0f}%(多头结构)")
     elif above50 <= 40:
-        votes.append(-1); reasons.append(f"MA50上方仅{above50:.0f}%(空头结构)")
+        votes.append(-1)
+        reasons.append(f"MA50上方仅{above50:.0f}%(空头结构)")
     else:
-        votes.append(0); reasons.append(f"MA50上方{above50:.0f}%(分化)")
+        votes.append(0)
+        reasons.append(f"MA50上方{above50:.0f}%(分化)")
     # 长期趋势:MA200
     if above200 >= 55:
-        votes.append(1); reasons.append(f"MA200上方{above200:.0f}%(长期多头)")
+        votes.append(1)
+        reasons.append(f"MA200上方{above200:.0f}%(长期多头)")
     elif above200 <= 40:
-        votes.append(-1); reasons.append(f"MA200上方仅{above200:.0f}%(长期承压)")
+        votes.append(-1)
+        reasons.append(f"MA200上方仅{above200:.0f}%(长期承压)")
     else:
-        votes.append(0); reasons.append(f"MA200上方{above200:.0f}%(中性)")
+        votes.append(0)
+        reasons.append(f"MA200上方{above200:.0f}%(中性)")
     # 近5日大盘动能
     if cap5 is not None:
         if cap5 >= 1.5:
-            votes.append(1); reasons.append(f"大盘近5日+{cap5:.1f}%")
+            votes.append(1)
+            reasons.append(f"大盘近5日+{cap5:.1f}%")
         elif cap5 <= -1.5:
-            votes.append(-1); reasons.append(f"大盘近5日{cap5:.1f}%")
+            votes.append(-1)
+            reasons.append(f"大盘近5日{cap5:.1f}%")
         else:
-            votes.append(0); reasons.append(f"大盘近5日{cap5:+.1f}%(横盘)")
+            votes.append(0)
+            reasons.append(f"大盘近5日{cap5:+.1f}%(横盘)")
     # 涨跌家数
     if ad_ratio >= 1.5:
-        votes.append(1); reasons.append(f"涨跌比{ad_ratio:.2f}(普涨)")
+        votes.append(1)
+        reasons.append(f"涨跌比{ad_ratio:.2f}(普涨)")
     elif ad_ratio <= 0.67:
-        votes.append(-1); reasons.append(f"涨跌比{ad_ratio:.2f}(普跌)")
+        votes.append(-1)
+        reasons.append(f"涨跌比{ad_ratio:.2f}(普跌)")
     else:
-        votes.append(0); reasons.append(f"涨跌比{ad_ratio:.2f}(均衡)")
+        votes.append(0)
+        reasons.append(f"涨跌比{ad_ratio:.2f}(均衡)")
     s = sum(votes)
     if s >= 2:
         label = "上涨(多头)"

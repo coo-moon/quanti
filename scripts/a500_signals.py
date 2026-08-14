@@ -15,7 +15,10 @@
 fail-loud: 行情/估值数据不新鲜、打分覆盖率不足、成分校验偏差过大 → 直接报错退出,
 不产出文件(QMT 侧因文件过期而拒绝交易)。
 """
-import argparse, csv, json, sys
+import argparse
+import csv
+import json
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -39,7 +42,8 @@ def current_members() -> set[str]:
     today = date.today().isoformat()
     for ev in sorted(spec["events"], key=lambda e: e["effective_trade_date"]):
         if ev["effective_trade_date"] <= today:
-            cur -= set(ev["out"]); cur |= set(ev["in"])
+            cur -= set(ev["out"])
+            cur |= set(ev["in"])
     return cur
 
 

@@ -37,7 +37,6 @@
 import csv
 import io
 import os
-import time
 from datetime import datetime, date
 
 # ----------------------------------------------------------------- 用户配置
@@ -276,8 +275,10 @@ def _selftest():
     assert orders[0][1] == "sell"               # 卖先于买
     assert inf_w == 0.0
 
-    prev_gap = dict(prev); prev_gap["A.SH"] = 9.0
-    prices_gap = dict(prices); prices_gap["A.SH"] = 10.0   # +11.1% 高开
+    prev_gap = dict(prev)
+    prev_gap["A.SH"] = 9.0
+    prices_gap = dict(prices)
+    prices_gap["A.SH"] = 10.0   # +11.1% 高开
     orders, skipped, _ = plan_orders(targets2, positions, prices_gap, prev_gap, 100000.0)
     assert ("A.SH", "buy", 5000) not in orders
     assert any("gap" in r for _, r in skipped)

@@ -137,9 +137,11 @@ def main():
 
     ew_y, lp_y = by_year(ew), by_year(lp)
     idx_y = by_year([(d, r) for d, r in idx.items()]) if idx_ok else {}
-    nbyyear = defaultdict(list); tbyyear = defaultdict(list)
+    nbyyear = defaultdict(list)
+    tbyyear = defaultdict(list)
     for d, r, n, t in ew:
-        nbyyear[d[:4]].append(n); tbyyear[d[:4]].append(t)
+        nbyyear[d[:4]].append(n)
+        tbyyear[d[:4]].append(t)
 
     print(f"\n窗口 {rebals[0]}~{rebals[-1]}  成本{COST:.1%}/换手\n", flush=True)
     print(f"{'年份':<6}{'全等权':>9}{'低价top40':>11}{'中证转债idx':>12}{'均券数':>7}{'年换手':>7}", flush=True)
