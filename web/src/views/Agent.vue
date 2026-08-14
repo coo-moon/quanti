@@ -1353,6 +1353,7 @@ function displayStrategy(name: string): string {
   if (!name) return "";
   if (name === "ensemble") return "ensemble";  // synthetic, not in the list
   if (name === "llm") return "LLM";
+  if (name === "llm_full") return "LLM 全权";
   return strategyNameMap.value.get(name) || name;
 }
 
@@ -1361,6 +1362,7 @@ function displayStrategy(name: string): string {
 // so they're not confused by a mode badge that does nothing.
 const modeLabel = computed(() => {
   if (goalDraft.strategy_name) return `钉死: ${displayStrategy(goalDraft.strategy_name)}`;
+  if (advParams.agent_mode === "llm_full") return "LLM 全权";
   if (advParams.agent_mode === "llm") return "LLM 决策";
   if (advParams.agent_mode === "ensemble") return "集成 (ensemble)";
   return "经典 (rule)";
@@ -1368,7 +1370,8 @@ const modeLabel = computed(() => {
 
 const modeClass = computed(() => {
   if (goalDraft.strategy_name) return "mode-pinned";
-  if (advParams.agent_mode === "llm") return "mode-llm";
+  if (advParams.agent_mode === "llm" || advParams.agent_mode === "llm_full")
+    return "mode-llm";
   if (advParams.agent_mode === "ensemble") return "mode-ensemble";
   return "mode-rule";
 });
