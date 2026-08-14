@@ -230,6 +230,7 @@ def create_app(
                                     regime_fn=_daily_regime,
                                     doctor_fn=_daily_doctor,
                                     strategy_gate_fn=_daily_strategy_gate,
+                                    provider=provider,
                                     heavy_warmup_sec=_warmup)
 
     @asynccontextmanager

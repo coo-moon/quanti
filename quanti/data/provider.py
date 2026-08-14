@@ -30,7 +30,7 @@ class DataProvider:
     """
 
     def __init__(self, db: Database, *,
-                 cache_ttl_sec: float = 60.0,
+                 cache_ttl_sec: float = 3600.0,
                  cache_max_codes: int = 500):
         """Args:
             cache_ttl_sec: per-code series cache lifetime. Hot loops (selector
@@ -38,9 +38,13 @@ class DataProvider:
                 tens of thousands of times per cold boot — without a cache
                 each read takes the SQLite lock and the whole cold start
                 becomes an hour-long lock convoy (2026-08-14 diagnosis).
-                60s is short enough that a post-sync re-read is at worst one
-                minute stale; the live mark path (realtime quotes) never
-                goes through this cache.
+                Measured 2026-08-14: at 60s the sweep's folds (which span
+                minutes) expire the entries mid-run and every fold re-pierces
+                the DB — the sweep went from 95s (quiet, cache-warm) to 7+ min
+                live. 3600s covers the sweep; staleness is handled at the
+                edges instead: freshness-critical reads pass fresh=True
+                (next_trading_bar), sync writes invalidate (runtime + syncer),
+                and realtime marks never touch this cache.
             cache_max_codes: LRU cap. ~500 codes x ~10 years of daily bars
                 ≈ 40MB — bounded regardless of universe size.
         """
