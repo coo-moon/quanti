@@ -504,3 +504,69 @@ def test_backtest_atr_stop_fires_when_fixed_would_not(tmp_path):
     assert atr_exits, "ATR-adaptive stop should have fired on the -6% drop"
     # Fixed-only (k=0): -6% never breaches -8% → no risk_exit.
     assert not [t for t in run(0.0).trades if t.strategy == "risk_exit"]
+
+class TestHaltedExposure:
+    """The portfolio circuit breaker must be VISIBLE on the result — post-halt
+    equity tails are cash/remnant drift, and research scripts / the UI must
+    not read them as the strategy still trading (2026-08-14 misread)."""
+
+    def _market(self, db, prices, start="2024-01-02"):
+        dates = pd.bdate_range(start, periods=len(prices))
+        df = pd.DataFrame({
+            "code": "000001",
+            "date": [d.date() for d in dates],
+            "open": prices, "high": [p * 1.01 for p in prices],
+            "low": [p * 0.99 for p in prices], "close": prices,
+            "volume": [1_000_000.0] * len(prices),
+            "amount": [p * 1_000_000 for p in prices],
+            "turnover": [1.0] * len(prices),
+        })
+        db.save_daily_quotes(df)
+        db.save_trade_calendar([d.date() for d in dates])
+        return dates
+
+    def test_breaker_trip_is_exposed(self, tmp_path):
+        from quanti.risk.manager import RiskConfig, RiskManager
+        db = Database(str(tmp_path / "h.db"))
+        db.initialize()
+        # A stock that falls 3%/day. ATR stop would exit early, so disable it
+        # and widen the per-stock floor — the PORTFOLIO breaker must trip first.
+        prices = [10.0 - 0.3 * i for i in range(40)]
+        self._market(db, prices)
+        provider = DataProvider(db)
+        strategy = AlwaysBuyStrategy()
+        strategy.init({})
+        cfg = RiskConfig(portfolio_stop_loss_pct=-0.10,
+                         atr_stop_k=0.0, stop_loss_pct=-0.60)
+        engine = BacktestEngine(provider=provider, initial_cash=100_000.0,
+                                risk_manager=RiskManager(cfg))
+        result = engine.run(strategy, ["000001"], date(2024, 1, 2), date(2024, 2, 27))
+        assert result.halted is True
+        assert result.halted_at is not None
+        assert "熔断" in result.halted_reason
+        # Post-halt trades may exist ONLY as the flatten fills (the breaker
+        # queues SELLs that fill at the next open) — never new strategy buys.
+        post = [t for t in result.trades if t.date > result.halted_at]
+        assert all(t.direction == Direction.SELL for t in post)
+        eq = result.equity_curve
+        eq.index = pd.to_datetime(eq.index)
+        tail = eq[eq.index > pd.Timestamp(result.halted_at)]
+        assert len(tail) == 0 or tail.pct_change().dropna().abs().max() < 0.001
+        db.close()
+
+    def test_no_halt_on_benign_run(self, tmp_path):
+        from quanti.risk.manager import RiskManager
+        db = Database(str(tmp_path / "ok.db"))
+        db.initialize()
+        prices = [10.0 + 0.01 * i for i in range(30)]
+        self._market(db, prices)
+        provider = DataProvider(db)
+        strategy = AlwaysBuyStrategy()
+        strategy.init({})
+        engine = BacktestEngine(provider=provider, initial_cash=100_000.0,
+                                risk_manager=RiskManager())
+        result = engine.run(strategy, ["000001"], date(2024, 1, 2), date(2024, 2, 12))
+        assert result.halted is False
+        assert result.halted_at is None
+        db.close()
+

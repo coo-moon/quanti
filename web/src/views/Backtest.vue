@@ -70,6 +70,16 @@
       <span>{{ syncMsg }}</span>
     </div>
 
+    <!-- Halted: the portfolio circuit breaker stopped strategy trading -->
+    <div v-if="result && result.halted" class="alert alert-danger">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <path d="M9 2l7.5 13H1.5L9 2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+        <path d="M9 7.5v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        <circle cx="9" cy="13" r="0.75" fill="currentColor" />
+      </svg>
+      <span>⚠️ {{ result.halted_reason || "组合回撤熔断" }}：{{ result.halted_at }} 起引擎停摆——熔断后段是现金/残仓漂移，不是策略在交易，OOS 指标请勿跨过熔断点解读。</span>
+    </div>
+
     <!-- Warning -->
     <div v-if="result && result.warning" class="alert alert-warning">
       <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
@@ -546,6 +556,11 @@ async function syncData() {
 .alert-warning {
   background: rgba(255, 149, 0, 0.08);
   color: var(--color-orange);
+}
+
+.alert-danger {
+  background: rgba(192, 57, 43, 0.08);
+  color: #c0392b;
 }
 
 .alert svg {

@@ -112,18 +112,25 @@ def main():
                 continue
             eq = res.equity_curve
             eq.index = pd.to_datetime(eq.index)
+            halted_at = getattr(res, 'halted_at', None)
             rows = {"full": {}, "is": {}, "oos": {}}
+            rows["halted_at"] = halted_at.isoformat() if halted_at else None
             segment_metrics(eq, "full", rows)
             seg_is = eq[eq.index <= pd.Timestamp(OOS_SPLIT)]
             seg_oos = eq[eq.index > pd.Timestamp(OOS_SPLIT)]
             segment_metrics(seg_is, "is", rows)
-            segment_metrics(seg_oos, "oos", rows)
+            if halted_at is not None and halted_at <= OOS_SPLIT:
+                rows["oos"] = {"void": True, "reason": f"熔断停摆于 {halted_at.isoformat()},OOS 无有效交易"}
+            else:
+                segment_metrics(seg_oos, "oos", rows)
             report["strategies"][sname][arm_name] = rows
             daily_returns[(sname, arm_name)] = eq.pct_change().dropna()
+            oos_s = rows.get('oos', {})
+            oos_str = (f"oos sharpe={oos_s['sharpe']:.2f} oos dd={oos_s['max_drawdown']:.1%}"
+                       if not oos_s.get('void')
+                       else f"oos=VOID ({oos_s.get('reason', '')})")
             print(f"{sname}/{arm_name}: full sharpe={rows['full']['sharpe']:.2f} "
-                  f"dd={rows['full']['max_drawdown']:.1%} "
-                  f"oos sharpe={rows['oos']['sharpe']:.2f} "
-                  f"oos dd={rows['oos']['max_drawdown']:.1%}")
+                  f"dd={rows['full']['max_drawdown']:.1%} " + oos_str)
 
     # ---- gates ----
     for sname in report["strategies"]:
@@ -148,6 +155,10 @@ def main():
         fixed = f.get("fixed10", {})
         for a in ("volt18", "volt30"):
             if a not in f or not fixed:
+                continue
+            if fixed.get("oos", {}).get("void") or f[a].get("oos", {}).get("void"):
+                f[a]["verdict"] = "INVALID(oos 熔断后无有效交易)"
+                print(f"{sname}/{a}: OOS 段熔断停摆,对比无效")
                 continue
             dd_ok = (f[a]["is"]["max_drawdown"] < fixed["is"]["max_drawdown"]
                      and f[a]["oos"]["max_drawdown"] < fixed["oos"]["max_drawdown"])

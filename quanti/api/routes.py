@@ -50,6 +50,9 @@ class BacktestResponse(BaseModel):
     trades: list[TradeResponse]
     equity_curve: dict[str, float]
     warning: str = ""
+    halted: bool = False
+    halted_at: str | None = None
+    halted_reason: str = ""
 
 
 class SyncRequest(BaseModel):
@@ -1617,6 +1620,11 @@ async def run_backtest(body: BacktestRequest, request: Request):
     return BacktestResponse(
         metrics=result.metrics,
         warning=result.skip_reason,
+        # getattr: test fakes and any legacy result-like object stay valid.
+        halted=bool(getattr(result, "halted", False)),
+        halted_at=(getattr(result, "halted_at", None).isoformat()
+                   if getattr(result, "halted_at", None) else None),
+        halted_reason=getattr(result, "halted_reason", ""),
         trades=[
             TradeResponse(
                 date=t.date.isoformat(),
