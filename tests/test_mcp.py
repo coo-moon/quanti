@@ -75,3 +75,28 @@ def test_list_strategies(ctx):
     result = _handle_tool_call(ctx, "list_strategies", {})
     names = {s["name"] for s in result}
     assert "ma_cross" in names
+
+
+class TestDiagnosticTools:
+    def test_tool_specs_include_diagnostics(self):
+        names = {t["name"] for t in _tool_specs()}
+        assert {"run_doctor", "factor_watch", "strategy_gate_status"} <= names
+
+    def test_run_doctor_tool(self, ctx):
+        report = _handle_tool_call(ctx, "run_doctor", {})
+        assert set(report["checks"]) == {"exit_coverage", "data_freshness",
+                                          "db_integrity"}
+        assert isinstance(report["ok"], bool)
+
+    def test_factor_watch_tool(self, ctx):
+        report = _handle_tool_call(ctx, "factor_watch", {})
+        assert set(report) >= {"ok", "factors", "decayed",
+                               "newly_rejected", "unmonitored"}
+
+    def test_strategy_gate_status_tool(self, ctx):
+        ctx.db.save_strategy_gate("ma_cross", date(2026, 8, 14), "breaker",
+                                  "熔断", sharpe=-1.0, max_drawdown=-0.4,
+                                  halted=True)
+        gate = _handle_tool_call(ctx, "strategy_gate_status", {})
+        assert gate["ma_cross"]["verdict"] == "breaker"
+
