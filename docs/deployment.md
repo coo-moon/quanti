@@ -58,6 +58,14 @@ launchctl load ~/Library/LaunchAgents/com.quanti.api.plist
 Web 侧:持仓策略离场降级会在「AI Agent」页顶部亮红色告警卡
 (列出代码与缺失策略);无退化时不显示。
 
+### 死锁诊断:QUANTI_STACK_DUMP
+
+部署 plist 里设 `QUANTI_STACK_DUMP=1` 后,`kill -USR1 <pid>` 会把**全线程的
+Python 栈**打到 err log。注意语义(macOS 实测):faulthandler 转储完成后按
+信号的默认动作执行——对 SIGUSR1 即**进程退出**,KeepAlive 会在 10 秒内
+拉起新进程。所以这是「转储 + 重启」组合:抓完现场服务自己复活,诊断用,
+别在交易时段当玩具按。
+
 ## 3. 告警静默的已知问题(已修)
 
 历史上挪走策略(如精简进 attic)后,盘中守卫每 5 秒刷一条

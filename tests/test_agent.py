@@ -417,3 +417,64 @@ class TestStaleDataGate:
         assert "stale_data_skip" not in kinds
         assert result["ok"] is True
         db.close()
+
+
+class TestBulkFreshness:
+    """_ensure_recent_data must use ONE bulk freshness query — the per-code
+    loop was a 5.8k-query lock convoy on the full market (2026-08-14)."""
+
+    def test_bulk_freshness_single_query(self, tmp_path, monkeypatch):
+        from datetime import date, timedelta
+
+        import pandas as pd
+
+        from quanti.agent.runtime import AgentRuntime
+        from quanti.data.database import Database
+        from quanti.data.provider import DataProvider
+        from quanti.execution.paper_broker import PaperBroker
+
+        db = Database(str(tmp_path / "b.db"))
+        db.initialize()
+        today = date.today()
+        for code in ("000001", "000002"):
+            days = [today - timedelta(days=1), today]
+            db.save_daily_quotes(pd.DataFrame({
+                "code": code,
+                "date": [d.isoformat() for d in days],
+                "open": [10.0] * 2, "high": [10.1] * 2, "low": [9.9] * 2,
+                "close": [10.0] * 2, "volume": [1e6] * 2,
+                "amount": [1e7] * 2, "turnover": [1.0] * 2,
+            }))
+        db.save_daily_quotes(pd.DataFrame({
+            "code": "000003",
+            "date": [(today - timedelta(days=10)).isoformat()],
+            "open": [10.0], "high": [10.1], "low": [9.9], "close": [10.0],
+            "volume": [1e6], "amount": [1e7], "turnover": [1.0],
+        }))
+        provider = DataProvider(db)
+
+        calls = {"bars": 0}
+        orig_bars = provider.get_daily_bars
+
+        def counting_bars(*a, **kw):
+            calls["bars"] += 1
+            return orig_bars(*a, **kw)
+        provider.get_daily_bars = counting_bars
+
+        synced = []
+
+        class _FakeAdapter:
+            def sync_daily_quotes(self, code, start=None, end=None,
+                                  repair_gaps=False):
+                synced.append(code)
+
+        monkeypatch.setattr("quanti.data.source.make_quote_adapter",
+                            lambda db: _FakeAdapter())
+        broker = PaperBroker(db, provider)
+        agent = AgentRuntime(db, provider, broker,
+                             strategies_dir="strategies",
+                             screeners_dir="screeners")
+        agent._ensure_recent_data(["000001", "000002", "000003"])
+        assert calls["bars"] == 0  # the bulk path never calls per-code bars
+        assert synced == ["000003"]  # only the stale code is refreshed
+
