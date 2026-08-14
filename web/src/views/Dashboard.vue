@@ -40,6 +40,36 @@
 
     <details class="card ds-card">
       <summary class="card-header ds-summary">
+        <h2>告警通道</h2>
+        <span class="card-header-hint">
+          熔断/未知单/体检异常主动推送 · {{ alertStateLabel }}
+        </span>
+      </summary>
+      <div class="ds-body">
+        <div class="ds-row">
+          <label>Webhook</label>
+          <input
+            v-model="alertUrl"
+            type="password"
+            :placeholder="alertCfg.has_webhook ? '已配置 ✓(留空则不修改)' : '飞书/钉钉/企微/Server酱 机器人 webhook URL'"
+            :disabled="alertBusy"
+          />
+        </div>
+        <div class="ds-actions">
+          <button class="btn-small" @click="testAlert" :disabled="alertBusy">发送测试消息</button>
+          <button class="btn-small primary" @click="saveAlert" :disabled="alertBusy">保存</button>
+          <button class="btn-small" @click="clearAlert" :disabled="alertBusy || !alertCfg.has_webhook">清除</button>
+          <span v-if="alertMsg" class="ds-msg" :class="alertError ? 'error' : 'ok'">{{ alertMsg }}</span>
+        </div>
+        <div class="card-header-hint" style="padding-top:4px">
+          推送事件:{{ alertCfg.kinds.join(" / ") }};同类事件 10 分钟去抖。env
+          QUANTI_ALERT_WEBHOOK 优先于此处配置。
+        </div>
+      </div>
+    </details>
+
+    <details class="card ds-card">
+      <summary class="card-header ds-summary">
         <h2>同步设置</h2>
         <span class="card-header-hint">
           下载 {{ syncYears }} 年 · {{ syncWithBasic ? "含估值" : "仅行情" }}{{ syncWithFinancials ? " · 含财报" : "" }}
@@ -256,6 +286,10 @@ import {
   fetchDataSource,
   testDataSource,
   saveDataSource,
+  fetchAlertConfig,
+  testAlertConfig,
+  saveAlertConfig,
+  type AlertConfig,
   type StockInfo,
   type StockPoolStats,
   type SyncStatus,
@@ -351,6 +385,77 @@ async function saveDS() {
   }
 }
 
+// --- Alert channel config panel ---
+const alertCfg = ref<AlertConfig>({ has_webhook: false, source: "", kinds: [] });
+const alertUrl = ref("");   // blank = keep existing webhook
+const alertMsg = ref("");
+const alertError = ref(false);
+const alertBusy = ref(false);
+
+const alertStateLabel = computed(() => {
+  if (!alertCfg.value.has_webhook) return "未配置";
+  return alertCfg.value.source === "env" ? "已启用 (env)" : "已启用";
+});
+
+async function loadAlertConfig() {
+  try {
+    const res = await fetchAlertConfig();
+    alertCfg.value = res.data;
+  } catch (e) { /* leave defaults */ }
+}
+
+function setAlertMsg(msg: string, err = false) {
+  alertMsg.value = msg;
+  alertError.value = err;
+}
+
+async function testAlert() {
+  alertBusy.value = true;
+  setAlertMsg("发送中…");
+  try {
+    // 传了新 URL 测新的,留空测已保存的
+    const res = await testAlertConfig(alertUrl.value.trim());
+    setAlertMsg(res.data.message, !res.data.ok);
+  } catch (e: any) {
+    setAlertMsg(e?.message || "测试失败", true);
+  } finally {
+    alertBusy.value = false;
+  }
+}
+
+async function saveAlert() {
+  const url = alertUrl.value.trim();
+  if (!url) {
+    setAlertMsg("请先填入 webhook URL(清除请用「清除」按钮)", true);
+    return;
+  }
+  alertBusy.value = true;
+  try {
+    await saveAlertConfig(url);
+    setAlertMsg("已保存 ✓");
+    alertUrl.value = "";
+    await loadAlertConfig();
+  } catch (e: any) {
+    setAlertMsg(e?.message || "保存失败", true);
+  } finally {
+    alertBusy.value = false;
+  }
+}
+
+async function clearAlert() {
+  alertBusy.value = true;
+  try {
+    await saveAlertConfig("");
+    setAlertMsg("已清除(通道关闭)");
+    alertUrl.value = "";
+    await loadAlertConfig();
+  } catch (e: any) {
+    setAlertMsg(e?.message || "清除失败", true);
+  } finally {
+    alertBusy.value = false;
+  }
+}
+
 // Newest bar date in the DB — NOT the wall clock. Showing `new Date()`
 // here (as before) claimed the data was current even when it wasn't.
 const lastUpdate = computed(() => {
@@ -418,6 +523,7 @@ async function resumeSync() {
 onMounted(async () => {
   await loadStocks();
   await loadDataSource();
+  await loadAlertConfig();
   await refreshBgSync();
   // Poll background sync every 10s — fast enough to feel live without
   // hammering the API.

@@ -23,7 +23,8 @@ def db(tmp_path):
 # --- app_config persistence ------------------------------------------------
 
 def test_app_config_roundtrip_and_token_preserved(db):
-    assert db.get_app_config() == {"data_source": "", "data_source_token": ""}
+    assert db.get_app_config() == {"data_source": "", "data_source_token": "",
+                                   "alert_webhook_url": ""}
     db.upsert_app_config("tushare", "tok123")
     cfg = db.get_app_config()
     assert cfg["data_source"] == "tushare" and cfg["data_source_token"] == "tok123"

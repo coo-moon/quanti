@@ -281,6 +281,9 @@ class Database:
             # LLM 全权模式的灾难地板(每标的):仅当 LLM 点位缺失或被幻觉点位
             # 穿透时兜底强平;0 = 关闭。不参与 LLM 日常点位决策。
             ("risk_config", "llm_disaster_floor_pct", "REAL DEFAULT -0.25"),
+            # 告警 webhook(飞书/钉钉/企微/Server酱/通用),空 = 通道关闭;
+            # env QUANTI_ALERT_WEBHOOK 优先于本列。
+            ("app_config", "alert_webhook_url", "TEXT DEFAULT ''"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -559,6 +562,7 @@ class Database:
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 data_source TEXT NOT NULL DEFAULT 'tushare',
                 data_source_token TEXT DEFAULT '',
+                alert_webhook_url TEXT DEFAULT '',
                 updated_at TEXT NOT NULL
             );
 
@@ -1919,12 +1923,15 @@ class Database:
         unset. NOTE: the token is stored plaintext in the local SQLite — fine
         for a local single-user tool; never expose it over the API unmasked."""
         row = self.conn.execute(
-            "SELECT data_source, data_source_token FROM app_config WHERE id=1"
+            "SELECT data_source, data_source_token, alert_webhook_url "
+            "FROM app_config WHERE id=1"
         ).fetchone()
         if row is None:
-            return {"data_source": "", "data_source_token": ""}
+            return {"data_source": "", "data_source_token": "",
+                    "alert_webhook_url": ""}
         return {"data_source": row[0] or "",
-                "data_source_token": row[1] or ""}
+                "data_source_token": row[1] or "",
+                "alert_webhook_url": row[2] or ""}
 
     def upsert_app_config(self, data_source: str,
                           data_source_token: str | None = None) -> None:
@@ -1945,6 +1952,27 @@ class Database:
                 updated_at=excluded.updated_at
             """,
             (data_source, token, now),
+        )
+        self.conn.commit()
+
+    def get_alert_webhook(self) -> str:
+        """告警 webhook(app_config 落库值;env 优先级在 quanti.notify 解析)。"""
+        row = self.conn.execute(
+            "SELECT alert_webhook_url FROM app_config WHERE id=1").fetchone()
+        return (row[0] or "") if row else ""
+
+    def set_alert_webhook(self, url: str) -> None:
+        """只写 webhook 列,不动数据源配置。"""
+        from datetime import datetime
+        self.conn.execute(
+            """
+            INSERT INTO app_config (id, alert_webhook_url, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                alert_webhook_url=excluded.alert_webhook_url,
+                updated_at=excluded.updated_at
+            """,
+            ((url or "").strip(), datetime.now().isoformat()),
         )
         self.conn.commit()
 
@@ -2150,6 +2178,16 @@ class Database:
              json.dumps(json_safe(details or {}))),
         )
         self.conn.commit()
+        # 关键事件主动推送(白名单过滤 + 去抖 + 后台线程,绝不阻塞/抛错)。
+        # 挂在这里而非各调用点:log_decision 是全部关键事件的汇聚点,
+        # CLI / server / MCP 三种入口都经过,一处接线全覆盖。
+        try:
+            from quanti import notify
+            if kind in notify.alert_kinds():
+                notify.notify_decision(kind, summary, code=code, details=details,
+                                       webhook_url=self.get_alert_webhook())
+        except Exception:  # noqa: BLE001 - 告警失败绝不影响决策落库
+            logger.warning("alert notify failed for kind=%s", kind, exc_info=True)
         return int(cur.lastrowid or 0)
 
     def prune_decisions(self, older_than_days: int = 90) -> int:

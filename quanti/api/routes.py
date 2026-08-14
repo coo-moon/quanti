@@ -854,6 +854,43 @@ async def set_data_source(body: DataSourceBody, request: Request):
     return {"ok": True, "message": message}
 
 
+class AlertConfigBody(BaseModel):
+    webhook_url: str = ""
+
+
+@router.get("/config/alert")
+async def get_alert_config(request: Request):
+    """告警通道状态。webhook URL 含密钥,同 data_source_token 一样绝不回明文。"""
+    import os
+
+    from quanti import notify
+    db_url = request.app.state.db.get_alert_webhook()
+    env_url = os.environ.get("QUANTI_ALERT_WEBHOOK", "").strip()
+    return {
+        "has_webhook": bool(notify.resolve_webhook(db_url)),
+        "source": "env" if env_url else ("db" if db_url else ""),
+        "kinds": sorted(notify.alert_kinds()),
+    }
+
+
+@router.post("/config/alert/test")
+async def test_alert_config(body: AlertConfigBody, request: Request):
+    """同步发一条测试消息(传了 URL 用传的,否则用已生效配置),不落库。"""
+    from quanti import notify
+    url = body.webhook_url.strip() or notify.resolve_webhook(
+        request.app.state.db.get_alert_webhook())
+    ok, message = notify.send_test(url)
+    return {"ok": ok, "message": message}
+
+
+@router.post("/config/alert")
+async def set_alert_config(body: AlertConfigBody, request: Request):
+    """存/清 webhook(空串 = 关闭;env QUANTI_ALERT_WEBHOOK 始终优先)。
+    不强制先测通——离线时也允许保存。"""
+    request.app.state.db.set_alert_webhook(body.webhook_url)
+    return {"ok": True}
+
+
 class RiskControlBody(BaseModel):
     stop_loss_pct: float
     portfolio_stop_loss_pct: float
