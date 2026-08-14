@@ -261,12 +261,69 @@ class StrategySelector:
         results.sort(key=lambda r: r.score, reverse=True)
         return results
 
+    def _rank(self, goal: Goal, codes: list[str],
+               candidates: list[BaseStrategy]) -> list[StrategyEvaluation]:
+        """Rank candidates — in a SUBPROCESS by default (goal.params
+        selector_subprocess=True): the walk-forward sweep is ~95s isolated but
+        13+ minutes inside the server process (GIL/DB-lock contention with UI
+        polls, guard threads, the syncer — measured 2026-08-14). Any worker
+        failure falls back to the in-process path, so the tick never dies on
+        a broken worker."""
+        params = goal.params or {}
+        if bool(params.get("selector_subprocess", True)) and len(candidates) > 1:
+            try:
+                ranking = self.evaluate_subprocess(goal, codes, candidates)
+                if ranking:
+                    logger.info("selector sweep ran in subprocess (%d strategies)",
+                                len(ranking))
+                    return ranking
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "selector subprocess sweep failed (%s) — in-process fallback", e)
+        return self.evaluate(goal, codes, candidates)
+
+    def evaluate_subprocess(self, goal: Goal, codes: list[str],
+                            candidates: list[BaseStrategy],
+                            timeout_sec: int = 1800
+                            ) -> list[StrategyEvaluation]:
+        """Run the sweep in a fresh process (quanti.agent.selector_worker),
+        JSON over stdio. Raises on any failure — callers fall back."""
+        import json
+        import subprocess
+        import sys
+
+        payload = {
+            "account_db": str(self._db._db_path),
+            "market_db": (str(self._db.market_db_path)
+                          if getattr(self._db, "_market_db_path", None)
+                          else None),
+            "strategies_dir": str(Path(self._strategies_dir).resolve()),
+            "codes": codes,
+            "end": date.today().isoformat(),
+            "initial_cash": self._initial_cash,
+            "params": goal.params or {},
+            "candidate_names": [c.name for c in candidates],
+        }
+        proc = subprocess.run(
+            [sys.executable, "-m", "quanti.agent.selector_worker"],
+            input=json.dumps(payload), capture_output=True, text=True,
+            timeout=timeout_sec,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"worker exit {proc.returncode}: "
+                f"{(proc.stderr or proc.stdout or '').strip()[-300:]}")
+        rows = json.loads(proc.stdout or "[]")
+        if isinstance(rows, dict) and rows.get("error"):
+            raise RuntimeError(f"worker: {rows['error']}")
+        return [StrategyEvaluation(**row) for row in rows]
+
     def pick_best(self, goal: Goal, codes: list[str],
                   ) -> tuple[BaseStrategy | None, list[StrategyEvaluation]]:
-        candidates = self.load_candidates()
+        candidates = self._gated_candidates()
         if not candidates:
             return None, []
-        ranking = self.evaluate(goal, codes, candidates)
+        ranking = self._rank(goal, codes, candidates)
         if not ranking:
             return None, []
         winner_name = ranking[0].strategy_name
@@ -306,7 +363,7 @@ class StrategySelector:
         candidates = self._gated_candidates()
         if not candidates:
             return [], []
-        ranking = self.evaluate(goal, codes, candidates)
+        ranking = self._rank(goal, codes, candidates)
         if not ranking:
             return [], []
 
