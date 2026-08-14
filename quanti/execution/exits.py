@@ -98,13 +98,25 @@ def compute_atr_ratios(provider, positions: list[dict],
 
 
 def load_strategies(strategies_dir: str) -> dict:
-    """Load strategy classes by name. Returns {} if the loader/dir is
-    unavailable, so exits degrade to stop-loss + take-profit only."""
+    """Load strategy classes by name for EXIT REPLAY, from the active
+    directory AND its attic. A holding whose entry-strategy was retired into
+    attic keeps its strategy-based exit — the position was opened with that
+    logic, so exit coherence outlives retirement. Candidate selection is
+    unaffected: the selector scans the active dir only. Name collision →
+    active dir wins. Returns {} if both dirs are unavailable, so exits
+    degrade to stop-loss + take-profit only."""
+    from pathlib import Path
     cache: dict = {}
     try:
         from quanti.strategy.loader import StrategyLoader
-        for s in StrategyLoader().load_directory(strategies_dir):
+        loader = StrategyLoader()
+        for s in loader.load_directory(strategies_dir):
             cache[s.name] = type(s)
+        attic = Path(strategies_dir) / "attic"
+        if attic.is_dir():
+            # setdefault: an active-dir strategy always beats its attic twin.
+            for s in loader.load_directory(str(attic)):
+                cache.setdefault(s.name, type(s))
     except Exception as e:  # noqa: BLE001 - never break the exit cycle
         logger.debug("strategy load for exits failed: %s", e)
     return cache
@@ -132,9 +144,9 @@ def compute_strategy_exits(provider, strategies: dict,
         strat_cls = strategies.get(name)
         if strat_cls is None:
             if name:
-                # 归属策略已被移除(如精简进 attic)→ 该持仓失去策略离场,
-                # 只剩止损/止盈。显式告警而非静默跳过(#96 教训);盘中守卫
-                # 每几秒跑一次,按 (策略, 代码) 每日只告警一次防刷屏。
+                # 归属策略已从 strategies/ 与 attic 同时消失 → 该持仓失去
+                # 策略离场,只剩止损/止盈。显式告警而非静默跳过(#96 教训);
+                # 盘中守卫每几秒跑一次,按 (策略, 代码) 每日只告警一次防刷屏。
                 _warn_degraded_once(name, p["code"])
             continue
         try:
