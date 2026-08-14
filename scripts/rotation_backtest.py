@@ -190,7 +190,7 @@ def main():
     if worst >= -1e-9:
         print(f"判定: 各 margin 净效应均 ≥0(无亏手续费),峰值 margin={best_m}")
     else:
-        print(f"判定: 存在负净效应的 margin(亏手续费)→ 谨慎")
+        print("判定: 存在负净效应的 margin(亏手续费)→ 谨慎")
     db.close()
 
 

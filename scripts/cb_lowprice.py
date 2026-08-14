@@ -140,7 +140,8 @@ def main():
     px = load(con)
     con.close()
     if not px:
-        print("cb.db 空,先跑 fetch_convertibles.py"); return
+        print("cb.db 空,先跑 fetch_convertibles.py")
+        return
     rebals = month_ends(px)
     oos = int(len(rebals) * 0.6) - 1
     npool = [len(pool_at(px, rd)) for rd in rebals]
@@ -175,7 +176,7 @@ def main():
     dsr_best = deflated_sharpe_ratio(series[best], trials)
     M = np.column_stack([series[n] for n in names])
     pbo = pbo_cscv(M, n_splits=min(12, (len(rebals)//2)*2))
-    print(f"\n=== 过拟合闸 ===", flush=True)
+    print("\n=== 过拟合闸 ===", flush=True)
     print(f"  先验={APRIORI}: DSR={dsr_ap['dsr']:.3f} (sr_obs={dsr_ap['sr_observed']:.3f} vs sr0={dsr_ap['sr0_benchmark']:.3f})", flush=True)
     print(f"  挑最优={best}: DSR={dsr_best['dsr']:.3f}", flush=True)
     print(f"  PBO={pbo['pbo']:.3f} ({pbo['n_configs']}变体/{pbo['n_combos']}组合)", flush=True)

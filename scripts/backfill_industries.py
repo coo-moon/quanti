@@ -95,7 +95,8 @@ def main() -> None:
     args = ap.parse_args()
 
     print("抓取 tushare 行业映射 ...")
-    token_db = Database(args.token_db); token_db.initialize()
+    token_db = Database(args.token_db)
+    token_db.initialize()
     try:
         code2ind = fetch_tushare_map(token_db)
     finally:

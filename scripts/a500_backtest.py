@@ -30,7 +30,11 @@ honest DSR 0.40 < 0.95 闸; 20万资金整手约束下可行子集超额 ≈0。
 0~负理解, 小资金正确动作=直接买 A500 ETF。本引擎与时点成分数据的价值在于
 口径与基础设施, 不在头条数字。
 """
-import sys, json, argparse, sqlite3, time
+import sys
+import json
+import argparse
+import sqlite3
+import time
 from datetime import date, timedelta
 from collections import defaultdict
 from pathlib import Path
@@ -65,7 +69,8 @@ def load_membership():
         cur = set(base)
         for ev in events:
             if date.fromisoformat(ev["effective_trade_date"]) <= d:
-                cur -= set(ev["out"]); cur |= set(ev["in"])
+                cur -= set(ev["out"])
+                cur |= set(ev["in"])
         return frozenset(cur)
     return members
 
@@ -261,12 +266,16 @@ def run(args):
         for s in SCHEMES:
             w = W.get(s)
             if w is None or len(w) == 0:
-                rets[s].append(0.0); turns[s].append(0.0); effns[s].append(0.0)
+                rets[s].append(0.0)
+                turns[s].append(0.0)
+                effns[s].append(0.0)
                 prev[s] = None
                 continue
             valid = w[w.index.isin(pr.index)]
             if valid.sum() <= 0:
-                rets[s].append(0.0); turns[s].append(0.0); effns[s].append(0.0)
+                rets[s].append(0.0)
+                turns[s].append(0.0)
+                effns[s].append(0.0)
                 prev[s] = None
                 continue
             valid = valid / valid.sum()
@@ -305,10 +314,13 @@ def run(args):
 
     def stats(r):
         r = np.asarray(r, dtype=float)
-        nav = np.cumprod(1 + r); tot = nav[-1] - 1; n = len(r)
+        nav = np.cumprod(1 + r)
+        tot = nav[-1] - 1
+        n = len(r)
         ann = (1 + tot) ** (12 / n) - 1
         sh = r.mean() / r.std(ddof=0) * np.sqrt(12) if r.std(ddof=0) > 0 else 0
-        pk = np.maximum.accumulate(nav); mdd = float(((nav - pk) / pk).min())
+        pk = np.maximum.accumulate(nav)
+        mdd = float(((nav - pk) / pk).min())
         return tot, ann, sh, mdd
 
     print("\n=== 结果 ===")
@@ -378,7 +390,8 @@ def run(args):
     out = ROOT / f"data/a500_bt_{args.mode}_{args.factors}_k{args.top_k}_lam{args.lam}.json"
     out.write_text(json.dumps(report, ensure_ascii=False, indent=1))
     print("saved:", out)
-    db.close(); con.close()
+    db.close()
+    con.close()
 
 
 if __name__ == "__main__":

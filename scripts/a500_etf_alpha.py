@@ -23,7 +23,8 @@
 
 用法: .venv/bin/python scripts/a500_etf_alpha.py [--cost 5] [--div 2.6] [--cash 1.5]
 """
-import sys, argparse
+import sys
+import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -55,8 +56,10 @@ def build_returns(df, div, cash):
     """返回 DataFrame: index=交易日, 列 cc/on/id(收盘-收盘/隔夜/日内 原始收益),
     以及每日股息累计 div_d、现金日收益 cash_d。"""
     c, o = df["c"].values, df["o"].values
-    cc = np.full(len(df), np.nan); cc[1:] = c[1:] / c[:-1] - 1.0
-    on = np.full(len(df), np.nan); on[1:] = o[1:] / c[:-1] - 1.0        # 昨收→今开
+    cc = np.full(len(df), np.nan)
+    cc[1:] = c[1:] / c[:-1] - 1.0
+    on = np.full(len(df), np.nan)
+    on[1:] = o[1:] / c[:-1] - 1.0        # 昨收→今开
     idr = c / o - 1.0                                                    # 今开→今收
     out = pd.DataFrame({"d": df["d"], "cc": cc, "on": on, "id": idr}).iloc[1:].reset_index(drop=True)
     out["div_d"] = (1 + div / 100.0) ** (1 / TD_PER_YR) - 1
@@ -171,7 +174,8 @@ def run(args):
     print(f"成本 {args.cost}bps/边, 股息 {args.div}%/yr, 现金 {args.cash}%/yr\n")
     hdr = f"{'策略':14s} {'全CAGR':>7s} {'全夏普':>6s} {'全回撤':>7s} " \
           f"{'超额full':>8s} {'超额OOS':>8s} {'OOS夏普':>6s} {'换手/yr':>7s}"
-    print(hdr); print("-" * len(hdr))
+    print(hdr)
+    print("-" * len(hdr))
 
     excess_full = {}   # 每日超额序列(用于 DSR)
     rows = []
@@ -234,7 +238,8 @@ def _selftest():
     lhs = (1 + r["on"]) * (1 + r["id"]) - 1
     assert np.allclose(lhs.values, r["cc"].values, atol=1e-9), "隔夜×日内 ≠ 收盘收益"
     # 无前视: buy_hold 敞口恒 1; ma20 首 20 日敞口应为 0(未够窗口 + shift)
-    r["close"] = df["c"].values[1:]; r["cc_raw"] = r["cc"]
+    r["close"] = df["c"].values[1:]
+    r["cc_raw"] = r["cc"]
     E = exposures(r)
     assert (E["buy_hold"] == 1).all()
     assert E["ma20"][:20].sum() == 0, "ma20 早期应无仓(无前视)"

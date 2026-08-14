@@ -139,7 +139,8 @@ def main():
             print(f"  ..{rd} ({time.time()-t:.1f}s/月)", flush=True)
 
     def apply_costs(name, mode):
-        r = np.array(raw[name]); turn = np.array(long_turn[name])
+        r = np.array(raw[name])
+        turn = np.array(long_turn[name])
         if mode == "raw":                       # 两腿换手成本
             return r - 2 * turn * TX_COST
         if mode == "borrow":                    # 两腿换手 + 空头腿融券费

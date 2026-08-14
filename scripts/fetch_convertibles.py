@@ -8,7 +8,6 @@ akshare `bond_zh_hs_cov_daily` 给单券完整生命周期日线(含强赎/到�
 可续跑:已在 cb.db 的 code 跳过。per-code try/except,单券失败不炸全量。
 用法:.venv/bin/python scripts/fetch_convertibles.py
 """
-import sys
 import sqlite3
 import time
 

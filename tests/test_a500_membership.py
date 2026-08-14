@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "strategies/qmt"))
 
-from a500_enhance_qmt import (parse_target_csv, signal_fresh, plan_orders,
+from a500_enhance_qmt import (parse_target_csv, signal_fresh, plan_orders,  # noqa: E402
                               MAX_SINGLE_WEIGHT)
 
 
@@ -76,13 +76,16 @@ def test_plan_orders_diff_gap_fuse_and_liquidation():
     assert orders[0][1] == "sell"              # 卖先于买
     assert inf_w == 0.0
     # 极端高开熔断: +11% 开盘的票跳过买入
-    prices2 = dict(prices); prices2["A.SH"] = 10.6
-    prev2 = dict(prev); prev2["A.SH"] = 9.5
+    prices2 = dict(prices)
+    prices2["A.SH"] = 10.6
+    prev2 = dict(prev)
+    prev2["A.SH"] = 9.5
     orders2, skipped2, _ = plan_orders(targets, positions, prices2, prev2, 100000.0)
     assert not any(c == "A.SH" and s == "buy" for c, s, _ in orders2)
     assert any("gap" in r for _, r in skipped2)
     # 停牌(无价)跳过
-    prices3 = dict(prices); prices3.pop("A.SH")
+    prices3 = dict(prices)
+    prices3.pop("A.SH")
     orders3, skipped3, _ = plan_orders(targets, positions, prices3, prev, 100000.0)
     assert any("suspended" in r for _, r in skipped3)
 
