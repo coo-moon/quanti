@@ -273,6 +273,29 @@ def _tool_specs() -> list[dict]:
                 },
             },
         },
+        {
+            "name": "run_doctor",
+            "description": "系统体检:持仓策略离场覆盖 / 数据新鲜度 / SQLite 完整性。"
+                           "三项只读,发现问题时 ok=false 且带 detail。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "codes": {"type": "array", "items": {"type": "string"},
+                             "description": "只体检这些代码的数据新鲜度"},
+                },
+            },
+        },
+        {
+            "name": "factor_watch",
+            "description": "因子 IC 漂移体检:衰减/退役/无快照因子(读快照历史,只读)",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "strategy_gate_status",
+            "description": "策略健康闸门的最新判定(每日后台计算,这里只读落库结果;"
+                           "breaker/deep_loss 策略已被走查选股器剔除)",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
     ]
 
 
@@ -418,6 +441,16 @@ def _handle_tool_call(ctx: QuantiContext, name: str, args: dict[str, Any]) -> An
             except Exception:
                 out[c] = 0
         return out
+    if name == "run_doctor":
+        from quanti.health import run_doctor
+        codes = args.get("codes")
+        return run_doctor(ctx.db, strategies_dir=ctx.strategies_dir,
+                           codes=codes)
+    if name == "factor_watch":
+        from quanti.agent.factor_watch import watch_factor_drift
+        return watch_factor_drift(ctx.db)
+    if name == "strategy_gate_status":
+        return ctx.db.load_strategy_gate()
     return {"error": f"unknown tool: {name}"}
 
 
