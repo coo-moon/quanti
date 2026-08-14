@@ -14,7 +14,7 @@ is to cover:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -456,7 +456,12 @@ class TestRuntimeLLMPath:
 
 def _seed_regime_snapshot(db, when=None):
     from quanti.regime import report as R
-    d = (when or date.today()).isoformat()
+    # Default = YESTERDAY, not today: between 00:00 and the order-decision
+    # boundary the decision date attributes to the previous day, and the
+    # direction gate correctly rejects a snapshot newer than the decision —
+    # seeding today made these tests time-of-day flaky (failed every night
+    # after midnight, 2026-08-15). Yesterday passes at every hour.
+    d = (when or date.today() - timedelta(days=1)).isoformat()
     R.save(db, {
         "date": d, "rule_label": "震荡(区间/分化)", "rule_score": -1,
         "llm_regime": "震荡", "llm_confidence": 75,
@@ -587,7 +592,7 @@ class TestRegimeContext:
         logs = db.list_decisions(kind="regime")
         assert logs, "tick 第一步没有写出 regime 观测"
         d = logs[0]["details"]
-        assert d["date"] == date.today().isoformat()
+        assert d["date"] == (date.today() - timedelta(days=1)).isoformat()
         assert d["rule_label"] == "震荡(区间/分化)"
         assert d["metrics"]["above50"] == 21.0
         # llm_setup 的 broker 是 immediate 成交 → 前视闸拦住注入,只观测
