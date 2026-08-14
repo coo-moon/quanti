@@ -112,6 +112,28 @@ def test_merge_fundamentals_is_point_in_time(db):
     assert as_factor_fn(parse_expr("roe"))(merged) == 15.0
 
 
+def test_merge_fundamentals_same_ann_date_prefers_newest_period(db):
+    """akshare's statutory ann_date collides across periods (annual 04-30 vs
+    Q1 04-30 of the following year). After the deadline, the merge must pick
+    the NEWEST report period deterministically — not whichever row SQLite
+    happened to return first."""
+    dates = [date(2025, 5, 6), date(2025, 5, 7)]
+    db.save_financials(pd.DataFrame([
+        {"code": "000001", "end_date": "20241231", "ann_date": "20250430",
+         "report_type": "", "roe": 10.0, "netprofit_yoy": 20.0, "revenue_yoy": 8.0},
+        {"code": "000001", "end_date": "20250331", "ann_date": "20250430",
+         "report_type": "", "roe": 3.0, "netprofit_yoy": 5.0, "revenue_yoy": 3.0},
+    ]))
+    bars = pd.DataFrame({"code": "000001", "date": dates,
+                         "close": [10, 11]})
+    merged = _merge_fundamentals(bars, DataProvider(db), "000001",
+                                 dates[0], dates[-1])
+    by_date = merged.set_index("date")
+    # Both reports are visible from 04-30 on; the Q1 (newer period) wins.
+    assert by_date.loc[date(2025, 5, 6), "roe"] == 3.0
+    assert by_date.loc[date(2025, 5, 7), "roe"] == 3.0
+    assert by_date.loc[date(2025, 5, 6), "netprofit_yoy"] == 5.0
+
 def test_parser_whitelists_fundamentals_and_rejects_unknown():
     parse_expr("pe / Mean(pe, 20)")          # valuation factor parses
     parse_expr("-roe")                        # quality factor parses

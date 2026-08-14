@@ -121,7 +121,13 @@ def create_app(
     # to free akshare when it can't / returns 0. See source.refresh_latest_financials.
     def _sync_latest_financials() -> int:
         from quanti.data.source import refresh_latest_financials
-        return refresh_latest_financials(db)
+        n = refresh_latest_financials(db)
+        if n:
+            # Fresh reports must be visible to the factor pipeline NOW, not
+            # after the provider TTL (3600s) — same write-invalidate rule as
+            # bars. The mining hook right behind this one is the big consumer.
+            provider.invalidate_series_cache()
+        return n
 
     # Once/day, the daemon also keeps the generated-factor library current:
     # always re-score existing factors against fresh data (no LLM), and mine a

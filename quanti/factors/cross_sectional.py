@@ -65,7 +65,10 @@ def _merge_fundamentals(bars_df: pd.DataFrame, provider: "DataProvider",
             left["_d"] = pd.to_datetime(left["date"])
             right = fin.copy()
             right["_a"] = pd.to_datetime(right["ann_date"])
-            right = right.sort_values("_a")
+            # ann_date ties (statutory deadlines) resolve to the NEWEST period:
+            # sort by (ann_date, end_date) ascending, and merge_asof(backward)
+            # takes the last row of a tie group.
+            right = right.sort_values(["_a", "end_date"], kind="stable")
             merged = pd.merge_asof(
                 left.sort_values("_d"), right[["_a", *fin_cols]],
                 left_on="_d", right_on="_a", direction="backward")
