@@ -172,6 +172,7 @@ class BackgroundQuoteSyncer:
         regime_fn=None,      # () -> Any; runs once/day AFTER REGIME_RUN_AT
         doctor_fn=None,      # () -> dict; runs once/day AFTER DOCTOR_RUN_AT
         strategy_gate_fn=None,  # () -> dict; strategy health gate, same cadence
+        provider=None,  # DataProvider (optional) — invalidated after bar writes
         heavy_warmup_sec: float = 0.0,
         # ^ seconds after process boot before the HEAVY daily hooks (doctor,
         #   strategy gate, factor re-score/mining) may fire. The agent's cold
@@ -183,6 +184,7 @@ class BackgroundQuoteSyncer:
         self._cfg = config or BackgroundSyncConfig()
         self._adapter_factory = adapter_factory or self._default_adapter_factory
         self._now = now_fn or datetime.now
+        self._provider = provider
         self._heavy_warmup_sec = heavy_warmup_sec
         self._booted_at = self._now()
         self._financials_fn = financials_fn
@@ -383,6 +385,16 @@ class BackgroundQuoteSyncer:
             logger.info("bg-sync regime snapshot done")
         except Exception as e:  # noqa: BLE001 - optional; never kills the loop
             logger.warning("bg-sync regime snapshot failed: %s", e)
+
+    def _invalidate_provider_cache(self) -> None:
+        """Drop the provider's series cache after writing bars — with the
+        1-hour TTL, a synced bar must not stay invisible to panel/sweep reads
+        (freshness-critical reads already bypass via fresh=True)."""
+        if self._provider is not None:
+            try:
+                self._provider.invalidate_series_cache()
+            except Exception:  # noqa: BLE001 - cache is an optimization
+                pass
 
     def _warmup_elapsed(self) -> bool:
         """True once the process has been up long enough for heavy hooks —
@@ -727,6 +739,8 @@ class BackgroundQuoteSyncer:
                 # over completeness; user-triggered sync still does gap repair.
                 count = adapter.sync_daily_quotes(
                     code, start=start_d, end=end_d, repair_gaps=False)
+                if count:
+                    self._invalidate_provider_cache()
                 try:
                     latest_after = self._db.get_latest_quote_date(code)
                 except Exception:
@@ -827,6 +841,8 @@ class BackgroundQuoteSyncer:
                 self._current_code = f"@{d.isoformat()}"
             try:
                 rows = adapter.sync_daily_quotes_by_date(d, seed_state=seed_state)
+                if rows:
+                    self._invalidate_provider_cache()
                 with self._lock:
                     self._current_code = None
                     if rows > 0:
