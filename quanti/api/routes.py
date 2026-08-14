@@ -1379,13 +1379,43 @@ def build_risk_audit(db, provider, broker, account: str,
     se_on = rc.strategy_exit_enabled
     atr_on = rc.atr_stop_k > 0
 
+    # LLM 全权模式 (agent_mode="llm_full",paper-only):经典个股离场
+    # (ATR/地板/移动止盈/策略离场)与买入四守卫被旁路——日常止损 = LLM 落库
+    # 点位(llm_position_plans),兜底 = 灾难地板 + 组合熔断(仍机械生效)。
+    # 审计页必须如实反映,否则展示的是一套没在跑的风控。真源 = goal.params
+    # (与 runtime._sync_llm_mode 同口径:实盘一律拒绝该模式)。
+    llm_full_on = False
+    try:
+        from quanti.agent.goal import load_goal
+        params = load_goal(db).params or {}
+        llm_full_on = (str(params.get("agent_mode", "")).lower() == "llm_full"
+                       and account != "live")
+    except Exception:  # noqa: BLE001 - an audit view must never 500
+        pass
+    llm_full: dict = {"enabled": llm_full_on,
+                      "disaster_floor_pct": rc.llm_disaster_floor_pct}
+    if llm_full_on:
+        try:
+            plans = {p["code"]: p for p in db.list_llm_plans()}
+            positions = db.list_positions()
+            llm_full["n_positions"] = len(positions)
+            llm_full["n_with_stop"] = sum(
+                1 for p in positions
+                if float((plans.get(p["code"]) or {}).get("stop_price") or 0) > 0)
+            llm_full["n_with_add"] = sum(
+                1 for p in positions
+                if float((plans.get(p["code"]) or {}).get("add_price") or 0) > 0)
+        except Exception:  # noqa: BLE001
+            pass
+
     exits = {
-        "stop_loss": {"enabled": True, "threshold": rc.stop_loss_pct},
-        "atr_stop": {"enabled": atr_on, "k": rc.atr_stop_k, "n": rc.atr_stop_n},
-        "trailing_take_profit": {"enabled": tp_on,
+        "stop_loss": {"enabled": not llm_full_on, "threshold": rc.stop_loss_pct},
+        "atr_stop": {"enabled": atr_on and not llm_full_on,
+                     "k": rc.atr_stop_k, "n": rc.atr_stop_n},
+        "trailing_take_profit": {"enabled": tp_on and not llm_full_on,
                                  "activate": rc.take_profit_activate_pct,
                                  "trail": rc.take_profit_trail_pct},
-        "strategy_exit": {"enabled": se_on},
+        "strategy_exit": {"enabled": se_on and not llm_full_on},
         "portfolio_circuit_breaker": {"threshold": rc.portfolio_stop_loss_pct},
     }
 
@@ -1405,8 +1435,11 @@ def build_risk_audit(db, provider, broker, account: str,
     ]
 
     # Live protection-guard state: locked = new BUYs are blocked right now.
+    # llm_full 下四守卫整体旁路(broker._entry_allowed 只剩 risk caps)。
     guard: dict = {
-        "enabled": pc.enabled, "locked": False, "reason": "",
+        "enabled": pc.enabled and not llm_full_on,
+        "bypassed_by_llm_full": llm_full_on,
+        "locked": False, "reason": "",
         "stoploss_guard": {
             "enabled": pc.stoploss_guard_enabled,
             "lookback_days": pc.sg_lookback_days,
@@ -1417,7 +1450,7 @@ def build_risk_audit(db, provider, broker, account: str,
             "max_drawdown_pct": pc.md_max_drawdown_pct,
             "lock_days": pc.md_lock_days},
     }
-    if pc.enabled:
+    if pc.enabled and not llm_full_on:
         try:
             from quanti.risk.protection_context import build_db_context
             ctx = build_db_context(db, provider, pc)
@@ -1458,6 +1491,7 @@ def build_risk_audit(db, provider, broker, account: str,
     recent.sort(key=lambda x: x["ts"] or "", reverse=True)
 
     return {"account": account, "is_live": account == "live",
+            "llm_full": llm_full,
             "exits": exits, "channel_parity": channel_parity, "guard": guard,
             "circuit_breaker": cb, "recent_exits": recent[:exits_limit],
             "stock_pnl": _stock_pnl_summary(db)}

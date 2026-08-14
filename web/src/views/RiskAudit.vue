@@ -13,6 +13,14 @@
     <div v-if="err" class="err-banner">{{ err }}</div>
 
     <template v-if="data">
+      <!-- LLM 全权模式横幅:经典个股风控被旁路,如实标注 -->
+      <div v-if="llmFull" class="llm-full-banner">
+        <b>LLM 全权模式生效中</b> — 个股日常止损 = LLM 落库点位(本地机械守护 5 秒比价执行,
+        LLM 失联沿用最后点位)。下方标注「已旁路」的经典风控(止损地板 / ATR / 移动止盈 /
+        策略离场 / 买入护栏)在此模式<b>不参与执行</b>,配置保留给经典模式与实盘。
+        仍然生效的机械兜底:<b>组合回撤熔断</b>与<b>灾难地板</b>。
+      </div>
+
       <!-- 退出阈值 -->
       <div class="section-head">
         <h2>退出阈值</h2>
@@ -20,13 +28,31 @@
       </div>
 
       <div v-if="!editing" class="stats-row">
-        <div class="stat-card">
-          <span class="stat-label">止损地板(绝对兜底)</span>
+        <div class="stat-card" v-if="llmFull">
+          <span class="stat-label">LLM 点位止损(日常)</span>
+          <span class="stat-value pos">
+            {{ data.llm_full?.n_with_stop ?? 0 }}/{{ data.llm_full?.n_positions ?? 0 }}
+            <span class="stat-sub">持仓已设点位 · 机械守护执行</span>
+          </span>
+        </div>
+        <div class="stat-card" v-if="llmFull">
+          <span class="stat-label">灾难地板(兜底)</span>
+          <span class="stat-value" :class="data.llm_full?.disaster_floor_pct ? 'neg' : 'muted'">
+            {{ data.llm_full?.disaster_floor_pct ? pct(data.llm_full.disaster_floor_pct) : "关闭" }}
+            <span class="stat-sub">仅接点位缺失/被穿透</span>
+          </span>
+        </div>
+        <div class="stat-card" :class="{ bypassed: llmFull }">
+          <span class="stat-label">止损地板(绝对兜底)
+            <span v-if="llmFull" class="bypass-tag">已旁路</span>
+          </span>
           <span class="stat-value neg">{{ pct(data.exits.stop_loss.threshold) }}</span>
         </div>
-        <div class="stat-card">
-          <span class="stat-label">ATR 自适应止损</span>
-          <span class="stat-value" v-if="data.exits.atr_stop.enabled">
+        <div class="stat-card" :class="{ bypassed: llmFull }">
+          <span class="stat-label">ATR 自适应止损
+            <span v-if="llmFull" class="bypass-tag">已旁路</span>
+          </span>
+          <span class="stat-value" v-if="data.exits.atr_stop.k > 0">
             ×{{ data.exits.atr_stop.k }}
             <span class="stat-sub">ATR({{ data.exits.atr_stop.n }}) · 替代固定止损</span>
           </span>
@@ -36,18 +62,22 @@
           <span class="stat-label">组合回撤熔断</span>
           <span class="stat-value neg">{{ pct(data.exits.portfolio_circuit_breaker.threshold) }}</span>
         </div>
-        <div class="stat-card">
-          <span class="stat-label">移动止盈</span>
-          <span class="stat-value" v-if="data.exits.trailing_take_profit.enabled">
+        <div class="stat-card" :class="{ bypassed: llmFull }">
+          <span class="stat-label">移动止盈
+            <span v-if="llmFull" class="bypass-tag">已旁路</span>
+          </span>
+          <span class="stat-value" v-if="data.exits.trailing_take_profit.activate > 0">
             +{{ pct(data.exits.trailing_take_profit.activate) }}
             <span class="stat-sub">武装 · 回撤 {{ pct(data.exits.trailing_take_profit.trail) }} 离场</span>
           </span>
           <span class="stat-value muted" v-else>已关闭</span>
         </div>
-        <div class="stat-card">
-          <span class="stat-label">策略离场</span>
+        <div class="stat-card" :class="{ bypassed: llmFull }">
+          <span class="stat-label">策略离场
+            <span v-if="llmFull" class="bypass-tag">已旁路</span>
+          </span>
           <span class="stat-value" :class="data.exits.strategy_exit.enabled ? 'pos' : 'muted'">
-            {{ data.exits.strategy_exit.enabled ? "启用" : "关闭" }}
+            {{ llmFull ? "不生效" : (data.exits.strategy_exit.enabled ? "启用" : "关闭") }}
           </span>
         </div>
       </div>
@@ -130,14 +160,23 @@
 
       <!-- 护栏 + 熔断状态 -->
       <div class="two-col">
-        <div class="card status-card">
-          <div class="card-header"><h2>买入护栏(只锁新买,不强卖)</h2></div>
+        <div class="card status-card" :class="{ bypassed: llmFull }">
+          <div class="card-header">
+            <h2>买入护栏(只锁新买,不强卖)
+              <span v-if="llmFull" class="bypass-tag">已旁路</span>
+            </h2>
+          </div>
           <div class="status-body">
             <div class="status-line">
               <span>当前状态</span>
-              <span class="badge" :class="data.guard.locked ? 'bad' : 'ok'">
+              <span v-if="llmFull" class="badge warn">LLM 全权模式不生效</span>
+              <span v-else class="badge" :class="data.guard.locked ? 'bad' : 'ok'">
                 {{ data.guard.locked ? "锁定中" : "正常" }}
               </span>
+            </div>
+            <div v-if="llmFull" class="status-reason">
+              买入判断权归 LLM;仅保留单票上限/日内开仓数等 sanity 闸与市场物理
+              (涨跌停/整手/极端高开熔断)。
             </div>
             <div v-if="data.guard.locked" class="status-reason">{{ data.guard.reason }}</div>
             <div class="status-line">
@@ -299,6 +338,8 @@ import {
 } from "../api/client";
 
 const data = ref<RiskAudit | null>(null);
+// LLM 全权模式生效中:经典个股离场与买入护栏被旁路,页面按实际执行语义标注。
+const llmFull = computed(() => !!data.value?.llm_full?.enabled);
 const err = ref("");
 let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -559,6 +600,31 @@ onUnmounted(() => {
 .badge.ok { background: rgba(52, 199, 89, 0.12); color: #2e9e4f; }
 .badge.bad { background: rgba(255, 59, 48, 0.12); color: #ff3b30; }
 .badge.neutral { background: rgba(0, 113, 227, 0.1); color: #0071e3; }
+.badge.warn { background: rgba(255, 149, 0, 0.14); color: #c47500; }
+
+/* LLM 全权模式:横幅 + 旁路项置灰打标 */
+.llm-full-banner {
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 149, 0, 0.4);
+  background: rgba(255, 149, 0, 0.08);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.bypassed {
+  opacity: 0.55;
+}
+.bypass-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(255, 149, 0, 0.14);
+  color: #c47500;
+}
 
 .cb-bar {
   position: relative;
