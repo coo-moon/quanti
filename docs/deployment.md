@@ -3,6 +3,14 @@
 本文档覆盖进程守护、每日自动体检、数据备份与常见故障排查。目标是让
 `quanti serve` 不再依赖手动 nohup + 人肉盯日志。
 
+## 0. 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `QUANTI_ACCOUNT` | paper | 账户库(paper/live) |
+| `QUANTI_STACK_DUMP` | 0 | =1 时 `kill -USR1` 转储全线程栈(随后进程按信号默认动作退出,KeepAlive 拉起) |
+| `QUANTI_HOOK_WARMUP_SEC` | 1800 | 启动后多久才允许重活钩子(doctor/策略闸门/因子重评)——避免与冷启动首轮 tick 的 selector sweep 争 CPU/锁 |
+
 ## 1. 进程守护(launchd, macOS)
 
 `deploy/com.quanti.api.plist` 是 API 服务的 launchd 模板:崩溃自动重启

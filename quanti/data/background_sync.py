@@ -172,11 +172,19 @@ class BackgroundQuoteSyncer:
         regime_fn=None,      # () -> Any; runs once/day AFTER REGIME_RUN_AT
         doctor_fn=None,      # () -> dict; runs once/day AFTER DOCTOR_RUN_AT
         strategy_gate_fn=None,  # () -> dict; strategy health gate, same cadence
+        heavy_warmup_sec: float = 0.0,
+        # ^ seconds after process boot before the HEAVY daily hooks (doctor,
+        #   strategy gate, factor re-score/mining) may fire. The agent's cold
+        #   first tick runs a ~20-30 min CPU-bound selector sweep; letting the
+        #   hooks pile on top turns boot into an hour-long lock convoy
+        #   (2026-08-14 rounds 8-9). 0 = off (tests / non-agent deployments).
     ) -> None:
         self._db = db
         self._cfg = config or BackgroundSyncConfig()
         self._adapter_factory = adapter_factory or self._default_adapter_factory
         self._now = now_fn or datetime.now
+        self._heavy_warmup_sec = heavy_warmup_sec
+        self._booted_at = self._now()
         self._financials_fn = financials_fn
         self._last_fin_day = None  # date of the last financials sync (once/day)
         self._mining_fn = mining_fn
@@ -317,6 +325,8 @@ class BackgroundQuoteSyncer:
         (no-op) when no mining_fn was provided — e.g. tests / no LLM key."""
         if self._mining_fn is None:
             return
+        if not self._warmup_elapsed():
+            return
         today = self._now().date()
         if self._last_mine_day == today:
             return
@@ -374,13 +384,25 @@ class BackgroundQuoteSyncer:
         except Exception as e:  # noqa: BLE001 - optional; never kills the loop
             logger.warning("bg-sync regime snapshot failed: %s", e)
 
+    def _warmup_elapsed(self) -> bool:
+        """True once the process has been up long enough for heavy hooks —
+        they defer past the agent's cold first-tick sweep instead of piling
+        onto it. Always True when heavy_warmup_sec is 0."""
+        if self._heavy_warmup_sec <= 0:
+            return True
+        return ((self._now() - self._booted_at).total_seconds()
+                >= self._heavy_warmup_sec)
+
     def _maybe_run_doctor(self) -> None:
         """Daily doctor, once per calendar day and only after DOCTOR_RUN_AT
         (17:45) — after the regime snapshot and after the close sweep has
         topped up today's bars, so the freshness check compares against the
-        day that should now be complete. Off (no-op) when no doctor_fn was
-        provided — e.g. tests."""
+        day that should now be complete. Also gated on the boot warm-up (the
+        integrity scan reads both SQLite files — heavy I/O). Off (no-op) when
+        no doctor_fn was provided — e.g. tests."""
         if self._doctor_fn is None:
+            return
+        if not self._warmup_elapsed():
             return
         now = self._now()
         if now.time() < DOCTOR_RUN_AT:
@@ -402,6 +424,8 @@ class BackgroundQuoteSyncer:
         calendar day after DOCTOR_RUN_AT (post-close, bars topped up). Off
         (no-op) when no strategy_gate_fn was provided — e.g. tests."""
         if self._gate_fn is None:
+            return
+        if not self._warmup_elapsed():
             return
         now = self._now()
         if now.time() < DOCTOR_RUN_AT:
