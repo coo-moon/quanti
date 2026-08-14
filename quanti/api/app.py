@@ -216,11 +216,21 @@ def create_app(
                 details=report)
         return report
 
+    # Heavy daily hooks (doctor / strategy gate / factor re-score) defer for
+    # QUANTI_HOOK_WARMUP_SEC (default 1800s) after boot so they never pile on
+    # top of the agent's cold first-tick selector sweep (2026-08-14 rounds 8-9
+    # diagnosis: the overlap was the lock convoy). 0 disables.
+    import os as _os
+    try:
+        _warmup = float(_os.environ.get("QUANTI_HOOK_WARMUP_SEC", "1800"))
+    except ValueError:
+        _warmup = 1800.0
     bg_sync = BackgroundQuoteSyncer(db=db, financials_fn=_sync_latest_financials,
                                     mining_fn=_auto_mine_factors,
                                     regime_fn=_daily_regime,
                                     doctor_fn=_daily_doctor,
-                                    strategy_gate_fn=_daily_strategy_gate)
+                                    strategy_gate_fn=_daily_strategy_gate,
+                                    heavy_warmup_sec=_warmup)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):

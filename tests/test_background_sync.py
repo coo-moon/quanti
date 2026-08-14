@@ -646,3 +646,64 @@ def test_financials_fn_runs_once_per_day(db_with_stocks):
         db=db_with_stocks, adapter_factory=lambda: None,
         now_fn=lambda: datetime(2026, 6, 24, 16, 0))
     off._maybe_sync_financials()  # would raise if it tried anything
+
+
+class TestHeavyWarmupGate:
+    """The heavy daily hooks (doctor / strategy gate / factor mining) must
+    defer for heavy_warmup_sec after boot so they never pile onto the cold
+    first-tick selector sweep (2026-08-14 rounds 8-9 lock-convoy diagnosis)."""
+
+    def _syncer(self, db, clock, warmup):
+        calls = {"doctor": 0, "gate": 0, "mine": 0}
+
+        def doctor_fn():
+            calls["doctor"] += 1
+            return {"ok": True}
+
+        def gate_fn():
+            calls["gate"] += 1
+            return {}
+
+        def mine_fn():
+            calls["mine"] += 1
+            return 0
+
+        syncer = BackgroundQuoteSyncer(
+            db=db, now_fn=lambda: clock["now"],
+            doctor_fn=doctor_fn, strategy_gate_fn=gate_fn, mining_fn=mine_fn,
+            heavy_warmup_sec=warmup)
+        return syncer, calls
+
+    def test_heavy_hooks_defer_until_warmup(self, tmp_path):
+        from datetime import datetime, timedelta
+
+        db = Database(str(tmp_path / "w.db"))
+        db.initialize()
+        clock = {"now": datetime(2026, 6, 24, 18, 0)}  # after DOCTOR_RUN_AT
+        syncer, calls = self._syncer(db, clock, warmup=1800.0)
+        syncer._maybe_run_doctor()
+        syncer._maybe_run_strategy_gate()
+        syncer._maybe_mine_factors()
+        assert calls == {"doctor": 0, "gate": 0, "mine": 0}  # all deferred
+
+        clock["now"] += timedelta(seconds=1801)
+        syncer._maybe_run_doctor()
+        syncer._maybe_run_strategy_gate()
+        syncer._maybe_mine_factors()
+        assert calls == {"doctor": 1, "gate": 1, "mine": 1}
+        # Day latches: a second call the same day does not re-run.
+        syncer._maybe_run_doctor()
+        assert calls["doctor"] == 1
+        db.close()
+
+    def test_warmup_zero_runs_immediately(self, tmp_path):
+        from datetime import datetime
+
+        db = Database(str(tmp_path / "w2.db"))
+        db.initialize()
+        clock = {"now": datetime(2026, 6, 24, 18, 0)}
+        syncer, calls = self._syncer(db, clock, warmup=0.0)
+        syncer._maybe_run_doctor()
+        assert calls["doctor"] == 1
+        db.close()
+
