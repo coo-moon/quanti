@@ -674,6 +674,23 @@ class Database:
                 accepted INTEGER NOT NULL,
                 PRIMARY KEY (name, as_of)
             );
+
+            -- Daily strategy health gate (strategy_gate.py): a long-horizon
+            -- backtest verdict per loadable strategy. "breaker" = the
+            -- portfolio circuit breaker tripped mid-run (account-killer under
+            -- the default risk budget); "deep_loss" = deeply negative Sharpe.
+            -- The selector drops gated strategies, so walk-forward never picks
+            -- a strategy that would ride a -30% drawdown (2026-08-14 erratum).
+            CREATE TABLE IF NOT EXISTS strategy_gate (
+                name TEXT PRIMARY KEY,
+                as_of TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                sharpe REAL,
+                max_drawdown REAL,
+                halted INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
             """
         )
 
@@ -2301,3 +2318,38 @@ class Database:
         return [{"name": r[0], "as_of": date.fromisoformat(r[1]),
                  "train_ic": r[2], "oos_ic": r[3], "oos_t": r[4],
                  "oos_n": r[5], "accepted": bool(r[6])} for r in rows]
+
+    # --- Strategy health gate ---
+
+    def save_strategy_gate(self, name: str, as_of: date, verdict: str,
+                           reason: str = "", sharpe: float | None = None,
+                           max_drawdown: float | None = None,
+                           halted: bool = False) -> None:
+        """Upsert today's gate verdict (latest wins per strategy)."""
+        from datetime import datetime as _dt
+        self.conn.execute(
+            "INSERT OR REPLACE INTO strategy_gate "
+            "(name, as_of, verdict, reason, sharpe, max_drawdown, halted, "
+            " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, as_of.isoformat(), verdict, reason,
+             _nan_to_none(sharpe), _nan_to_none(max_drawdown),
+             1 if halted else 0, _dt.now().isoformat()))
+        self.conn.commit()
+
+    def load_strategy_gate(self) -> dict[str, dict]:
+        """Latest gate verdict per strategy. {name: {verdict, as_of, reason,
+        sharpe, max_drawdown, halted}} — the selector reads this to drop
+        gated strategies before ranking."""
+        rows = self.conn.execute(
+            "SELECT name, as_of, verdict, reason, sharpe, max_drawdown, halted "
+            "FROM strategy_gate").fetchall()
+        out: dict[str, dict] = {}
+        for r in rows:
+            try:
+                as_of = date.fromisoformat(r[1])
+            except ValueError:
+                as_of = None
+            out[r[0]] = {"verdict": r[2], "reason": r[3], "sharpe": r[4],
+                         "max_drawdown": r[5], "halted": bool(r[6]),
+                         "as_of": as_of.isoformat() if as_of else None}
+        return out

@@ -275,6 +275,23 @@ class StrategySelector:
                 return s, ranking
         return candidates[0], ranking
 
+    def _gated_candidates(self) -> list[BaseStrategy]:
+        """Load candidates minus strategies excluded by the daily health gate
+        (quanti/agent/strategy_gate.py: breaker/deep_loss verdicts). The gate
+        is computed on a 2-year window under default risk — walk-forward must
+        never re-admit a strategy that rides -30% drawdowns (2026-08-14
+        erratum). No gate rows yet → nothing excluded (gate only excludes on
+        evidence)."""
+        from quanti.agent.strategy_gate import excluded_names
+        try:
+            banned = excluded_names(self._db)
+        except Exception:  # noqa: BLE001 - a gate read failure must not break selection
+            banned = set()
+        out = [s for s in self.load_candidates() if s.name not in banned]
+        if banned:
+            logger.info("strategy gate excludes: %s", sorted(banned))
+        return out
+
     def pick_topk(self, goal: Goal, codes: list[str], k: int = 3,
                   ) -> tuple[list[tuple[BaseStrategy, float]], list[StrategyEvaluation]]:
         """Return top-K strategies with softmax-normalized weights.
@@ -283,9 +300,10 @@ class StrategySelector:
         floored at 0 to prevent losing strategies from getting weight. A
         single positive-Sharpe strategy gets weight 1.0; multiple compete via
         softmax with temperature 0.5 so the best gets ~60-70% weight rather
-        than 100%.
+        than 100%. Strategies excluded by the daily health gate (breaker /
+        deep_loss verdicts) are dropped before ranking.
         """
-        candidates = self.load_candidates()
+        candidates = self._gated_candidates()
         if not candidates:
             return [], []
         ranking = self.evaluate(goal, codes, candidates)
