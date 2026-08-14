@@ -113,6 +113,15 @@ class QmtBroker:
         self._max_live_exposure = (
             float(max_live_exposure) if max_live_exposure is not None
             else float(os.environ.get("QUANTI_MAX_LIVE_EXPOSURE", "0") or 0))
+        # 真钱账户上两道 blast-radius 闸都没配 = 观察期裸奔,单次配置失误
+        # 可一天铺满仓。落决策日志(kind 在告警白名单,配了 webhook 会推人)。
+        if self._require_live and not self._max_order_notional \
+                and not self._max_live_exposure:
+            self._db.log_decision(
+                "live_caps_unset",
+                "实盘敞口双闸均未配置:QUANTI_MAX_ORDER_NOTIONAL 与 "
+                "QUANTI_MAX_LIVE_EXPOSURE 都为 0,单笔名义额与总敞口无代码上限",
+                details={"max_order_notional": 0, "max_live_exposure": 0})
         self._risk = RiskManager(risk_config)
         from quanti.risk.protections import ProtectionConfig, ProtectionManager
         self._protections = ProtectionManager(

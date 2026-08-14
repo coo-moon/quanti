@@ -595,6 +595,21 @@ export const saveDataSource = (source: string, token?: string | null) =>
     token: token ?? null,
   });
 
+// --- Alert channel config ---
+export interface AlertConfig {
+  has_webhook: boolean;
+  source: string; // "env" | "db" | ""
+  kinds: string[];
+}
+
+export const fetchAlertConfig = () => api.get<AlertConfig>("/config/alert");
+export const testAlertConfig = (webhookUrl: string) =>
+  api.post<{ ok: boolean; message: string }>("/config/alert/test", {
+    webhook_url: webhookUrl,
+  });
+export const saveAlertConfig = (webhookUrl: string) =>
+  api.post<{ ok: boolean }>("/config/alert", { webhook_url: webhookUrl });
+
 export default api;
 
 
