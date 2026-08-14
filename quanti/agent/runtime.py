@@ -648,11 +648,20 @@ class AgentRuntime:
             if c not in ordered:
                 ordered.append(c)
 
-        missing: list[str] = []
-        for c in ordered:
-            bars = self._provider.get_daily_bars(c, start, end)
-            if not bars or bars[-1].date < stale_after:
-                missing.append(c)
+        # ONE bulk freshness query for the whole universe instead of one
+        # get_daily_bars call per code. The per-code loop was 5.8k serialized
+        # DB round trips on the full market — with the bg-sync's factor
+        # rescore and the daily hooks contending for the same SQLite lock, it
+        # turned cold-start ticks into hour-long lock convoys (2026-08-14
+        # faulthandler diagnosis). latest_quote_dates does a single GROUP BY.
+        try:
+            latest = self._db.latest_quote_dates(ordered)
+        except AttributeError:  # legacy/older DB wrapper in exotic setups
+            latest = {}
+        missing: list[str] = [
+            c for c in ordered
+            if latest.get(c) is None or latest[c] < stale_after
+        ]
         if not missing:
             return
         # Cap per tick. Held positions are guaranteed to be in the first
