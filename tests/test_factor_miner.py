@@ -141,3 +141,62 @@ def test_nw_tstat_overlap_correction_lowers_t():
     import numpy as np
     assert np.isnan(_nw_tstat([0.05], 4))
     assert np.isnan(_nw_tstat([0.05, 0.05, 0.05], 1))  # zero variance
+
+
+def test_mine_records_lifetime_trials(tmp_path):
+    """每个被打分的候选(含未采纳)都进 append-only 台账;unparseable 不进。"""
+    db = Database(str(tmp_path / "m.db"))
+    db.initialize()
+    provider, codes = _seed_provider()
+    llm = _LLM("good_mom: Ref(close,1)/Ref(close,21)-1\n"
+               "evil: __import__('os').system('x')\n"
+               "flat: close / close\n")
+    mine_factors(llm, db, provider, codes, date(2025, 5, 20),
+                 n_candidates=5, oos_ic_threshold=0.0, min_train_ic=0.0)
+    rows = db.conn.execute(
+        "SELECT name, accepted FROM factor_trials ORDER BY id").fetchall()
+    names = [r[0] for r in rows]
+    assert "good_mom" in names and "flat" in names
+    assert "evil" not in names
+    # 重跑同一批:台账追加(append-only),不覆盖
+    mine_factors(llm, db, provider, codes, date(2025, 5, 21),
+                 n_candidates=5, oos_ic_threshold=0.0, min_train_ic=0.0)
+    n2 = db.conn.execute("SELECT COUNT(*) FROM factor_trials").fetchone()[0]
+    assert n2 == 2 * len(rows)
+
+
+def test_factor_trial_icirs_dedupes_by_expression(tmp_path):
+    db = Database(str(tmp_path / "m.db"))
+    db.initialize()
+    # 同一表达式重测 3 次 → 只算 1 个假设(取最新);另一表达式 → 共 2 个
+    for t in (2.0, 3.0, 4.0):
+        db.record_factor_trial("a", "Ref(close,1)", 0.01, 0.02, t, 64,
+                               False, "2025-01-01")
+    db.record_factor_trial("b", "-Std(close,20)", 0.01, 0.02, 5.0, 25,
+                           False, "2025-01-01")
+    icirs = sorted(db.factor_trial_icirs())
+    assert len(icirs) == 2
+    assert icirs[0] == pytest.approx(4.0 / 8.0)   # a 的最新一条 t=4, n=64
+    assert icirs[1] == pytest.approx(5.0 / 5.0)   # b: t=5, n=25
+
+
+def test_dsr_haircut_rejects_after_many_wild_trials(tmp_path):
+    """终生台账里塞满高方差噪声试验 → expected_max_sharpe 基准飙高 →
+    原本能过 floor+FDR 的候选被 DSR 拒。跨批次多重挖矿必须抬门槛。"""
+    db = Database(str(tmp_path / "m.db"))
+    db.initialize()
+    rng = np.random.default_rng(3)
+    for k in range(80):
+        # 合成趋势数据里 good_mom 的 ICIR 高达 ~5,噪声试验的 ICIR 方差
+        # 要压得比它还大(t=±60/√60 → ICIR≈±7.7)才能验证「基准抬高→拒」
+        t = float(rng.choice([-1, 1])) * 60.0 + rng.normal(0, 1)
+        db.record_factor_trial(f"junk{k}", f"expr_{k}", 0.0, 0.0, t, 60,
+                               False, "2025-01-01")
+    provider, codes = _seed_provider()
+    llm = _LLM("good_mom: Ref(close,1)/Ref(close,21)-1\n")
+    results = mine_factors(llm, db, provider, codes, date(2025, 5, 20),
+                           n_candidates=5, oos_ic_threshold=0.0,
+                           min_train_ic=0.0)
+    by = {r.name: r for r in results}
+    assert by["good_mom"].accepted is False
+    assert "DSR" in by["good_mom"].reason

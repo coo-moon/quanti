@@ -641,6 +641,25 @@ class Database:
                 created_at TEXT NOT NULL
             );
 
+            -- 因子挖掘终生试验台账(append-only,绝不 REPLACE)。每一个被打过
+            -- 分的候选都是一次统计试验;跨批次反复挖矿的多重检验校正(DSR
+            -- haircut)需要「历史上一共试过多少个假设」——generated_factors
+            -- 是 INSERT OR REPLACE 的现状快照,天生记不住这件事。
+            CREATE TABLE IF NOT EXISTS factor_trials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                name TEXT NOT NULL,
+                expression TEXT NOT NULL,
+                train_ic REAL,
+                oos_ic REAL,
+                oos_t REAL,
+                oos_n INTEGER,
+                accepted INTEGER NOT NULL DEFAULT 0,
+                batch_end TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_factor_trials_expr
+                ON factor_trials(expression);
+
             -- Latest cycle's fused candidate scores (replace-all each cycle).
             -- Surfaces a holding's / pending order's current final_score in the
             -- UI; a code absent here is no longer a candidate (UI shows "—").
@@ -2279,6 +2298,35 @@ class Database:
         self.conn.commit()
 
     # ----- generated factors --------------------------------------------
+
+    def record_factor_trial(self, name: str, expr_str: str, train_ic: float,
+                            oos_ic: float, oos_t: float, oos_n: int,
+                            accepted: bool, batch_end: str) -> None:
+        """追加一条挖矿试验(append-only 台账,含未采纳者)。"""
+        self.conn.execute(
+            "INSERT INTO factor_trials "
+            "(ts, name, expression, train_ic, oos_ic, oos_t, oos_n, accepted, batch_end) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), name, expr_str,
+             _nan_to_none(train_ic), _nan_to_none(oos_ic), _nan_to_none(oos_t),
+             int(oos_n), 1 if accepted else 0, batch_end),
+        )
+        self.conn.commit()
+
+    def factor_trial_icirs(self) -> list[float]:
+        """终生试验的每期 ICIR(= t/√n)清单,喂给 DSR 的 trial_sharpes。
+
+        按表达式去重取最新一条:同一假设被反复重测不是独立试验,按原始行数
+        计 N 会让闸随每日自动挖矿无限变严;按「历史上试过多少个不同表达式」
+        计才是 López de Prado 意义上的试验数。
+        """
+        rows = self.conn.execute(
+            "SELECT oos_t, oos_n FROM factor_trials t1 "
+            "WHERE id = (SELECT MAX(id) FROM factor_trials t2 "
+            "            WHERE t2.expression = t1.expression) "
+            "AND oos_t IS NOT NULL AND oos_n >= 2").fetchall()
+        import math
+        return [float(r[0]) / math.sqrt(int(r[1])) for r in rows]
 
     def save_generated_factor(self, name: str, expr_str: str, train_ic: float,
                               oos_ic: float, accepted: bool,

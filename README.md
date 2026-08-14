@@ -366,7 +366,7 @@ quanti up --target 0.20 --max-drawdown -0.20 --risk medium
 让 LLM 用上文的因子 DSL 提出截面 alpha 表达式，经安全解析与 rank-IC 闸门筛选后入库，**可选**注入实盘选股排序（默认不参与）。可用字段除 OHLCV/换手率外，还包含 PIT 基本面 `pe/pe_ttm/pb/ps/ps_ttm/total_mv/circ_mv/dv_ratio/roe/netprofit_yoy/revenue_yoy`；函数限 `Ref/Mean/Std/Sum/Max/Min/Log` + `+ - * /` 与一元负号，仅整数窗口，禁止 `**`。
 
 - 触发：Web **AI Agent → 因子挖掘 (LLM)** 面板「运行挖掘」，或 CLI `quanti mine-factors`（`--universe / --n（默认 10）/ --end`）。复用 LLM 增强层的供应商配置（DeepSeek / Anthropic）。
-- **IC 闸门**（采纳条件，全满足）：`|训练IC| ≥ 0.02`、`OOS IC ≥ 0.03`、且与已采纳因子不冗余（秩相关 < 0.7）；训练/OOS 窗口留间隔防标签泄漏。
+- **采纳闸门**（四层，全满足）：① 经济地板 `训练IC ≥ 0.02` 且 `OOS IC ≥ 0.03`（训练/OOS 窗口留间隔防标签泄漏）；② 批内 Benjamini-Hochberg FDR（q=0.10）校正单批 best-of-N 挑优；③ **跨批次 DSR haircut**——终生试验台账（`factor_trials`，append-only，含未采纳者）记录每一个被打过分的假设，候选的每期 ICIR 必须以 ≥0.85 的 Deflated Sharpe 概率超过「试了 N 次能碰到的最大 ICIR 期望」，反复挖矿越多门槛自动越高（同表达式重测按一个假设计）；④ 与已采纳因子不冗余（秩相关 < 0.7）。
 - **基本面参与打分**：IC 评估时按 point-in-time 把 `daily_basic`/`financials`（估值 + ROE/同比）并入每只票的求值帧（financials 用 `merge_asof(ann_date)` 防前视），所以 LLM 提的**估值/质量因子（pe/pb/roe/…）能算出真实 IC 并被采纳**；DB 无基本面时自动跳过该合并（零额外开销，仅量价/换手维度）。
 - **三态语义**：`采纳` = 挖掘时通过 IC 闸门（不可变）；`启用` = 逐因子开关（默认开）；`生效` = 采纳 ∧ 启用 ∧ 账户总开关 `use_generated_factors`（默认**关**）三者同时成立，才真正并入下单排序。
 - 生成因子存于各账户库的 `generated_factors` 表；接口 `GET /factors/generated`、`POST /factors/generated/{name}/enabled`。

@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from quanti.agent.llm_runtime import LLMConfig, _complete_text
+from quanti.backtest.overfit import deflated_sharpe_from_stats
 from quanti.factors.cross_sectional import DEFAULT_FACTORS, _merge_fundamentals
 from quanti.factors.evaluation import factor_ic, factor_ic_stats
 from quanti.factors.library import evaluate_series
@@ -93,6 +94,7 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
                  oos_ic_threshold: float = 0.03, min_train_ic: float = 0.02,
                  redundancy_max: float = 0.7, train_days: int = 252,
                  oos_days: int = 63, fdr_q: float = 0.10,
+                 dsr_min: float = 0.85,
                  cfg: LLMConfig | None = None
                  ) -> list[MineResult]:
     cfg = cfg or LLMConfig()
@@ -148,13 +150,16 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
     #   (2) Benjamini-Hochberg FDR at `fdr_q` over the floor-passers' one-sided
     #       IC p-values (family size = #floor-passers this batch — a VALID
     #       within-run FDR control);
-    #   (3) redundancy vs already-accepted.
-    # NOTE: this corrects WITHIN-RUN best-of-N snooping only. Cross-run
-    # multiplicity (re-mining many times) is NOT corrected here — that needs a
-    # genuine lifetime trial ledger + deflated-Sharpe haircut (a separate item);
-    # a prior attempt to fold it into the BH family size via the name-dedup'd
-    # library count was invalid (not an FDR level) and unstable (it silently
-    # demoted already-accepted factors as the library grew), so it was removed.
+    #   (3) cross-run DSR haircut: lifetime trial ledger (factor_trials,
+    #       append-only) supplies every hypothesis ever scored; the winner's
+    #       per-period ICIR (= t/√n) must clear a PSR whose benchmark is
+    #       raised to expected_max_sharpe(all trial ICIRs) — the more you
+    #       re-mine, the higher the bar. Ledger deduped by expression (re-
+    #       testing the same hypothesis is not an independent trial); with <2
+    #       trials it degrades to plain PSR, so the first batch stays lenient.
+    #       (This replaces the earlier invalid attempt to fold cross-run
+    #       multiplicity into the BH family size, which was removed.)
+    #   (4) redundancy vs already-accepted.
     floor_idx: list[int] = []
     pvals: list[float] = []
     for i, (name, expr_str, train_ic, oos, xs) in enumerate(scored):
@@ -166,11 +171,20 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
     fdr_ok = {floor_idx[pos] for pos in _bh_discoveries(pvals, fdr_q, m)}
     floor_set = set(floor_idx)
 
+    # 终生试验池 = 历史台账(按表达式去重的最新 ICIR)+ 本批全部有效 ICIR。
+    # 本批与历史同表达式会各计一次(轻微高估 N,方向保守)。
+    prior_icirs = db.factor_trial_icirs()
+    batch_icirs = [o.t_stat / math.sqrt(o.n) for (_, _, _, o, _) in scored
+                   if o.n >= 2 and not np.isnan(o.t_stat)]
+    trial_icirs = prior_icirs + batch_icirs
+
     accepted_xs: list[dict] = []
     results: list[MineResult] = []
     for i, (name, expr_str, train_ic, oos, xs) in enumerate(scored):
         oos_ic = oos.mean_ic
         p = _ic_pvalue(oos.t_stat, oos.n, fwd_days)
+        icir = (oos.t_stat / math.sqrt(oos.n)
+                if oos.n >= 2 and not np.isnan(oos.t_stat) else float("nan"))
         if i not in floor_set:
             if np.isnan(train_ic) or train_ic < min_train_ic:
                 reason = f"train_ic {train_ic:.3f} below {min_train_ic}"
@@ -181,13 +195,26 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
             reason = (f"failed FDR (p={p:.3f}, q={fdr_q}, m={m}, "
                       f"t={oos.t_stat:.2f}/n={oos.n})")
             accepted = False
-        elif _redundant(xs, accepted_xs, redundancy_max):
-            reason = f"redundant (|corr|>={redundancy_max})"
-            accepted = False
         else:
-            accepted = True
-            accepted_xs.append(xs)
-            reason = f"accepted (oos_ic={oos_ic:.3f}, p={p:.3f}, FDR q={fdr_q}, m={m})"
+            d = (deflated_sharpe_from_stats(icir, oos.n, trial_icirs)
+                 if not np.isnan(icir)
+                 else {"dsr": 0.0, "sr0_benchmark": float("nan")})
+            if d["dsr"] < dsr_min:
+                reason = (f"failed DSR (dsr={d['dsr']:.2f} < {dsr_min}, "
+                          f"sr0={d['sr0_benchmark']:.3f}, "
+                          f"lifetime N={len(trial_icirs)})")
+                accepted = False
+            elif _redundant(xs, accepted_xs, redundancy_max):
+                reason = f"redundant (|corr|>={redundancy_max})"
+                accepted = False
+            else:
+                accepted = True
+                accepted_xs.append(xs)
+                reason = (f"accepted (oos_ic={oos_ic:.3f}, p={p:.3f}, "
+                          f"FDR q={fdr_q}, m={m}, dsr={d['dsr']:.2f}, "
+                          f"N={len(trial_icirs)})")
+        db.record_factor_trial(name, expr_str, train_ic, oos_ic,
+                               oos.t_stat, oos.n, accepted, end.isoformat())
         db.save_generated_factor(name, expr_str, train_ic, oos_ic, accepted)
         # Baseline snapshot on day one: a freshly mined factor's trajectory
         # starts NOW, so the drift watcher never sees it as unmonitored.
