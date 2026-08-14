@@ -10,6 +10,15 @@
 | `QUANTI_ACCOUNT` | paper | 账户库(paper/live) |
 | `QUANTI_STACK_DUMP` | 0 | =1 时 `kill -USR1` 转储全线程栈(随后进程按信号默认动作退出,KeepAlive 拉起) |
 | `QUANTI_HOOK_WARMUP_SEC` | 1800 | 启动后多久才允许重活钩子(doctor/策略闸门/因子重评)——避免与冷启动首轮 tick 的 selector sweep 争 CPU/锁 |
+| `QUANTI_SQLITE_CACHE_MB` | 64 | 每个 SQLite 连接的页缓存上限(MB,最小 8)。OS 页缓存已覆盖热文件页,256MB 的 SQLite 缓存是纯重复占用——内存紧张时先看这里 |
+
+## 0.1 系统要求与内存排查
+
+- **内存**:16GB 起步(2.3GB 市场库 + 全市场扫描的 pandas 瞬态帧)。
+- **swap 排查**(macOS):`sysctl vm.swapusage`——used 接近 total 时,系统整体
+  变慢会放大一切量测(2026-08-15 实测 swap 10.4GB/11.3GB 时,同一 sweep 从
+  88s 恶化到 14 分钟)。swap 压力来自宿主机的全部应用,不只是 quanti;
+  释放内存、或把 `QUANTI_SQLITE_CACHE_MB` 降到 32,是两条最直接的缓解。
 
 ## 1. 进程守护(launchd, macOS)
 

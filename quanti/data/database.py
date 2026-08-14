@@ -185,16 +185,25 @@ class Database:
         are all per-schema, so the ATTACHed `market` DB needs its own set — not
         just `main`. WAL + synchronous=NORMAL is crash-safe under WAL (the DB
         can't corrupt; at most the last un-checkpointed commit is lost), and
-        drops the per-commit fsync that FULL forces. The 256MB page cache +
-        256MB mmap keep the 1.9GB market DB's hot working set resident so
-        full-market range scans stop hitting disk on every read. `schema` is an
-        internal literal ("main"/"market"), never user input — PRAGMA can't
-        bind params, so it's interpolated."""
+        drops the per-commit fsync that FULL forces. Page cache: 64MB by
+        default (QUANTI_SQLITE_CACHE_MB overrides) — was 256MB, but the OS
+        page cache already holds the hot file pages, and a 256MB per-schema
+        SQLite cache is pure duplication under memory pressure (2026-08-15:
+        the host sat at ~10GB swap; every process that opens the 2.3GB market
+        DB adds its own cache on top). The 256MB mmap is VIRTUAL address
+        space — pages stay disk-backed until touched, so it stays. `schema` is
+        an internal literal ("main"/"market"), never user input — PRAGMA
+        can't bind params, so it's interpolated."""
+        import os
+        try:
+            cache_mb = max(8, int(os.environ.get("QUANTI_SQLITE_CACHE_MB", "64")))
+        except ValueError:
+            cache_mb = 64
         c = self._raw_conn
         c.execute(f"PRAGMA {schema}.journal_mode=WAL")
         c.execute(f"PRAGMA {schema}.synchronous=NORMAL")
-        c.execute(f"PRAGMA {schema}.cache_size=-262144")   # 256 MB (negative = KiB cap)
-        c.execute(f"PRAGMA {schema}.mmap_size=268435456")  # 256 MB
+        c.execute(f"PRAGMA {schema}.cache_size={-cache_mb * 1024}")
+        c.execute(f"PRAGMA {schema}.mmap_size=268435456")  # 256 MB virtual
 
     # Shared/market tables — MUST live in the attached `market.*` schema, never
     # in the account (main) DB. A copy in main shadows the attached one (SQLite

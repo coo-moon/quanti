@@ -59,7 +59,18 @@ def test_pragmas_tuned_on_both_schemas(tmp_path):
             c = db.conn
             assert c.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0] == "wal"
             assert c.execute(f"PRAGMA {schema}.synchronous").fetchone()[0] == 1       # NORMAL，WAL 下 crash-safe
-            assert c.execute(f"PRAGMA {schema}.cache_size").fetchone()[0] == -262144  # 256 MB
+            assert c.execute(f"PRAGMA {schema}.cache_size").fetchone()[0] == -65536  # 64 MB default
             assert c.execute(f"PRAGMA {schema}.mmap_size").fetchone()[0] == 268435456  # 256 MB
     finally:
         db.close()
+
+
+def test_cache_size_env_override(tmp_path, monkeypatch):
+    """QUANTI_SQLITE_CACHE_MB overrides the default 64MB page cache."""
+    from quanti.data.database import Database
+    monkeypatch.setenv("QUANTI_SQLITE_CACHE_MB", "128")
+    db = Database(str(tmp_path / "e.db"))
+    db.initialize()
+    assert db.conn.execute("PRAGMA main.cache_size").fetchone()[0] == -131072
+    db.close()
+
