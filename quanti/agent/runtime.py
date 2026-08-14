@@ -149,9 +149,14 @@ class AgentRuntime:
         self._attribution_logged: date | None = None  # daily dedup for the
         # observe-only "pool_vs_passive" active-vs-passive guardrail log
         # Degraded-exit cache: (monotonic ts, list) — recomputed at most once
-        # per 60s inside status(), so the UI sees fresh coverage without a
-        # strategy-directory scan on every poll.
-        self._degraded_cache: tuple[float, list[dict]] = (0.0, [])
+        # per 300s inside status(), so the UI sees fresh coverage without a
+        # strategy-directory scan on every poll (the UI polls every few
+        # seconds; the scan loads every strategy file — needless GIL/IO
+        # pressure that starved the selector sweep's workers, 2026-08-14).
+        # ts starts at -inf: with 0.0, a process booted <TTL seconds ago
+        # (fresh CI VMs, freshly-booted hosts) would serve the EMPTY cache
+        # without ever computing — caught by CI, a real latent bug.
+        self._degraded_cache: tuple[float, list[dict]] = (float("-inf"), [])
         self._thread: threading.Thread | None = None
         self._guard_thread: threading.Thread | None = None
         # 盘中 LLM 守护线程(llm_full 模式,默认每 300s 一轮)。独立于 5 秒
@@ -452,12 +457,13 @@ class AgentRuntime:
         poll. A miss runs the doctor's exit_coverage check (local reads only)."""
         now = time.monotonic()
         ts, cached = self._degraded_cache
-        if now - ts < 60.0:
+        if now - ts < 300.0:
             return cached
         try:
             from quanti.health import exit_coverage
             degraded = exit_coverage(self._db, self._strategies_dir)["degraded"]
-        except Exception:  # noqa: BLE001 - status() must never raise
+        except Exception as e:  # noqa: BLE001 - status() must never raise
+            logger.warning("degraded-exit scan failed (serving cached): %s", e)
             degraded = cached
         self._degraded_cache = (now, degraded)
         return degraded

@@ -348,3 +348,19 @@ class TestClear:
         db.mark_backfill_done(date(2024, 1, 2), 100)
         assert db.clear_backfill_progress() == 1
         assert db.get_backfilled_dates() == set()
+
+
+class TestBatchPositionPrices:
+    def test_batch_update_all_positions(self, tmp_path):
+        from datetime import date
+
+        db = Database(str(tmp_path / "p.db"))
+        db.initialize()
+        db.upsert_position("000001", 100, 10.0, 10.0, date.today())
+        db.upsert_position("000002", 200, 5.0, 5.0, date.today())
+        db.set_positions_prices({"000001": 11.5, "000002": 4.8})
+        rows = {p["code"]: p["current_price"] for p in db.list_positions()}
+        assert rows == {"000001": 11.5, "000002": 4.8}
+        db.set_positions_prices({})  # empty batch is a no-op
+        db.close()
+

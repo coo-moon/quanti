@@ -1602,6 +1602,22 @@ class Database:
         )
         self.conn.commit()
 
+    def set_positions_prices(self, prices: dict[str, float]) -> None:
+        """Batch-mark many positions to their latest close — ONE commit
+        instead of one per position. snapshot_portfolio runs on every UI
+        status poll (every few seconds); the per-code path meant N commits
+        + N lock round trips per poll, which starved the selector sweep's
+        workers of the GIL/DB lock during cold boot (2026-08-14)."""
+        if not prices:
+            return
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        self.conn.executemany(
+            "UPDATE positions SET current_price=?, updated_at=? WHERE code=?",
+            [(price, now, code) for code, price in prices.items()],
+        )
+        self.conn.commit()
+
     def insert_order(self, order: dict) -> None:
         from datetime import datetime
         self.conn.execute(

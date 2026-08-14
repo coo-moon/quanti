@@ -261,13 +261,16 @@ class PaperBroker:
         latest_d: date | None = None
         # In-session realtime overlay (paper intraday guard); {} off-session.
         marks = self._intraday_marks([p["code"] for p in positions])
+        # Batch the mark-to-market writes: ONE commit for all positions
+        # instead of one per code (this method runs on every UI status poll).
+        price_updates: dict[str, float] = {}
         for pos in positions:
             live = marks.get(pos["code"])
             quote = ((live, date.today()) if live
                      else self._latest_close(pos["code"]))
             price = quote[0] if quote else pos["current_price"] or pos["avg_cost"]
             if quote:
-                self._db.set_position_price(pos["code"], price)
+                price_updates[pos["code"]] = price
                 if latest_d is None or quote[1] > latest_d:
                     latest_d = quote[1]
             mv = price * pos["quantity"]
@@ -290,6 +293,8 @@ class PaperBroker:
 
         total = cash + market_value
         snap_d = latest_d or date.today()
+        self._db.set_positions_prices(price_updates)
+
         # In-session (realtime-marked) snapshots are transient — do NOT
         # persist them. portfolio_snapshots must stay a close-marked daily
         # series: an intraday spike written here would inflate the drawdown
