@@ -167,6 +167,42 @@ class TestRiskAuditEndpoint:
         assert isinstance(d["recent_exits"], list)
 
     @pytest.mark.asyncio
+    async def test_audit_reflects_llm_full_bypass(self, client, db):
+        """llm_full 模式下审计必须如实标注:经典个股离场与买入护栏被旁路,
+        llm_full 块给出灾难地板与点位覆盖数;组合熔断阈值不受影响。"""
+        from quanti.agent.goal import load_goal, save_goal
+        goal = load_goal(db)
+        goal.params = {**(goal.params or {}), "agent_mode": "llm_full"}
+        save_goal(db, goal)
+        from datetime import date as _date
+        db.upsert_position("000001", 100, 10.0, 10.0, _date(2026, 1, 5))
+        db.upsert_llm_plan("000001", 9.0, 0, 0, "test")
+
+        r = await client.get("/api/risk/audit")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["llm_full"]["enabled"] is True
+        assert d["llm_full"]["disaster_floor_pct"] == -0.25  # dataclass default
+        assert d["llm_full"]["n_positions"] == 1
+        assert d["llm_full"]["n_with_stop"] == 1
+        # 经典个股离场标记为不生效;熔断照旧。
+        assert d["exits"]["stop_loss"]["enabled"] is False
+        assert d["exits"]["atr_stop"]["enabled"] is False
+        assert d["exits"]["strategy_exit"]["enabled"] is False
+        assert d["exits"]["portfolio_circuit_breaker"]["threshold"] == -0.30
+        # 买入四守卫旁路。
+        assert d["guard"]["enabled"] is False
+        assert d["guard"]["bypassed_by_llm_full"] is True
+
+        # 切回经典模式,审计恢复原样。
+        goal.params["agent_mode"] = ""
+        save_goal(db, goal)
+        d2 = (await client.get("/api/risk/audit")).json()
+        assert d2["llm_full"]["enabled"] is False
+        assert d2["exits"]["stop_loss"]["enabled"] is True
+        assert d2["guard"]["enabled"] is True
+
+    @pytest.mark.asyncio
     async def test_audit_lists_recent_risk_exit(self, client, db):
         from datetime import datetime
         now = datetime.now().isoformat()

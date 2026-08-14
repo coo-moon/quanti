@@ -410,6 +410,14 @@ export interface RiskExitEvent {
 export interface RiskAudit {
   account: string;
   is_live: boolean;
+  // LLM 全权模式:经典个股离场与买入护栏被旁路,止损=LLM 落库点位。
+  llm_full?: {
+    enabled: boolean;
+    disaster_floor_pct: number;
+    n_positions?: number;
+    n_with_stop?: number;
+    n_with_add?: number;
+  };
   exits: {
     stop_loss: { enabled: boolean; threshold: number };
     atr_stop: { enabled: boolean; k: number; n: number };
@@ -420,6 +428,7 @@ export interface RiskAudit {
   channel_parity: ChannelParity[];
   guard: {
     enabled: boolean;
+    bypassed_by_llm_full?: boolean;
     locked: boolean;
     reason: string;
     recent_stop_losses: number;
