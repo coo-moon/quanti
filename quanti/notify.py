@@ -36,6 +36,7 @@ DEFAULT_ALERT_KINDS = frozenset({
     "doctor_warn",           # 每日体检发现问题(数据陈旧/离场缺口/库损坏)
     "llm_unavailable",       # LLM 决策层不可用,tick 空过
     "live_caps_unset",       # 实盘敞口双闸(单笔/总敞口)均未配置
+    "stale_data_skip",       # 数据大面积陈旧,tick 跳过新信号生成
 })
 
 _MAX_QUEUE = 100

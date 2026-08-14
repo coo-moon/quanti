@@ -1011,3 +1011,23 @@ def test_disarm_never_blocks_sell(env):
     landed = broker.execute_signal(Signal("000001", Direction.SELL, 1.0, "x"), "s")
     assert landed is False
     assert not any(d["kind"] == "order_disarmed" for d in db.list_decisions(limit=10))
+
+
+def test_size_buy_reserves_commission(env):
+    """实盘 sizing 与 paper 同式:按手折算时把佣金摊进每手成本。
+
+    env 里最新收盘 10.9 → 每手 1090 元;佣金估计 = 5 元下限 + 过户费。
+    target = cash*0.95*strength = 10903 元:不减佣金会买 10 手(10903/1090
+    = 10.003),减佣金后 10903/1095.01 = 9.96 → 9 手。差的这一手就是此前
+    实盘比 paper 超买的口径漂移。
+    """
+    from quanti.models import Portfolio
+
+    db, provider = env
+    broker = _make(db, provider, client=DeadBridge())
+    portfolio = Portfolio(cash=100_000.0)
+    sig = Signal(stock_code="000001", direction=Direction.BUY,
+                 strength=10_903 / 95_000, reason="sizing test")
+    quantity, price = broker._size_buy(sig, portfolio)
+    assert quantity == 900
+    assert price > 10.9  # 滑点上浮

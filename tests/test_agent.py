@@ -355,3 +355,65 @@ class TestAgentRuntime:
         assert result["ok"] is False
         assert "宇宙" in result["reason"]
         db.close()
+
+
+class TestStaleDataGate:
+    """数据陈旧闸:大面积陈旧拦新信号,单只陈旧不拦。"""
+
+    def _mk_db(self, tmp_path, n_stocks: int, stale_codes: set[str]):
+        db = Database(str(tmp_path / "gate.db"))
+        db.initialize()
+        today = pd.Timestamp.today().normalize()
+        cal = pd.bdate_range(end=today, periods=10)
+        db.save_trade_calendar([d.date() for d in cal])
+        for i in range(n_stocks):
+            code = f"00000{i}" if i < 10 else f"0000{i}"
+            db.upsert_stock(code, f"股票{i}", "SZ", date(2000, 1, 1), "行业")
+            end = today - pd.Timedelta(days=30) if code in stale_codes else today
+            dates = pd.bdate_range(end=end, periods=30)
+            px = 10 + np.arange(len(dates)) * 0.01
+            db.save_daily_quotes(pd.DataFrame({
+                "code": code, "date": [d.date() for d in dates],
+                "open": px, "high": px + 0.1, "low": px - 0.1, "close": px,
+                "volume": np.full(len(dates), 1e6), "amount": px * 1e6,
+                "turnover": np.ones(len(dates)),
+            }))
+        return db
+
+    @pytest.fixture(autouse=True)
+    def _no_network(self, monkeypatch):
+        # _ensure_recent_data 不许在测试里真去拉数据源
+        monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+        monkeypatch.delenv("QUANTI_DATA_SOURCE", raising=False)
+
+    def test_systemic_staleness_blocks_new_signals(self, tmp_path):
+        db = self._mk_db(tmp_path, 2, stale_codes={"000000", "000001"})
+        provider = DataProvider(db)
+        broker = PaperBroker(db, provider)
+        agent = AgentRuntime(db, provider, broker,
+                             strategies_dir="strategies",
+                             screeners_dir="screeners")
+        save_goal(db, Goal(strategy_name="ma_cross",
+                           target_annual_return=0.15))
+        result = agent.tick()
+        assert result["ok"] is False
+        assert "数据陈旧闸" in result["reason"]
+        kinds = {d["kind"] for d in db.list_decisions(limit=20)}
+        assert "stale_data_skip" in kinds
+        assert "cycle" not in kinds  # 没往下生成新信号
+        db.close()
+
+    def test_single_stale_stock_does_not_block(self, tmp_path):
+        db = self._mk_db(tmp_path, 10, stale_codes={"000009"})
+        provider = DataProvider(db)
+        broker = PaperBroker(db, provider)
+        agent = AgentRuntime(db, provider, broker,
+                             strategies_dir="strategies",
+                             screeners_dir="screeners")
+        save_goal(db, Goal(strategy_name="ma_cross",
+                           target_annual_return=0.15))
+        result = agent.tick()
+        kinds = {d["kind"] for d in db.list_decisions(limit=30)}
+        assert "stale_data_skip" not in kinds
+        assert result["ok"] is True
+        db.close()

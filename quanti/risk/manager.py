@@ -8,7 +8,7 @@ Layer 1 — **protections** (``quanti/risk/protections.py``):
     Does NOT force a sell.
 
 Layer 2 — **portfolio_stop_loss** (this module, ``check_portfolio_stop``):
-    All-time HWM hard breaker. Default -15% from the running high-water mark.
+    All-time HWM hard breaker. Default -30% from the running high-water mark (PR #78).
     Flattens all positions and halts the agent when triggered.
     Threshold: ``RiskConfig.portfolio_stop_loss_pct``.
 
@@ -215,7 +215,7 @@ class RiskManager:
 
     def check_portfolio_stop(self, total_value: float, peak_value: float) -> bool:
         """True when equity has drawn down from its high-water mark past
-        `portfolio_stop_loss_pct` (e.g. -15%). Portfolio-level circuit breaker
+        `portfolio_stop_loss_pct` (e.g. -30%). Portfolio-level circuit breaker
         — the caller flattens everything and halts the agent."""
         if peak_value <= 0:
             return False
@@ -287,7 +287,7 @@ class RiskManager:
             3. trailing take-profit
 
         NOTE this is the per-stock layer. The portfolio circuit-breaker
-        (check_portfolio_stop, -15% from the equity high-water mark) is a
+        (check_portfolio_stop, -30% from the equity high-water mark) is a
         SEPARATE, higher-priority mechanism the caller runs first — when it
         trips it flattens everything, so in effect the full order is
         circuit-breaker > stop-loss > strategy-exit > take-profit.

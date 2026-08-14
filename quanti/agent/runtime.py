@@ -1297,6 +1297,30 @@ class AgentRuntime:
 
         self._ensure_recent_data(universe)
 
+        # 数据陈旧闸:_ensure_recent_data 是「尽力补」(每 tick 预算 ~20 只),
+        # 不是保证。数据源挂掉/回填中断时大面积股票停在旧价上,继续往下就是
+        # 拿旧价选股下单。复用 doctor 的 data_freshness 判定,但阈值按「系统
+        # 性失效」放宽:≥2 只且 ≥20% 缺失/陈旧才拦——单只停牌股或新建池里
+        # 一只没同步过的票不该锁死整个 agent。只拦新信号:持仓离场/止损/熔断
+        # 在 tick 开头与盘中守护里已照常跑(H2 教训:数据问题绝不能顺带禁用
+        # 止损)。kind 在告警白名单,配了 webhook 会推人。
+        try:
+            from quanti.health import data_freshness
+            fresh = data_freshness(self._db, codes=universe)
+            n_bad = int(fresh.get("missing", 0)) + int(fresh.get("stale", 0))
+            total = int(fresh.get("total", 0))
+            if total > 0 and n_bad >= 2 and n_bad / total >= 0.20:
+                summary = (f"数据陈旧闸:宇宙 {total} 只中 {n_bad} 只缺失/陈旧,"
+                           f"本 tick 不生成新信号;持仓守护不受影响。"
+                           f"{fresh.get('detail', '')}")
+                self._db.log_decision("stale_data_skip", summary, details=fresh)
+                with self._lock:
+                    self._status.last_tick_at = ts
+                    self._status.last_tick_summary = summary
+                return {"ok": False, "reason": summary}
+        except Exception as e:  # noqa: BLE001 - 闸自身失败不拦截,但要可见
+            logger.warning("data freshness gate failed (skipped): %s", e)
+
         # Step 1 of every tick: read the market-regime snapshot (full-market
         # breadth / rotation / turnover, produced once a day at 17:30 by the
         # background syncer) and log it. Observe-only here — it changes nothing
