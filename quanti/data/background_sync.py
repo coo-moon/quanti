@@ -454,6 +454,19 @@ class BackgroundQuoteSyncer:
                 self._sleep_responsive(5)
                 continue
 
+            if not self._warmup_elapsed():
+                # Warm-up window: the ENTIRE syncer yields to the agent's cold
+                # first-tick selector sweep. Every subsystem (financials sync,
+                # regime snapshot, after-close per-code sweep, factor re-score)
+                # competes with it for CPU + the DB lock — measured 2026-08-14:
+                # the sweep alone takes ~90s in a quiet process but 19+ min
+                # under cold-boot coexistence. Bars already on disk stay fresh
+                # enough; the queue resumes once warm-up elapses.
+                with self._lock:
+                    self._state = "warming"
+                self._sleep_responsive(5)
+                continue
+
             self._maybe_sync_financials()
             self._maybe_mine_factors()
             self._maybe_run_regime()

@@ -707,3 +707,51 @@ class TestHeavyWarmupGate:
         assert calls["doctor"] == 1
         db.close()
 
+
+
+    def test_syncer_loop_yields_during_warmup(self, tmp_path):
+        """The whole syncer (financials + queue + regime) must yield to the
+        agent cold tick during warm-up — the sweep alone takes ~90s in a
+        quiet process but 19+ min under boot coexistence (2026-08-14)."""
+        from datetime import datetime, timedelta
+
+        db = Database(str(tmp_path / "w3.db"))
+        db.initialize()
+        clock = {"now": datetime(2026, 6, 24, 18, 0)}
+        calls = {"fin": 0, "sync": 0}
+
+        class _Adapter:
+            def sync_daily_quotes_by_date(self, d, seed_state=None):
+                calls["sync"] += 1
+                return 0
+
+            def sync_daily_quotes(self, code, start=None, end=None,
+                                  repair_gaps=False):
+                calls["sync"] += 1
+                return 0
+
+        def fin():
+            calls["fin"] += 1
+            return 0
+
+        cfg = BackgroundSyncConfig()
+        syncer = BackgroundQuoteSyncer(
+            db=db, adapter_factory=lambda: _Adapter(),
+            config=cfg, now_fn=lambda: clock["now"],
+            financials_fn=fin, heavy_warmup_sec=30.0)
+        syncer.start()
+        import time
+        time.sleep(2.0)  # several loop iterations inside the warm-up window
+        assert calls == {"fin": 0, "sync": 0}
+        assert syncer.status().state == "warming"
+        # Advance past warm-up: the next loop pass must fire the daily hooks.
+        clock["now"] += timedelta(seconds=31)
+        for _ in range(30):
+            if calls["fin"] >= 1:
+                break
+            time.sleep(0.5)
+        assert calls["fin"] >= 1
+        syncer.stop()
+        syncer.shutdown(timeout=3)
+        db.close()
+
