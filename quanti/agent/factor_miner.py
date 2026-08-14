@@ -189,6 +189,10 @@ def mine_factors(llm, db, provider, codes: list[str], end: date, *,
             accepted_xs.append(xs)
             reason = f"accepted (oos_ic={oos_ic:.3f}, p={p:.3f}, FDR q={fdr_q}, m={m})"
         db.save_generated_factor(name, expr_str, train_ic, oos_ic, accepted)
+        # Baseline snapshot on day one: a freshly mined factor's trajectory
+        # starts NOW, so the drift watcher never sees it as unmonitored.
+        db.save_factor_ic_snapshot(name, end, train_ic, oos_ic,
+                                   oos.t_stat, oos.n, accepted)
         results.append(MineResult(name, expr_str, train_ic, oos_ic, accepted, reason))
     return results
 
@@ -347,6 +351,10 @@ def rescore_generated_factors(db, provider, codes: list[str], end: date, *,
         accepted = i in fdr_ok
         db.save_generated_factor(name, expr_str, train_ic, oos.mean_ic, accepted,
                                  enabled=enabled)
+        # Append today's IC snapshot so the drift watcher can track the
+        # trajectory and retire factors whose edge decays over time.
+        db.save_factor_ic_snapshot(name, end, train_ic, oos.mean_ic,
+                                   oos.t_stat, oos.n, accepted)
         results.append(MineResult(name, expr_str, train_ic, oos.mean_ic, accepted,
                                   "rescored"))
     return results

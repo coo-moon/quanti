@@ -659,6 +659,21 @@ class Database:
                 reason TEXT DEFAULT '',
                 updated_at TEXT NOT NULL
             );
+
+            -- Per-rescore IC snapshots for generated factors (appended daily
+            -- by rescore_generated_factors). The drift watcher reads this to
+            -- decide decay/retirement — without it, a factor's IC trajectory
+            -- is invisible and nothing ever retires a decaying edge.
+            CREATE TABLE IF NOT EXISTS factor_ic_history (
+                name TEXT NOT NULL,
+                as_of TEXT NOT NULL,
+                train_ic REAL,
+                oos_ic REAL,
+                oos_t REAL,
+                oos_n INTEGER,
+                accepted INTEGER NOT NULL,
+                PRIMARY KEY (name, as_of)
+            );
             """
         )
 
@@ -2253,3 +2268,36 @@ class Database:
                 logger.warning("skipping unparseable generated factor %s: %s",
                                name, expr_str)
         return out
+
+    # --- Generated-factor IC history (drift watcher) ---
+
+    def save_factor_ic_snapshot(self, name: str, as_of: date, train_ic: float,
+                                oos_ic: float, oos_t: float, oos_n: int,
+                                accepted: bool) -> None:
+        """Append one rescore snapshot. Keyed by (name, as_of) so a same-day
+        re-rescore overwrites instead of duplicating."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO factor_ic_history "
+            "(name, as_of, train_ic, oos_ic, oos_t, oos_n, accepted) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, as_of.isoformat(), _nan_to_none(train_ic),
+             _nan_to_none(oos_ic), _nan_to_none(oos_t),
+             int(oos_n or 0), 1 if accepted else 0))
+        self.conn.commit()
+
+    def list_factor_ic_history(self, name: str | None = None,
+                               limit: int = 400) -> list[dict]:
+        """IC snapshots, newest first. `name=None` lists every factor (the
+        watcher reads this to build per-factor baselines)."""
+        sql = ("SELECT name, as_of, train_ic, oos_ic, oos_t, oos_n, accepted "
+               "FROM factor_ic_history ")
+        if name is not None:
+            rows = self.conn.execute(
+                sql + "WHERE name=? ORDER BY as_of DESC LIMIT ?",
+                (name, limit)).fetchall()
+        else:
+            rows = self.conn.execute(
+                sql + "ORDER BY as_of DESC LIMIT ?", (limit,)).fetchall()
+        return [{"name": r[0], "as_of": date.fromisoformat(r[1]),
+                 "train_ic": r[2], "oos_ic": r[3], "oos_t": r[4],
+                 "oos_n": r[5], "accepted": bool(r[6])} for r in rows]

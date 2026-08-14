@@ -19,6 +19,7 @@ quanti <子命令> [参数]
 | [`agent`](#agent--命令行操作-agent) | 无 server 模式下观察/触发 Agent |
 | [`mine-factors`](#mine-factors--llm-因子挖掘) | LLM 因子挖掘 |
 | [`doctor`](#doctor--系统体检) | 系统体检:退出覆盖/数据新鲜度/DB 完整性 |
+| [`factor-watch`](#factor-watch--因子-ic-漂移体检) | 因子 IC 漂移体检:衰减/退役/无快照 |
 | [`mcp`](#mcp--mcp-server) | 启动 MCP server(stdio,供 OpenClaw/Claude Desktop 接入) |
 
 ---
@@ -265,6 +266,17 @@ quanti mine-factors --universe my_pool --n 20 --end 2024-12-31
 quanti doctor                      # 人类可读摘要
 quanti doctor --json               # 机器可读
 quanti doctor --codes 000001,600519  # 只体检指定代码的数据
+```
+
+---
+
+## `factor-watch` — 因子 IC 漂移体检
+
+把每日重评(`rescore_generated_factors`)沉淀的 IC 快照变成衰减决策:基线(历史 OOS IC 均值,不含最近窗口)vs 近期(最近 3 次快照),近期 < 基线一半 → 标记「衰减」;曾被闸通过、最新一次被拒 → 标记「退役」;已入库启用但尚无快照(本功能上线前的存量)→ 标记「无快照」。发现问题退出码 1;后台每日重评后若有问题,会以 `factor_watch` 决策条目落进审计流。
+
+```bash
+quanti factor-watch        # 人类可读
+quanti factor-watch --json # 机器可读
 ```
 
 ---
