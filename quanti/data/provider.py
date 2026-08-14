@@ -53,34 +53,70 @@ class DataProvider:
         self._cache_max = cache_max_codes
         self._series_cache: OrderedDict[str, tuple[float, pd.DataFrame]] = (
             OrderedDict())
+        # Same LRU/TTL design for the two per-code "table" families the factor
+        # pipeline re-reads on every evaluation: daily_basic (PE/PB/mv/...) and
+        # financials (PIT quarterly reports). The daily factor rescore alone
+        # (118 factors x 2 windows x 100 codes) issued ~47k redundant SQLite
+        # reads for these two tables — the 2026-08-15 stack dump showed those
+        # queries dominating a 12-minute in-process mining hook. Full-history
+        # per-code entries, same LRU cap as bars: at the 500-code cap the
+        # daily_basic table is the dominant one (≈ a few tens of MB); the
+        # financials table is ~37 rows/code and negligible.
+        self._basic_cache: OrderedDict[str, tuple[float, pd.DataFrame]] = (
+            OrderedDict())
+        self._fin_cache: OrderedDict[str, tuple[float, pd.DataFrame]] = (
+            OrderedDict())
         self._cache_lock = threading.Lock()
+
+    def _cached_table(self, cache: "OrderedDict[str, tuple[float, pd.DataFrame]]",
+                      code: str, fetch) -> pd.DataFrame:
+        """Shared LRU/TTL get-or-fill for the per-code table caches.
+        `fetch` is a zero-arg closure that reads the full per-code table from
+        the DB once; callers slice/filter on top (never mutate the entry)."""
+        now = time.monotonic()
+        with self._cache_lock:
+            hit = cache.get(code)
+            if hit is not None and now - hit[0] < self._cache_ttl:
+                cache.move_to_end(code)
+                return hit[1]
+        df = fetch()
+        with self._cache_lock:
+            cache[code] = (now, df)
+            cache.move_to_end(code)
+            while len(cache) > self._cache_max:
+                cache.popitem(last=False)
+        return df
 
     def _cached_series(self, code: str) -> pd.DataFrame:
         """RAW (unadjusted) bars for `code` from _SERIES_CACHE_FROM to today,
         served from an LRU/TTL cache. Callers slice + adjust on top."""
-        now = time.monotonic()
-        with self._cache_lock:
-            hit = self._series_cache.get(code)
-            if hit is not None and now - hit[0] < self._cache_ttl:
-                self._series_cache.move_to_end(code)
-                return hit[1]
-        df = self._db.get_daily_quotes(
-            code, _SERIES_CACHE_FROM, date.today() + timedelta(days=1))
-        with self._cache_lock:
-            self._series_cache[code] = (now, df)
-            self._series_cache.move_to_end(code)
-            while len(self._series_cache) > self._cache_max:
-                self._series_cache.popitem(last=False)
-        return df
+        return self._cached_table(
+            self._series_cache, code,
+            lambda: self._db.get_daily_quotes(
+                code, _SERIES_CACHE_FROM, date.today() + timedelta(days=1)))
+
+    def _cached_basic(self, code: str) -> pd.DataFrame:
+        """Full daily_basic history for `code` (from _SERIES_CACHE_FROM)."""
+        return self._cached_table(
+            self._basic_cache, code,
+            lambda: self._db.get_daily_basic(
+                code, _SERIES_CACHE_FROM, date.today() + timedelta(days=1)))
+
+    def _cached_financials(self, code: str) -> pd.DataFrame:
+        """Full announced financial-report history for `code`."""
+        return self._cached_table(
+            self._fin_cache, code, lambda: self._db.get_financials(code))
 
     def invalidate_series_cache(self, code: str | None = None) -> None:
-        """Drop one code (or everything) — callers that just wrote bars can
-        force a fresh read without waiting out the TTL."""
+        """Drop one code (or everything) from all series caches — callers that
+        just wrote bars / daily_basic / financials can force a fresh read
+        without waiting out the TTL."""
         with self._cache_lock:
-            if code is None:
-                self._series_cache.clear()
-            else:
-                self._series_cache.pop(code, None)
+            for cache in (self._series_cache, self._basic_cache, self._fin_cache):
+                if code is None:
+                    cache.clear()
+                else:
+                    cache.pop(code, None)
 
     @staticmethod
     def _apply_adjust(df: pd.DataFrame, adjust: str) -> pd.DataFrame:
@@ -145,13 +181,18 @@ class DataProvider:
 
     def get_daily_basic_df(self, code: str, start: date, end: date) -> pd.DataFrame:
         """Per-(code,date) valuation (PE/PB/PS/mv/dv/turnover). Point-in-time by
-        construction — used by the factor panel."""
-        return self._db.get_daily_basic(code, start, end)
+        construction — used by the factor panel. Served from the per-code table
+        cache (full history, sliced here) — a copy, safe to merge/mutate."""
+        full = self._cached_basic(code)
+        return full[(full["date"] >= start) & (full["date"] <= end)].copy()
 
     def get_financials_asof(self, code: str, as_of: date) -> pd.DataFrame:
         """Financial reports ANNOUNCED on/before `as_of` (ann_date ≤ as_of) —
-        the point-in-time-safe view for fundamental factors."""
-        return self._db.get_financials_asof(code, as_of)
+        the point-in-time-safe view for fundamental factors. Served from the
+        per-code table cache (full history, filtered here) — a copy, safe to
+        merge/mutate."""
+        full = self._cached_financials(code)
+        return full[full["ann_date"] <= as_of].copy()
 
     def get_trade_dates(self, start: date, end: date) -> list[date]:
         return self._db.get_trade_dates(start, end)

@@ -117,3 +117,21 @@ sqlite3 data/market.db "VACUUM INTO 'backups/market-$(date +%F).db'"  # 2.3GB,�
 - [ ] Agent 页无「持仓策略离场降级」红卡
 - [ ] 组合净值曲线无异常跳变(对账)
 
+## 6. 财务数据源:VIP 降级与保守披露日(ann_date)约定
+
+基本面因子读两张表:`daily_basic`(估值,tushare 日频)与 `financials`(季度
+报告)。`financials` 的每日同步按配置的源回退:tushare VIP(`fina_indicator_vip`)
+无权限或失败时,自动回退 akshare 业绩报表(全市场一次调用,免费)。日志里
+`fina_indicator_vip unavailable ... via akshare 业绩报表` 是**正常降级路径**,
+不是故障——但意味着:只有同比增速(netprofit_yoy / revenue_yoy),没有净利润
+绝对值(`financials.net_profit` 约 97% 为 NULL)。依赖绝对值的因子(如 SUE 季节
+意外)当前无法点对点计算,补数据需要 tushare 利润表 VIP 接口
+(证据见 docs/2026-08-15-earnings-revision-study.md)。
+
+**ann_date 约定(重要)**:akshare 路径把 ann_date 记为该报告期的**法定披露
+截止日**(一季报 4/30、半年报 8/31、三季报 10/31、年报次年 4/30),而不是
+不可靠的「最新公告日期」。取舍是刻意的:因子只有在 `ann_date ≤ 当天` 后才
+能看到报告(merge_asof 点对点),因此**绝不前视**;代价是最新报告的可见性被
+推迟到截止日(最坏约 6 周信号延迟)。`ann≤2026-08-31` 这类日志字样即此约定,
+不是数据错误。
+

@@ -1097,13 +1097,31 @@ class Database:
         return False
 
     def get_financials_asof(self, code: str, as_of: date) -> pd.DataFrame:
-        """Reports ANNOUNCED on/before `as_of`, ordered by ann_date — the only
-        point-in-time-safe view (a report is invisible until its ann_date)."""
+        """Reports ANNOUNCED on/before `as_of`, ordered by (ann_date, end_date) —
+        the only point-in-time-safe view (a report is invisible until its
+        ann_date). The end_date tiebreak makes same-deadline reports (akshare's
+        statutory ann_date: annual 4/30 vs Q1 4/30) deterministic — newest
+        period last, which is what merge_asof(backward) picks."""
         with self._db_lock:
             df = pd.read_sql_query(
                 f"SELECT code, end_date, ann_date, {', '.join(self._FIN_COLS)} "
-                "FROM financials WHERE code=? AND ann_date<=? ORDER BY ann_date",
+                "FROM financials WHERE code=? AND ann_date<=? "
+                "ORDER BY ann_date, end_date",
                 self._raw_conn, params=(code, as_of.isoformat()))
+        if not df.empty:
+            df["ann_date"] = pd.to_datetime(df["ann_date"]).dt.date
+        return df
+
+    def get_financials(self, code: str) -> pd.DataFrame:
+        """Full announced-report history for one code, ordered by
+        (ann_date, end_date) — same tiebreak as get_financials_asof. The
+        provider's cache layer fetches this once per code and filters per
+        `as_of` itself (see DataProvider.get_financials_asof)."""
+        with self._db_lock:
+            df = pd.read_sql_query(
+                f"SELECT code, end_date, ann_date, {', '.join(self._FIN_COLS)} "
+                "FROM financials WHERE code=? ORDER BY ann_date, end_date",
+                self._raw_conn, params=(code,))
         if not df.empty:
             df["ann_date"] = pd.to_datetime(df["ann_date"]).dt.date
         return df
