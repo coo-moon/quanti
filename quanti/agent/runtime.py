@@ -680,6 +680,9 @@ class AgentRuntime:
             try:
                 adapter.sync_daily_quotes(c, start=start, end=end,
                                           repair_gaps=False)
+                # The provider's series cache may hold the pre-sync series —
+                # drop it so the same tick's downstream reads see the new bar.
+                self._provider.invalidate_series_cache(c)
             except Exception as e:
                 logger.warning(f"Agent data refresh failed for {c}: {e}")
 

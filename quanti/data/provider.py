@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import date
+import threading
+import time
+from collections import OrderedDict
+from datetime import date, timedelta
 
 import pandas as pd
 
 from quanti.data.database import Database
 from quanti.models import BarData
+
+#: Cache fetch window: bars from this date forward cover every hot path
+#: (selector walk-forward full-history starts ~2021 in this deployment; the
+#: gate's 730-day window; panel lookbacks). Older history is not cached.
+_SERIES_CACHE_FROM = date(2015, 1, 1)
 
 
 class DataProvider:
@@ -21,8 +29,54 @@ class DataProvider:
     layer never adjusts — so gap-repair / re-reads can't double-adjust.
     """
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, *,
+                 cache_ttl_sec: float = 60.0,
+                 cache_max_codes: int = 500):
+        """Args:
+            cache_ttl_sec: per-code series cache lifetime. Hot loops (selector
+                sweep, factor rescore, strategy gate) re-read the same bars
+                tens of thousands of times per cold boot — without a cache
+                each read takes the SQLite lock and the whole cold start
+                becomes an hour-long lock convoy (2026-08-14 diagnosis).
+                60s is short enough that a post-sync re-read is at worst one
+                minute stale; the live mark path (realtime quotes) never
+                goes through this cache.
+            cache_max_codes: LRU cap. ~500 codes x ~10 years of daily bars
+                ≈ 40MB — bounded regardless of universe size.
+        """
         self._db = db
+        self._cache_ttl = cache_ttl_sec
+        self._cache_max = cache_max_codes
+        self._series_cache: OrderedDict[str, tuple[float, pd.DataFrame]] = (
+            OrderedDict())
+        self._cache_lock = threading.Lock()
+
+    def _cached_series(self, code: str) -> pd.DataFrame:
+        """RAW (unadjusted) bars for `code` from _SERIES_CACHE_FROM to today,
+        served from an LRU/TTL cache. Callers slice + adjust on top."""
+        now = time.monotonic()
+        with self._cache_lock:
+            hit = self._series_cache.get(code)
+            if hit is not None and now - hit[0] < self._cache_ttl:
+                self._series_cache.move_to_end(code)
+                return hit[1]
+        df = self._db.get_daily_quotes(
+            code, _SERIES_CACHE_FROM, date.today() + timedelta(days=1))
+        with self._cache_lock:
+            self._series_cache[code] = (now, df)
+            self._series_cache.move_to_end(code)
+            while len(self._series_cache) > self._cache_max:
+                self._series_cache.popitem(last=False)
+        return df
+
+    def invalidate_series_cache(self, code: str | None = None) -> None:
+        """Drop one code (or everything) — callers that just wrote bars can
+        force a fresh read without waiting out the TTL."""
+        with self._cache_lock:
+            if code is None:
+                self._series_cache.clear()
+            else:
+                self._series_cache.pop(code, None)
 
     @staticmethod
     def _apply_adjust(df: pd.DataFrame, adjust: str) -> pd.DataFrame:
@@ -41,11 +95,28 @@ class DataProvider:
         df["volume"] = df["volume"] / f
         return df
 
+    def _windowed(self, code: str, start: date, end: date,
+                   adjust: str, fresh: bool = False) -> pd.DataFrame:
+        """Cached raw series sliced to [start, end] and adjusted. The TTL cache
+        stores the RAW series (adjust is per-call — hfq and raw callers share
+        the same entry). `fresh=True` (freshness checks: has the bar landed
+        yet?) bypasses the cache AND drops the stale entry — a just-synced
+        bar must be visible immediately, not after the TTL."""
+        if fresh:
+            with self._cache_lock:
+                self._series_cache.pop(code, None)
+            df = self._db.get_daily_quotes(code, start, end)
+            return self._apply_adjust(df, adjust)
+        full = self._cached_series(code)
+        df = full[(full["date"] >= start) & (full["date"] <= end)]
+        return self._apply_adjust(df, adjust)
+
     def get_daily_bars(self, code: str, start: date, end: date,
-                       adjust: str = "hfq") -> list[BarData]:
+                       adjust: str = "hfq",
+                       fresh: bool = False) -> list[BarData]:
         """Get daily bars. ``adjust="hfq"`` (default) returns back-adjusted
         prices; ``adjust="none"`` returns raw market prices."""
-        df = self._apply_adjust(self._db.get_daily_quotes(code, start, end), adjust)
+        df = self._windowed(code, start, end, adjust, fresh=fresh)
         return [
             BarData(
                 code=row["code"],
@@ -62,10 +133,11 @@ class DataProvider:
         ]
 
     def get_daily_df(self, code: str, start: date, end: date,
-                    adjust: str = "hfq") -> pd.DataFrame:
+                    adjust: str = "hfq",
+                    fresh: bool = False) -> pd.DataFrame:
         """Get daily data as DataFrame (for factor computation). Adjusted (hfq)
         by default; pass ``adjust="none"`` for raw prices."""
-        return self._apply_adjust(self._db.get_daily_quotes(code, start, end), adjust)
+        return self._windowed(code, start, end, adjust, fresh=fresh)
 
     def get_daily_basic_df(self, code: str, start: date, end: date) -> pd.DataFrame:
         """Per-(code,date) valuation (PE/PB/PS/mv/dv/turnover). Point-in-time by

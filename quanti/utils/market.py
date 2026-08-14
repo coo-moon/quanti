@@ -171,7 +171,11 @@ def next_trading_bar(provider: DataProvider, code: str,
     probably suspended and the pending order will be expired by then.
     """
     end = after_date + timedelta(days=14)
-    bars = provider.get_daily_bars(code, after_date + timedelta(days=1), end)
+    # fresh=True: this IS the freshness check (has today's bar landed yet?).
+    # The provider's series cache would otherwise serve up to TTL-stale data
+    # right after a sync wrote the bar (2026-08-14 fill-scan regression).
+    bars = provider.get_daily_bars(code, after_date + timedelta(days=1), end,
+                                   fresh=True)
     if not bars:
         return None
     # Bars are sorted ascending by date; take the first.
