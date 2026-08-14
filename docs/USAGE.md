@@ -1082,7 +1082,7 @@ curl -X POST http://127.0.0.1:8000/api/backtest/run \
 | `max_position_pct` | 0.10 | 单股不超过组合的 10% |
 | `max_industry_pct` | 0.30 | 单行业不超过 30% |
 | `stop_loss_pct` | -0.08 | 单股止损 -8% |
-| `portfolio_stop_loss_pct` | -0.15 | 组合止损 -15% |
+| `portfolio_stop_loss_pct` | -0.30 | 组合回撤熔断 -30%（PR #78 由 -15% 放宽） |
 | `max_daily_trades` | 20 | 每日最多 20 笔 |
 | `blocked_prefixes` | ("ST", "*ST") | 黑名单前缀 |
 

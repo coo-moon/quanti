@@ -179,7 +179,10 @@ class AnthropicLLMClient:
             raise ImportError(
                 "anthropic SDK not installed. Install with: pip install -e '.[llm]'"
             ) from e
-        self._client = anthropic.Anthropic(api_key=api_key)
+        # timeout/重试与 DeepSeek 路径(openai_compat:timeout=60 + 退避重试)
+        # 对称。SDK 默认约 600s,一次慢调用能横跨多轮 300s 的盘中 LLM 守护。
+        self._client = anthropic.Anthropic(api_key=api_key, timeout=60.0,
+                                           max_retries=2)
 
     def create_message(self, *, model, system, messages, tools,
                        max_tokens, temperature) -> dict:

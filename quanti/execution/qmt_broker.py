@@ -26,7 +26,8 @@ The parts that need the real venue are marked ``# NOTE``:
   - fills are reconciled by polling ``/trader/orders`` + ``/trader/trades``;
     the real venue pushes them asynchronously (callbacks) — phase ③ wires the
     bridge to accumulate callbacks and this poller just reads them.
-  - sizing is the simple cash%/risk-cap rule (no Sizer/commission yet).
+  - sizing is the simple cash%/risk-cap rule (no Sizer; commission is
+    estimated per-lot, same formula as PaperBroker, so the two paths agree).
   - ``check_exits`` is stop-loss-only for now (trailing TP + strategy-exit
     replay land with the intraday loop in phase ⑤).
 """
@@ -38,6 +39,7 @@ import uuid
 from datetime import date, datetime
 from typing import Callable, TYPE_CHECKING
 
+from quanti.backtest.commission import AShareCommission
 from quanti.bridge_client import BridgeClient, DEFAULT_BRIDGE_URL, HttpBridgeClient
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
@@ -128,6 +130,7 @@ class QmtBroker:
             protection_config if protection_config is not None
             else ProtectionConfig())
         self._slippage = slippage
+        self._commission = AShareCommission()
         self._strategies_dir = strategies_dir
         self._pending_ttl_days = pending_ttl_trading_days
         # In-session gate: off-hours signals queue (A 股 no night session),
@@ -621,7 +624,10 @@ class QmtBroker:
         target_value = compute_buy_target_value(
             cash=cash, total_value=portfolio.total_value,
             strength=signal.strength, size_cap=room, code=signal.stock_code)
-        lots = int(target_value / (price * 100)) if price > 0 else 0
+        # 按手折算时预留佣金,公式与 PaperBroker 一致——此前实盘不减佣金,
+        # 边界上会比 paper 多买一手,两条链路口径漂移。
+        commission_est = self._commission.calculate(price, 100, Direction.BUY)
+        lots = int(target_value / (price * 100 + commission_est)) if price > 0 else 0
         return lots * 100, price * (1 + self._slippage)
 
     def _latest_price(self, code: str) -> float:

@@ -1,6 +1,6 @@
 # quanti/risk/protections.py
 """Composable, pluggable risk *protections* — a soft layer ABOVE the hard
-RiskManager caps and BELOW the -15% portfolio breaker.
+RiskManager caps and BELOW the -30% portfolio breaker.
 
 Each protection answers one question: "should new BUYs be locked today?".
 They never force a sell. Pure logic: given a ProtectionContext of facts
@@ -40,7 +40,7 @@ class ProtectionConfig:
 
     # MaxDrawdown: window peak-to-trough drawdown over md_lookback_days trading
     # days <= md_max_drawdown_pct → lock new BUYs for md_lock_days trading days.
-    # Must stay strictly shallower than the -0.15 hard portfolio breaker.
+    # Must stay strictly shallower than the -0.30 hard portfolio breaker.
     max_drawdown_enabled: bool = True
     md_lookback_days: int = 10
     md_max_drawdown_pct: float = -0.08
@@ -50,7 +50,7 @@ class ProtectionConfig:
     # CorrelationGuard (opt-in, default OFF — it changes live BUY behavior): when
     # the held book is already a highly-correlated single bet, lock new BUYs so
     # the agent doesn't pile more into the same exposure. Preventive only — never
-    # forces a sell (the -15% breaker + ATR stops own the sell side). Targets the
+    # forces a sell (the -30% breaker + ATR stops own the sell side). Targets the
     # known failure mode: an "equal-weight" book that is really one small-cap beta
     # with a fat left tail. Point-in-time on today's holdings (no K-lock history).
     correlation_guard_enabled: bool = False
