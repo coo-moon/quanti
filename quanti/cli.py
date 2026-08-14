@@ -69,6 +69,26 @@ def _cmd_clear(db, args) -> None:
         logger.info("以上为预演;确认无误后加 --yes 实际执行")
 
 
+def _cmd_doctor(db, args) -> None:
+    """One-shot system health check: exit coverage + data freshness + DB
+    integrity. Human-readable by default (--json for machines); exits 1 when
+    any check fails so it can gate cron/launchd health checks."""
+    import json as _json
+
+    from quanti.health import format_doctor, run_doctor
+    codes = ([c.strip() for c in args.codes.split(",") if c.strip()]
+             if getattr(args, "codes", None) else None)
+    strategies_dir = getattr(args, "strategies_dir", None) or "strategies"
+    report = run_doctor(db, strategies_dir=strategies_dir, codes=codes)
+    if getattr(args, "json", False):
+        print(_json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(format_doctor(report))
+    if not report["ok"]:
+        logger.error("体检发现问题(详见上方),建议按 docs/deployment.md 排查")
+        sys.exit(1)
+
+
 def _report_periods(years: int) -> list:
     """Quarterly report-period ends (MM-DD ∈ 03-31/06-30/09-30/12-31) within the
     last `years`, up to today — the keys akshare 业绩报表 is fetched by."""
@@ -590,6 +610,15 @@ def main():
     mine_parser.add_argument("--end", type=str, default=None)
     mine_parser.add_argument("--cash", type=float, default=1_000_000)
 
+    # doctor
+    doc_parser = subparsers.add_parser("doctor", help="系统体检：退出覆盖/数据新鲜度/DB 完整性")
+    doc_parser.add_argument("--codes", type=str, default=None,
+                            help="只体检这些代码的数据新鲜度(逗号分隔,默认全部)")
+    doc_parser.add_argument("--strategies-dir", dest="strategies_dir",
+                            type=str, default=None)
+    doc_parser.add_argument("--json", action="store_true",
+                            help="输出机器可读 JSON")
+
     # mcp
     subparsers.add_parser("mcp", help="启动 MCP server（stdio）供 OpenClaw 接入")
 
@@ -613,6 +642,8 @@ def main():
             cmd_mcp(args)
         elif cmd == "mine-factors":
             cmd_mine_factors(args)
+        elif cmd == "doctor":
+            _cmd_doctor(_open_db(), args)
         else:
             parser.print_help()
     except DataSourceUnavailable as e:

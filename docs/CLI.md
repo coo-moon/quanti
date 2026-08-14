@@ -18,6 +18,7 @@ quanti <子命令> [参数]
 | [`up`](#up--一键启动) | 一键:数据 + 目标 + Web + Agent |
 | [`agent`](#agent--命令行操作-agent) | 无 server 模式下观察/触发 Agent |
 | [`mine-factors`](#mine-factors--llm-因子挖掘) | LLM 因子挖掘 |
+| [`doctor`](#doctor--系统体检) | 系统体检:退出覆盖/数据新鲜度/DB 完整性 |
 | [`mcp`](#mcp--mcp-server) | 启动 MCP server(stdio,供 OpenClaw/Claude Desktop 接入) |
 
 ---
@@ -252,6 +253,18 @@ quanti agent prune --older-than-days 90
 ```bash
 quanti mine-factors --n 10
 quanti mine-factors --universe my_pool --n 20 --end 2024-12-31
+```
+
+---
+
+## `doctor` — 系统体检
+
+三项只读检查:持仓策略离场覆盖(策略被移走 → 只剩止损/止盈)、数据新鲜度(每个代码的最新 bar vs 交易日历)、SQLite 完整性。发现问题退出码为 1(可接 cron 告警);后台同步守护每天 17:45 自动跑一次并把结果写进决策日志。
+
+```bash
+quanti doctor                      # 人类可读摘要
+quanti doctor --json               # 机器可读
+quanti doctor --codes 000001,600519  # 只体检指定代码的数据
 ```
 
 ---

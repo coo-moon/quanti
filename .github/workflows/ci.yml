@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so the changed-files lint can diff vs origin/main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint changed Python files (vs origin/main)
+        # The repo is not yet lint-clean end-to-end (legacy semicolon style in
+        # regime/*, tests use lambdas). Gate linting on CHANGED files only so
+        # new code must be clean without a flag-day mass refactor. On a push to
+        # main the diff is empty and this step is a no-op.
+        run: |
+          CHANGED=$(git diff --name-only origin/main...HEAD -- '*.py' | tr '\n' ' ')
+          if [ -n "$CHANGED" ]; then
+            ruff check $CHANGED
+          else
+            echo "no python changes vs origin/main — lint skipped"
+          fi
+
+      - name: Tests
+        env:
+          # Production hosts must be on Beijing time (live-broker guard asserts
+          # UTC+8); CI runners are UTC, so align the env to the production
+          # contract instead of weakening the guard.
+          TZ: Asia/Shanghai
+        run: pytest -q
+

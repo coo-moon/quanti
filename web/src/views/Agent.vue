@@ -53,6 +53,29 @@
       </div>
     </div>
 
+    <!-- Strategy-exit degradation warning: holdings whose owning strategy was
+         retired (e.g. into strategies/attic) lose their strategy exit and only
+         keep stop-loss / take-profit. Operator must act or accept it. -->
+    <div class="card degraded-card" v-if="(agent?.degraded_exits?.length ?? 0) > 0">
+      <div class="card-header">
+        <h2>⚠️ 持仓策略离场降级</h2>
+        <span class="stat-label">{{ agent?.degraded_exits?.length }} 个持仓</span>
+      </div>
+      <p class="degraded-desc">
+        以下持仓的入场策略已不在 strategies 目录(通常是被精简进 attic)——策略离场已失效,只剩止损/止盈兜底:
+      </p>
+      <ul class="degraded-list">
+        <li v-for="d in agent?.degraded_exits ?? []" :key="d.code">
+          <b>{{ d.name || d.code }}</b> ({{ d.code }}) — 缺失策略
+          <code>{{ d.entry_strategy }}</code>
+        </li>
+      </ul>
+      <p class="degraded-desc">
+        处理:把策略移回 strategies/ 目录,或平掉这些仓位,或确认可接受仅止损/止盈离场。
+        (<code>quanti doctor</code> 会持续体检此项)
+      </p>
+    </div>
+
     <!-- Goal editor -->
     <div class="card">
       <div class="card-header"><h2>目标设定</h2></div>
@@ -1629,6 +1652,25 @@ onUnmounted(() => {
 }
 .muted-card {
   opacity: 0.7;
+}
+/* strategy-exit degradation warning */
+.degraded-card {
+  border-color: rgba(192, 57, 43, 0.4);
+  background: rgba(192, 57, 43, 0.06);
+}
+.degraded-desc {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin: 4px 0 8px;
+  line-height: 1.6;
+}
+.degraded-list {
+  margin: 0 0 8px;
+  padding-left: 20px;
+  font-size: 13px;
+}
+.degraded-list li {
+  margin: 4px 0;
 }
 .card {
   background: var(--color-surface, #fff);

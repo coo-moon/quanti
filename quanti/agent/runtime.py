@@ -94,6 +94,10 @@ class AgentStatus:
     last_evaluations: list[dict] = field(default_factory=list)
     total_value: float = 0.0
     pnl_pct: float = 0.0
+    degraded_exits: list[dict] = field(default_factory=list)
+    """Holdings whose entry_strategy is no longer loadable — their strategy
+    exit silently degraded to stop-loss/TP only. Computed lazily (see
+    `_degraded_exits_cached`) so the status endpoint stays cheap."""
 
 
 class AgentRuntime:
@@ -144,6 +148,10 @@ class AgentRuntime:
         # no-screener "candidate_source" beta-exposure decision log
         self._attribution_logged: date | None = None  # daily dedup for the
         # observe-only "pool_vs_passive" active-vs-passive guardrail log
+        # Degraded-exit cache: (monotonic ts, list) — recomputed at most once
+        # per 60s inside status(), so the UI sees fresh coverage without a
+        # strategy-directory scan on every poll.
+        self._degraded_cache: tuple[float, list[dict]] = (0.0, [])
         self._thread: threading.Thread | None = None
         self._guard_thread: threading.Thread | None = None
         # 盘中 LLM 守护线程(llm_full 模式,默认每 300s 一轮)。独立于 5 秒
@@ -438,6 +446,22 @@ class AgentRuntime:
         self.shutdown()
         self.start()
 
+    def _degraded_exits_cached(self) -> list[dict]:
+        """Exit-coverage scan with a 60s TTL — status() is polled by the UI
+        every few seconds and must not rescan the strategy directory on every
+        poll. A miss runs the doctor's exit_coverage check (local reads only)."""
+        now = time.monotonic()
+        ts, cached = self._degraded_cache
+        if now - ts < 60.0:
+            return cached
+        try:
+            from quanti.health import exit_coverage
+            degraded = exit_coverage(self._db, self._strategies_dir)["degraded"]
+        except Exception:  # noqa: BLE001 - status() must never raise
+            degraded = cached
+        self._degraded_cache = (now, degraded)
+        return degraded
+
     def status(self) -> AgentStatus:
         # Snapshot BEFORE taking the status lock: in-session it may do real
         # network I/O (realtime marks) — holding the lock through that would
@@ -457,6 +481,7 @@ class AgentRuntime:
                 last_evaluations=list(self._status.last_evaluations),
                 total_value=self._status.total_value,
                 pnl_pct=self._status.pnl_pct,
+                degraded_exits=self._degraded_exits_cached(),
             )
 
     def tick(self) -> dict:
@@ -1056,7 +1081,6 @@ class AgentRuntime:
         import copy
 
         from quanti.agent.llm_full import run_llm_full_decision
-        from quanti.agent.llm_runtime import LLMConfig
 
         params = goal.params or {}
         g2 = copy.copy(goal)

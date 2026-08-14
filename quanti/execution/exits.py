@@ -18,6 +18,26 @@ from quanti.models import Direction
 
 logger = logging.getLogger(__name__)
 
+# (strategy_name, code) -> last calendar day the degradation warning fired.
+# The intraday guard calls check_exits every few seconds, so without this the
+# log floods with the same warning thousands of times a day (observed on a
+# live paper book: ~5s cadence × 3 degraded positions ≈ 50k lines/day).
+_degraded_warned: dict[tuple[str, str], date] = {}
+
+
+def _warn_degraded_once(name: str, code: str) -> None:
+    """Warn about a holding whose owning strategy is missing — at most once
+    per (strategy, code) per calendar day. The set is bounded by the book's
+    degraded holdings, not by the call rate."""
+    key = (name, code)
+    today = date.today()
+    if _degraded_warned.get(key) == today:
+        return
+    _degraded_warned[key] = today
+    logger.warning(
+        "entry_strategy %r for %s not loaded — strategy exit "
+        "degraded to stop-loss/TP only (warned once today)", name, code)
+
 
 def compute_peaks(db, positions: list[dict],
                   raw_axis: bool = False) -> dict[str, float]:
@@ -113,10 +133,9 @@ def compute_strategy_exits(provider, strategies: dict,
         if strat_cls is None:
             if name:
                 # 归属策略已被移除(如精简进 attic)→ 该持仓失去策略离场,
-                # 只剩止损/止盈。显式告警而非静默跳过(#96 教训)。
-                logger.warning(
-                    "entry_strategy %r for %s not loaded — strategy exit "
-                    "degraded to stop-loss/TP only", name, p["code"])
+                # 只剩止损/止盈。显式告警而非静默跳过(#96 教训);盘中守卫
+                # 每几秒跑一次,按 (策略, 代码) 每日只告警一次防刷屏。
+                _warn_degraded_once(name, p["code"])
             continue
         try:
             bars = provider.get_daily_bars(p["code"], start, end)

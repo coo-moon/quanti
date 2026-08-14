@@ -143,9 +143,28 @@ def create_app(
         from quanti.regime import report as regime_report
         return regime_report.generate(db)
 
+    # Once/day after 17:45 (regime done, today's bars landed), run the doctor
+    # (exit coverage + data freshness + DB integrity) and persist findings as
+    # decision entries — so health problems show up in the audit trail without
+    # anyone having to remember `quanti doctor`. Read-only; never trades.
+    def _daily_doctor() -> dict:
+        from quanti.health import run_doctor
+        report = run_doctor(db, strategies_dir=strategies_dir)
+        checks = report.get("checks", {})
+        problems = [f"{name}: {c.get('detail', '')}"
+                    for name, c in checks.items() if not c.get("ok")]
+        if problems:
+            db.log_decision(
+                "doctor_warn", "每日体检发现问题: " + " | ".join(problems),
+                details=report)
+        else:
+            db.log_decision("doctor_ok", "每日体检通过", details=report)
+        return report
+
     bg_sync = BackgroundQuoteSyncer(db=db, financials_fn=_sync_latest_financials,
                                     mining_fn=_auto_mine_factors,
-                                    regime_fn=_daily_regime)
+                                    regime_fn=_daily_regime,
+                                    doctor_fn=_daily_doctor)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
