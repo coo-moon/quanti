@@ -239,6 +239,13 @@ export interface AgentStatus {
   total_value: number;
   pnl_pct: number;
   pending_orders?: number;
+  // Holdings whose entry_strategy is no longer loadable — strategy exit
+  // silently degraded to stop-loss/TP only. Non-empty = needs operator action.
+  degraded_exits?: Array<{
+    code: string;
+    entry_strategy: string;
+    name: string;
+  }>;
 }
 
 export interface PortfolioPosition {

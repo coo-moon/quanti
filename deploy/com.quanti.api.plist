@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Quanti Web API launchd service template.
+     Usage (see docs/deployment.md):
+       1. Replace every REPLACE_ME with your own absolute paths.
+       2. cp deploy/com.quanti.api.plist ~/Library/LaunchAgents/
+       3. launchctl load ~/Library/LaunchAgents/com.quanti.api.plist
+     KeepAlive restarts the API on crash; logs go to logs/api.{out,err}.log. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.quanti.api</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_ME/quanti/.venv/bin/python</string>
+    <string>-m</string>
+    <string>quanti.cli</string>
+    <string>serve</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8000</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>REPLACE_ME/quanti</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- paper (模拟盘) or live (实盘, needs QUANTI_LIVE_ACK). Do NOT put
+         real-money credentials here; use secrets via launchctl setenv. -->
+    <key>QUANTI_ACCOUNT</key>
+    <string>paper</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>REPLACE_ME/quanti/logs/api.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_ME/quanti/logs/api.err.log</string>
+</dict>
+</plist>
+

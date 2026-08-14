@@ -13,6 +13,7 @@ Quanti 是一个面向中国 A 股市场的开源量化交易系统，提供从*
 |------|------|
 | **数据采集** | 可切换数据源（默认 Tushare 含退市股，支持 AkShare/xtdata），按 显式>DB配置>env>默认 解析；无 token 时报错提示配置 token 或显式切到 AkShare（不静默换源）；自动同步全A股行情，SQLite 本地存储 |
 | **后台同步守护** | 常驻增量同步：收盘后自动全市场扫一轮，盘中安静；停牌股/死数据源指数退避 |
+| **系统体检(doctor)** | 每日 17:45 自动体检(持仓策略离场覆盖/数据新鲜度/SQLite 完整性)并落决策日志；`quanti doctor` 手动跑、退出码可接告警；Agent 页红卡提示策略离场降级持仓 |
 | **股票池管理** | 创建/删除股票池，批量添加/移除股票，一键同步K线数据 |
 | **技术因子** | 内置 MA/EMA/RSI/MACD/布林带/ATR/ADX 等技术指标；横截面因子覆盖全维度 —— 动量/反转/波动/流动性(量价) + 估值/股息/规模/质量/成长(PIT 基本面),支持自定义 |
 | **因子 DSL（防前视）** | 声明式因子表达式（`Ref/Mean/Std/Sum/Max/Min/Log` + OHLCV/换手率，及按公告日 PIT 合并的基本面字段 pe/pe_ttm/pb/ps/ps_ttm/total_mv/circ_mv/dv_ratio/roe/netprofit_yoy/revenue_yoy）；结构上禁止引用未来数据，安全白名单解析（无 `eval`） |

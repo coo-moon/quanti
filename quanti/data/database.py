@@ -1194,6 +1194,46 @@ class Database:
         except (ValueError, TypeError):
             return None
 
+    def latest_quote_dates(self, codes: list[str]) -> dict[str, date | None]:
+        """Latest daily-bar date per code, one bulk query. Codes with no
+        bars at all map to None — the caller decides whether that's a gap
+        or a not-yet-synced name. Bounded for the doctor's freshness check;
+        for very large universes prefer chunking (the query itself is a
+        single GROUP BY, cheap even on the full market)."""
+        out: dict[str, date | None] = {c: None for c in codes}
+        if not codes:
+            return out
+        placeholders = ",".join("?" for _ in codes)
+        rows = self.conn.execute(
+            f"SELECT code, MAX(date) FROM daily_quotes "
+            f"WHERE code IN ({placeholders}) GROUP BY code",
+            tuple(codes),
+        ).fetchall()
+        for code, max_date in rows:
+            if max_date:
+                try:
+                    out[code] = date.fromisoformat(max_date)
+                except ValueError:
+                    pass
+        return out
+
+    def integrity_check(self) -> dict[str, str]:
+        """PRAGMA quick_check on every attached schema. Returns {schema:
+        result}; a healthy schema reports "ok". Cost scales with file size —
+        the full-market DB takes seconds; callers should treat this as a
+        maintenance operation, not a per-tick check."""
+        schemas = ["main"]
+        if self._market_db_path:
+            schemas.append("market")
+        out: dict[str, str] = {}
+        for schema in schemas:
+            # schema is an internal literal ("main"/"market"), never user
+            # input — PRAGMA can't bind params, so it's interpolated.
+            rows = self.conn.execute(
+                f"PRAGMA {schema}.quick_check").fetchall()
+            out[schema] = str(rows[0][0]) if rows else "(no result)"
+        return out
+
     # --- Trade calendar ---
 
     def save_trade_calendar(self, dates: list[date]) -> None:

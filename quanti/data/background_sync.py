@@ -56,6 +56,10 @@ MARKET_CLOSE_GRACE = dtime(15, 30)
 #: 先把当日全市场日线补齐(15:30 后陆续到位),快照才读得到今天的收盘数据。
 REGIME_RUN_AT = dtime(17, 30)
 
+#: 每日 doctor 体检的触发时刻,晚于 regime 快照(17:30)——体检的数据新鲜度
+#: 检查需要当日全市场日线已落地,排在其后跑结果才有意义。
+DOCTOR_RUN_AT = dtime(17, 45)
+
 
 def expected_latest_bar(now: datetime) -> date:
     """The most recent calendar date whose daily bar should exist upstream.
@@ -166,6 +170,7 @@ class BackgroundQuoteSyncer:
         financials_fn=None,  # () -> int; runs once/day if set (None = off, tests)
         mining_fn=None,      # () -> int; runs once/day if set (None = off, tests)
         regime_fn=None,      # () -> Any; runs once/day AFTER REGIME_RUN_AT
+        doctor_fn=None,      # () -> dict; runs once/day AFTER DOCTOR_RUN_AT
     ) -> None:
         self._db = db
         self._cfg = config or BackgroundSyncConfig()
@@ -178,6 +183,8 @@ class BackgroundQuoteSyncer:
         self._regime_fn = regime_fn
         self._last_regime_day = None  # date of the last regime snapshot
         self._regime_retry_at = None  # datetime; set when the day's data was thin
+        self._doctor_fn = doctor_fn
+        self._last_doctor_day = None  # date of the last doctor run
 
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
@@ -364,6 +371,29 @@ class BackgroundQuoteSyncer:
         except Exception as e:  # noqa: BLE001 - optional; never kills the loop
             logger.warning("bg-sync regime snapshot failed: %s", e)
 
+    def _maybe_run_doctor(self) -> None:
+        """Daily doctor, once per calendar day and only after DOCTOR_RUN_AT
+        (17:45) — after the regime snapshot and after the close sweep has
+        topped up today's bars, so the freshness check compares against the
+        day that should now be complete. Off (no-op) when no doctor_fn was
+        provided — e.g. tests."""
+        if self._doctor_fn is None:
+            return
+        now = self._now()
+        if now.time() < DOCTOR_RUN_AT:
+            return
+        today = now.date()
+        if self._last_doctor_day == today:
+            return
+        self._last_doctor_day = today  # set first → a failure won't retry till tomorrow
+        try:
+            report = self._doctor_fn()
+            if isinstance(report, dict) and not report.get("ok"):
+                logger.warning("bg-sync doctor: problems found — %s",
+                               report.get("checks", {}))
+        except Exception as e:  # noqa: BLE001 - optional; never kills the loop
+            logger.warning("bg-sync doctor failed: %s", e)
+
     # ----------------- main loop -----------------
 
     def _loop(self) -> None:
@@ -379,6 +409,7 @@ class BackgroundQuoteSyncer:
             self._maybe_sync_financials()
             self._maybe_mine_factors()
             self._maybe_run_regime()
+            self._maybe_run_doctor()
 
             # Build the source adapter per loop so a UI source/token change
             # applies without a restart. Misconfig (e.g. tushare, no token — no

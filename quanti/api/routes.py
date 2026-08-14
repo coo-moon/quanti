@@ -973,7 +973,7 @@ async def get_portfolio(request: Request):
 
 
 @router.get("/agent/live-status")
-async def live_status(request: Request):
+async def agent_live_status(request: Request):
     """Live status card: intraday-guard daemon state + per-holding stop price
     (买入价/当前价/止损价). Stop price is computed server-side from the risk
     config + ATR ratios: avg_cost·(1+max(floor, -k·ATRratio))."""
@@ -1258,7 +1258,33 @@ async def agent_status(request: Request):
         "last_evaluations": s.last_evaluations,
         "total_value": s.total_value, "pnl_pct": s.pnl_pct,
         "pending_orders": pending_count,
+        "degraded_exits": s.degraded_exits,
     }
+
+
+@router.get("/doctor")
+async def system_doctor(request: Request, codes: str | None = None):
+    """Doctor report: exit coverage + data freshness + DB integrity. The
+    integrity scan reads both SQLite files (seconds on the full market DB),
+    so results are cached for 10 minutes. Optional `codes` (comma-separated)
+    narrows the freshness scan; default scans every stock."""
+    import time
+
+    from quanti.health import run_doctor
+    cache = getattr(request.app.state, "health_cache", None)
+    now = time.monotonic()
+    if cache is not None and now - cache[0] < 600.0:
+        return cache[1]
+    code_list = None
+    if codes:
+        code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    report = run_doctor(
+        request.app.state.db,
+        strategies_dir=request.app.state.strategies_dir,
+        codes=code_list,
+    )
+    request.app.state.health_cache = (now, report)
+    return report
 
 
 @router.get("/agent/decisions")
