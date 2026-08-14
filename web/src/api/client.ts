@@ -48,6 +48,11 @@ export interface BacktestResult {
   trades: TradeRecord[];
   equity_curve: Record<string, number>;
   warning: string;
+  // Portfolio circuit breaker: after halted_at the engine stopped trading —
+  // the equity tail is cash/remnant drift, not the strategy.
+  halted: boolean;
+  halted_at: string | null;
+  halted_reason: string;
 }
 
 export interface ServerMeta {

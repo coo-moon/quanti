@@ -62,6 +62,14 @@ class BacktestResult:
     daily_positions: list[dict] = field(default_factory=list)
     skipped_signals: int = 0
     skip_reason: str = ""
+    halted: bool = False
+    """True when the portfolio circuit breaker tripped mid-run. The engine
+    flattens the book and stops generating strategy trades — the equity tail
+    after `halted_at` is cash/remnant drift, NOT the strategy trading.
+    Callers (research scripts, the UI) must not read OOS metrics across the
+    halt as if the strategy were still active."""
+    halted_at: date | None = None
+    halted_reason: str = ""
 
 
 class BacktestEngine:
@@ -141,7 +149,8 @@ class BacktestEngine:
         # trailing take-profit in RiskManager.check_exits.
         peaks: dict[str, float] = {}
         skipped_signals = 0
-        # Signals generated on a bar, waiting to fill at the NEXT bar's open.
+        halted_at: date | None = None  # set when the portfolio breaker trips
+        halted_reason = ""
         # Each: {"signal", "gen_idx", "strategy_name"}.
         pending: list[dict] = []
 
@@ -298,6 +307,10 @@ class BacktestEngine:
                     and self._risk.check_portfolio_stop(
                         portfolio.total_value, peak_equity)):
                 halted = True
+                halted_at = current_date
+                pct = self._risk.config.portfolio_stop_loss_pct
+                halted_reason = (f"组合回撤熔断(阈值 {pct:.0%})"
+                                 if pct else "组合回撤熔断")
                 for hc in list(portfolio.positions):
                     if hc in today_bars:
                         _queue(Signal(stock_code=hc, direction=Direction.SELL,
@@ -355,6 +368,9 @@ class BacktestEngine:
             metrics=metrics,
             skipped_signals=skipped_signals,
             skip_reason=skip_reason,
+            halted=halted_at is not None,
+            halted_at=halted_at,
+            halted_reason=halted_reason,
         )
 
     def _fill_pending(
