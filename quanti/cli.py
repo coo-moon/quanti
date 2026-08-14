@@ -89,6 +89,22 @@ def _cmd_doctor(db, args) -> None:
         sys.exit(1)
 
 
+def _cmd_factor_watch(db, args) -> None:
+    """因子 IC 漂移体检:基线 vs 近期 OOS IC,标记衰减/退役/无快照因子。
+    退出码 1 = 存在需关注的因子(可接告警)。"""
+    import json as _json
+
+    from quanti.agent.factor_watch import format_watch, watch_factor_drift
+    report = watch_factor_drift(db)
+    if getattr(args, "json", False):
+        print(_json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(format_watch(report))
+    if not report.get("ok", True):
+        logger.error("存在需关注的因子(衰减/退役/无快照),详见上方;每日自动重评会持续追踪")
+        sys.exit(1)
+
+
 def _report_periods(years: int) -> list:
     """Quarterly report-period ends (MM-DD ∈ 03-31/06-30/09-30/12-31) within the
     last `years`, up to today — the keys akshare 业绩报表 is fetched by."""
@@ -610,6 +626,12 @@ def main():
     mine_parser.add_argument("--end", type=str, default=None)
     mine_parser.add_argument("--cash", type=float, default=1_000_000)
 
+    # factor-watch
+    fw_parser = subparsers.add_parser("factor-watch",
+                                      help="因子 IC 漂移体检：衰减/退役/无快照")
+    fw_parser.add_argument("--json", action="store_true",
+                           help="输出机器可读 JSON")
+
     # doctor
     doc_parser = subparsers.add_parser("doctor", help="系统体检：退出覆盖/数据新鲜度/DB 完整性")
     doc_parser.add_argument("--codes", type=str, default=None,
@@ -644,6 +666,8 @@ def main():
             cmd_mine_factors(args)
         elif cmd == "doctor":
             _cmd_doctor(_open_db(), args)
+        elif cmd == "factor-watch":
+            _cmd_factor_watch(_open_db(), args)
         else:
             parser.print_help()
     except DataSourceUnavailable as e:

@@ -127,9 +127,28 @@ def create_app(
             from quanti.agent.llm_runtime import build_llm_client
             llm = build_llm_client(params)
         except Exception:  # noqa: BLE001 - no/invalid LLM key → re-score only
-            return len(rescored)
-        mined = factor_miner.mine_factors(
-            llm, db, provider, codes, today, n_candidates=12)
+            mined = []
+        else:
+            mined = factor_miner.mine_factors(
+                llm, db, provider, codes, today, n_candidates=12)
+        # IC drift watch: an edge that dies slowly must not linger silently —
+        # decay / gate-retirement / unmonitored factors land in the decision
+        # log (Web Agent page) for the operator and the judge LLM to see.
+        from quanti.agent.factor_watch import watch_factor_drift
+        watch = watch_factor_drift(db)
+        problems = ((watch.get("decayed") or []) + (watch.get("newly_rejected") or []))
+        unmonitored = watch.get("unmonitored") or []
+        if problems or unmonitored:
+            bits = []
+            if problems:
+                bits.append("衰减/退役: " + ", ".join(problems))
+            if unmonitored:
+                bits.append("无快照(靠信仰交易): " + ", ".join(unmonitored))
+            db.log_decision(
+                "factor_watch", "因子漂移需关注: " + " | ".join(bits),
+                details={k: watch.get(k) for k in
+                         ("decayed", "newly_rejected", "newly_accepted",
+                          "unmonitored", "as_of")})
         return len(rescored) + len(mined)
 
     # Once/day after 17:30 (market closed, bars topped up), snapshot the market
