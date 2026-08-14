@@ -180,10 +180,28 @@ def create_app(
             db.log_decision("doctor_ok", "每日体检通过", details=report)
         return report
 
+    # Once/day after the doctor: the strategy health gate — a 2-year backtest
+    # per loadable strategy under DEFAULT risk. Verdicts land in strategy_gate;
+    # breaker/deep_loss strategies are excluded from the selector, so the
+    # walk-forward can never re-admit an account-killer (2026-08-14 erratum:
+    # every built-in strategy tripped -30% within 1-2 years). Read-only.
+    def _daily_strategy_gate() -> dict:
+        from quanti.agent.strategy_gate import compute_gate
+        report = compute_gate(db, provider, strategies_dir=strategies_dir)
+        excluded = [f"{name}({g.get('verdict')})"
+                    for name, g in report.items()
+                    if g.get("verdict") in ("breaker", "deep_loss")]
+        if excluded:
+            db.log_decision(
+                "strategy_gate", "策略闸门剔除: " + ", ".join(excluded),
+                details=report)
+        return report
+
     bg_sync = BackgroundQuoteSyncer(db=db, financials_fn=_sync_latest_financials,
                                     mining_fn=_auto_mine_factors,
                                     regime_fn=_daily_regime,
-                                    doctor_fn=_daily_doctor)
+                                    doctor_fn=_daily_doctor,
+                                    strategy_gate_fn=_daily_strategy_gate)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):

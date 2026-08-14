@@ -20,6 +20,7 @@ quanti <子命令> [参数]
 | [`mine-factors`](#mine-factors--llm-因子挖掘) | LLM 因子挖掘 |
 | [`doctor`](#doctor--系统体检) | 系统体检:退出覆盖/数据新鲜度/DB 完整性 |
 | [`factor-watch`](#factor-watch--因子-ic-漂移体检) | 因子 IC 漂移体检:衰减/退役/无快照 |
+| [`strategy-gate`](#strategy-gate--策略健康闸门) | 策略健康闸门:长窗回测剔除熔断/深亏策略 |
 | [`mcp`](#mcp--mcp-server) | 启动 MCP server(stdio,供 OpenClaw/Claude Desktop 接入) |
 
 ---
@@ -277,6 +278,18 @@ quanti doctor --codes 000001,600519  # 只体检指定代码的数据
 ```bash
 quanti factor-watch        # 人类可读
 quanti factor-watch --json # 机器可读
+```
+
+---
+
+## `strategy-gate` — 策略健康闸门
+
+每个可加载策略跑 2 年长窗回测(默认风险:ATR 止损 + 组合熔断):触发 -30% 熔断 → 「breaker」剔除;无熔断但年化夏普 < 阈值(默认 -0.5)→ 「deep_loss」剔除;其余「pass」。判定写入 `strategy_gate` 表,**走查选股器将不再选用被剔除策略**(2026-08-14 勘误的机制化:短窗 OOS 夏普看不出组合级杀手,长窗熔断判定才看得见)。每日后台自动跑,剔除事件落决策日志;退出码 1 = 存在剔除。
+
+```bash
+quanti strategy-gate              # 人类可读
+quanti strategy-gate --json       # 机器可读
+quanti strategy-gate --lookback-days 365 --threshold -0.3
 ```
 
 ---

@@ -69,6 +69,28 @@ def _cmd_clear(db, args) -> None:
         logger.info("以上为预演;确认无误后加 --yes 实际执行")
 
 
+def _cmd_strategy_gate(db, args) -> None:
+    """策略健康闸门:每个策略跑 2 年长窗回测(默认风险),熔断/深亏策略标记为
+    剔除并写入 strategy_gate,走查选股器将不再选用它们。退出码 1 = 存在剔除。"""
+    import json as _json
+
+    from quanti.agent.strategy_gate import compute_gate, format_gate
+    from quanti.data.provider import DataProvider
+    report = compute_gate(db, DataProvider(db), strategies_dir="strategies",
+                          lookback_days=args.lookback_days,
+                          sharpe_threshold=args.threshold,
+                          max_codes=args.max_codes)
+    if getattr(args, "json", False):
+        print(_json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(format_gate(report))
+    excluded = [n for n, g in report.items()
+                if g.get("verdict") in ("breaker", "deep_loss")]
+    if excluded:
+        logger.error("被闸门剔除: %s(走查选股器将不再选用)", ", ".join(excluded))
+        sys.exit(1)
+
+
 def _cmd_doctor(db, args) -> None:
     """One-shot system health check: exit coverage + data freshness + DB
     integrity. Human-readable by default (--json for machines); exits 1 when
@@ -632,6 +654,17 @@ def main():
     fw_parser.add_argument("--json", action="store_true",
                            help="输出机器可读 JSON")
 
+    # strategy-gate
+    sg_parser = subparsers.add_parser("strategy-gate",
+                                      help="策略健康闸门：长窗回测剔除熔断/深亏策略")
+    sg_parser.add_argument("--lookback-days", dest="lookback_days", type=int,
+                           default=730)
+    sg_parser.add_argument("--threshold", type=float, default=-0.5,
+                           help="年化夏普剔除阈值")
+    sg_parser.add_argument("--max-codes", dest="max_codes", type=int,
+                           default=100)
+    sg_parser.add_argument("--json", action="store_true")
+
     # doctor
     doc_parser = subparsers.add_parser("doctor", help="系统体检：退出覆盖/数据新鲜度/DB 完整性")
     doc_parser.add_argument("--codes", type=str, default=None,
@@ -668,6 +701,8 @@ def main():
             _cmd_doctor(_open_db(), args)
         elif cmd == "factor-watch":
             _cmd_factor_watch(_open_db(), args)
+        elif cmd == "strategy-gate":
+            _cmd_strategy_gate(_open_db(), args)
         else:
             parser.print_help()
     except DataSourceUnavailable as e:

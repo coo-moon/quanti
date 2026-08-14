@@ -171,6 +171,7 @@ class BackgroundQuoteSyncer:
         mining_fn=None,      # () -> int; runs once/day if set (None = off, tests)
         regime_fn=None,      # () -> Any; runs once/day AFTER REGIME_RUN_AT
         doctor_fn=None,      # () -> dict; runs once/day AFTER DOCTOR_RUN_AT
+        strategy_gate_fn=None,  # () -> dict; strategy health gate, same cadence
     ) -> None:
         self._db = db
         self._cfg = config or BackgroundSyncConfig()
@@ -185,6 +186,8 @@ class BackgroundQuoteSyncer:
         self._regime_retry_at = None  # datetime; set when the day's data was thin
         self._doctor_fn = doctor_fn
         self._last_doctor_day = None  # date of the last doctor run
+        self._gate_fn = strategy_gate_fn
+        self._last_gate_day = None  # date of the last strategy-gate run
 
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
@@ -394,6 +397,27 @@ class BackgroundQuoteSyncer:
         except Exception as e:  # noqa: BLE001 - optional; never kills the loop
             logger.warning("bg-sync doctor failed: %s", e)
 
+    def _maybe_run_strategy_gate(self) -> None:
+        """Daily strategy health gate, same cadence as the doctor: once per
+        calendar day after DOCTOR_RUN_AT (post-close, bars topped up). Off
+        (no-op) when no strategy_gate_fn was provided — e.g. tests."""
+        if self._gate_fn is None:
+            return
+        now = self._now()
+        if now.time() < DOCTOR_RUN_AT:
+            return
+        today = now.date()
+        if self._last_gate_day == today:
+            return
+        self._last_gate_day = today  # set first → a failure won't retry till tomorrow
+        try:
+            report = self._gate_fn()
+            if isinstance(report, dict) and report:
+                logger.info("bg-sync strategy gate: %s",
+                            {k: v.get("verdict") for k, v in report.items()})
+        except Exception as e:  # noqa: BLE001 - optional; never kills the loop
+            logger.warning("bg-sync strategy gate failed: %s", e)
+
     # ----------------- main loop -----------------
 
     def _loop(self) -> None:
@@ -410,6 +434,7 @@ class BackgroundQuoteSyncer:
             self._maybe_mine_factors()
             self._maybe_run_regime()
             self._maybe_run_doctor()
+            self._maybe_run_strategy_gate()
 
             # Build the source adapter per loop so a UI source/token change
             # applies without a restart. Misconfig (e.g. tushare, no token — no
