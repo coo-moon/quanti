@@ -24,6 +24,25 @@ _DIST_DIR = _PROJECT_ROOT / "web" / "dist"
 
 logger = logging.getLogger(__name__)
 
+# Deadlock/postmortem observability: when QUANTI_STACK_DUMP=1 the server
+# registers a SIGUSR1 handler that dumps EVERY thread's Python stack (with
+# exception chains) to stderr — the launchd error log. Trigger it any time
+# with `kill -USR1 <pid>`; nothing is dumped unless the signal arrives, so
+# the knob is free to leave ON in supervised deployments.
+def _register_stack_dump() -> None:
+    import faulthandler
+    import os
+    import signal
+
+    if os.environ.get("QUANTI_STACK_DUMP") != "1":
+        return
+    faulthandler.register(signal.SIGUSR1, all_threads=True, chain=True)
+    logger.info("stack dump armed: kill -USR1 %s for full-thread tracebacks",
+                os.getpid())
+
+
+_register_stack_dump()
+
 
 class SafeJSONResponse(JSONResponse):
     """响应里的 NaN/±Inf 渲染成 `null`,而不是让整个端点 500。
