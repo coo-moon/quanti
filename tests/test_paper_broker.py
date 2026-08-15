@@ -493,6 +493,79 @@ def test_intraday_crash_triggers_stop_via_check_exits(setup, monkeypatch):
     assert db.list_orders(limit=10, status="pending") == []
 
 
+# ------------------------------------ llm_full 盘中实时买入 (live-mirror BUY)
+
+def test_llm_managed_buy_fills_now_in_session(setup, monkeypatch):
+    """llm_full 盘中 tick 的买单:盘中有实时报价且未涨停锁板 → 立即按
+    实时价(+滑点)成交,不排队等次日开盘。"""
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
+    quote = raw_close * 1.02  # +2%:盘中正常波动,未触 +10% 涨停
+    broker = _mk_broker(db, provider, lambda codes: {"000001": quote})
+    broker.llm_managed = True
+    _in_session(monkeypatch, True)
+    status, reason = broker._submit_one(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="LLM 盘中买入"), "llm_full")
+    assert status == "filled", reason
+    pos = {p["code"]: p for p in db.list_positions()}
+    assert pos["000001"]["quantity"] >= 100
+    assert pos["000001"]["avg_cost"] == pytest.approx(quote * 1.001, rel=1e-4)
+
+
+def test_llm_managed_buy_slippage_capped_at_half_percent(setup, monkeypatch):
+    """构造时 slippage=1% 被硬钳到 0.5%:即时成交价 = 实时价 × 1.005,
+    纸面账户永远不会记出超过半个点的滑点(契约由 MAX_FILL_SLIPPAGE 单点强制)。"""
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
+    quote = raw_close * 1.02
+    broker = PaperBroker(db, provider, initial_cash=200_000,
+                         fill_mode="pending", slippage=0.01,
+                         realtime_quote_fn=lambda codes: {"000001": quote})
+    assert broker._slippage == 0.005
+    broker.llm_managed = True
+    _in_session(monkeypatch, True)
+    status, reason = broker._submit_one(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="test"), "llm_full")
+    assert status == "filled", reason
+    assert db.list_positions()[0]["avg_cost"] == pytest.approx(
+        quote * 1.005, rel=1e-4)
+
+
+def test_llm_managed_buy_falls_back_to_queue_without_quote(setup, monkeypatch):
+    """无实时报价(盘外/源故障/停牌)→ 照旧排队次日开盘成交——腾讯源
+    无 SLA,即时路径的回退必须保留,不能把订单丢掉。"""
+    db, provider, _ = setup
+    broker = _mk_broker(db, provider, lambda codes: {})  # 无报价
+    broker.llm_managed = True
+    _in_session(monkeypatch, True)
+    status, _reason = broker._submit_one(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="test"), "llm_full")
+    assert status == "pending"
+    assert db.list_positions() == []
+
+
+def test_llm_managed_buy_at_limit_up_queues(setup, monkeypatch):
+    """涨停锁板(实时价已顶到 +10%)买不进——保持挂单而不是假装成交,
+    锁板期间按 TTL 每个交易日重试。"""
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
+    quote = raw_close * 1.10  # 顶板
+    broker = _mk_broker(db, provider, lambda codes: {"000001": quote})
+    broker.llm_managed = True
+    _in_session(monkeypatch, True)
+    status, _reason = broker._submit_one(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="test"), "llm_full")
+    assert status == "pending"
+    assert db.list_positions() == []
+
+
 def test_no_quote_fn_keeps_legacy_marks(setup):
     """Default construction (tests/backtests) never touches realtime marks."""
     db, _, broker = setup

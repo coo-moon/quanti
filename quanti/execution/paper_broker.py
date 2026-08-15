@@ -12,7 +12,14 @@ Two fill modes:
     that price, exactly like a live market sell (see execute_signal_ex);
     T+1 still holds — a wholly-frozen holding falls back to the queue,
     and a partially-frozen one fills its settled shares now with the
-    frozen remainder re-queued for the next open (_sell_now).
+    frozen remainder re-queued for the next open (_sell_now). Same for
+    an in-session BUY in LLM 全权模式 (`llm_managed=True`): a realtime
+    quote + not limit-up locked → fills NOW at the mark, so the LLM tick's
+    orders don't wait for the next open; no quote / off-session / locked
+    board falls back to the queue (Tencent has no SLA — the fallback must
+    stay). "确保成交" ends at market physics: 涨停/跌停锁板、停牌、T+1
+    cannot be filled by any architecture; those orders rest in the queue
+    and retry per bar within the TTL instead of pretending to fill.
 
   * `fill_mode="immediate"` (legacy): each signal fills synchronously
     against the most-recent close price. Kept for the backtest engine,
@@ -20,6 +27,11 @@ Two fill modes:
 
 All A-share rules (T+1, 100-share lots, commission, stamp tax) are honored
 in both modes; the difference is *when* and at *what price* the fill happens.
+
+Slippage contract: every fill (queued or live-mirror) prices off
+`slippage`, hard-capped at MAX_FILL_SLIPPAGE (0.5%) at construction — the
+paper account never books a fill worse than half a percent from the
+reference price, whatever the operator configures.
 """
 
 from __future__ import annotations
@@ -61,6 +73,12 @@ from quanti.utils.market import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 纸面成交的滑点硬上限(0.5%):无论构造参数给多少,任何成交价格偏离
+# 参考价(实时 mark / 次日开盘价)不超过半个百分点——「盘中即时成交、
+# 滑点 ≤0.5%」的契约由这里单点强制,而不是散在各 fill 分支的巧合。
+# QMT 实盘不受此约束(qmt_broker 的 slippage 是下单限价偏移,不是成交模型)。
+MAX_FILL_SLIPPAGE = 0.005
 
 
 class PaperBroker:
@@ -109,7 +127,12 @@ class PaperBroker:
         self._db = db
         self._provider = provider
         self._commission = commission or AShareCommission()
-        self._slippage = slippage
+        self._slippage = min(float(slippage), MAX_FILL_SLIPPAGE)
+        if float(slippage) > MAX_FILL_SLIPPAGE:
+            logger.warning(
+                "slippage %.3f > cap %.3f — clamped; fills never exceed "
+                "MAX_FILL_SLIPPAGE from the reference price",
+                float(slippage), MAX_FILL_SLIPPAGE)
         self._risk = RiskManager(risk_config)
         from quanti.risk.protections import ProtectionConfig, ProtectionManager
         self._protections = ProtectionManager(
