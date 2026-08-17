@@ -418,6 +418,40 @@ class TestStaleDataGate:
         assert result["ok"] is True
         db.close()
 
+    def test_intraday_missing_today_bar_does_not_block(self, tmp_path):
+        """交易日盘中的回归钉子(2026-08-17 实发):日历含今天、bar 只到上一
+        交易日(今天的要收盘 sweep 后才有)——不许误判全宇宙陈旧。参照日
+        必须是昨天,不是今天。"""
+        db = Database(str(tmp_path / "gate.db"))
+        db.initialize()
+        today = pd.Timestamp.today().normalize()
+        cal = pd.bdate_range(end=today, periods=10)
+        db.save_trade_calendar([d.date() for d in cal])
+        # bar 严格截止到今天之前的最后一个交易日(周一盘中 → 上周五)
+        last_done = [d for d in cal if d < today][-1]
+        for i in range(3):
+            code = f"10000{i}"
+            db.upsert_stock(code, f"股票{i}", "SZ", date(2000, 1, 1), "行业")
+            dates = pd.bdate_range(end=last_done, periods=30)
+            px = 10 + np.arange(len(dates)) * 0.01
+            db.save_daily_quotes(pd.DataFrame({
+                "code": code, "date": [d.date() for d in dates],
+                "open": px, "high": px + 0.1, "low": px - 0.1, "close": px,
+                "volume": np.full(len(dates), 1e6), "amount": px * 1e6,
+                "turnover": np.ones(len(dates)),
+            }))
+        provider = DataProvider(db)
+        broker = PaperBroker(db, provider)
+        agent = AgentRuntime(db, provider, broker,
+                             strategies_dir="strategies",
+                             screeners_dir="screeners")
+        save_goal(db, Goal(strategy_name="ma_cross",
+                           target_annual_return=0.15))
+        agent.tick()
+        kinds = {d["kind"] for d in db.list_decisions(limit=30)}
+        assert "stale_data_skip" not in kinds
+        db.close()
+
 
 class TestBulkFreshness:
     """_ensure_recent_data must use ONE bulk freshness query — the per-code
@@ -477,4 +511,3 @@ class TestBulkFreshness:
         agent._ensure_recent_data(["000001", "000002", "000003"])
         assert calls["bars"] == 0  # the bulk path never calls per-code bars
         assert synced == ["000003"]  # only the stale code is refreshed
-

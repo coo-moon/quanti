@@ -1322,9 +1322,17 @@ class AgentRuntime:
         # 一只没同步过的票不该锁死整个 agent。只拦新信号:持仓离场/止损/熔断
         # 在 tick 开头与盘中守护里已照常跑(H2 教训:数据问题绝不能顺带禁用
         # 止损)。kind 在告警白名单,配了 webhook 会推人。
+        #
+        # 参照日必须是「昨天」而非今天:交易日盘中今天的 bar 要收盘 sweep
+        # (15:30)后才存在,拿今天当 expected 会在周一盘中把全宇宙判成
+        # 落后 3 个日历日(跨周末)→ 全员「陈旧」误拦(2026-08-17 实发)。
+        # doctor 17:45 跑所以可以拿今天;本闸跑在盘中,只对「昨天该有的
+        # bar」问责——代价是收盘后当天的陈旧要到次日才拦,系统性多日
+        # 陈旧(源挂掉)仍然逃不掉,当天的口子由 doctor 告警补上。
         try:
             from quanti.health import data_freshness
-            fresh = data_freshness(self._db, codes=universe)
+            fresh = data_freshness(self._db, codes=universe,
+                                   today=date.today() - timedelta(days=1))
             n_bad = int(fresh.get("missing", 0)) + int(fresh.get("stale", 0))
             total = int(fresh.get("total", 0))
             if total > 0 and n_bad >= 2 and n_bad / total >= 0.20:
