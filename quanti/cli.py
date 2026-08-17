@@ -374,12 +374,34 @@ def cmd_optimize(args):
     db.close()
 
 
+def _preflight_port(host: str, port: int) -> None:
+    """uvicorn 是先跑 lifespan(启动后台同步、按 goal 自动拉起 agent、写
+    agent_start 决策)之后才 bind 端口——端口被占时这些副作用已经发生。
+    launchd KeepAlive 每 ~10s 拉一次,曾在 3 天里往 paper.db 刷了 4000+ 条
+    agent_start(2026-08-17 实发)。在构建 app 之前先探一次端口,占用就
+    fail-fast,让 crash-loop 至少是零副作用的。非原子(探完到真 bind 有
+    窗口),目的只是挡长期循环污染,不是抢锁。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((host, port))
+    except OSError as e:
+        raise SystemExit(
+            f"端口 {host}:{port} 已被占用({e})——已有另一个 quanti serve 在跑?"
+            f"用 `lsof -nP -iTCP:{port} -sTCP:LISTEN` 查看占用进程;"
+            "若是 launchd 服务与手动实例冲突,二选一。") from e
+    finally:
+        s.close()
+
+
 def cmd_serve(args):
     """Start the web server only."""
     import uvicorn
 
     from quanti.api.app import create_app
 
+    _preflight_port(args.host, args.port)
     app = create_app(initial_cash=args.cash, autostart_agent=False)
     uvicorn.run(app, host=args.host, port=args.port)
 
@@ -437,6 +459,7 @@ def cmd_up(args):
                 f"agent={'on' if goal.enabled else 'off'}")
     logger.info(f"启动服务 → http://{args.host}:{args.port}")
 
+    _preflight_port(args.host, args.port)
     app = create_app(initial_cash=args.cash,
                      autostart_agent=goal.enabled)
     uvicorn.run(app, host=args.host, port=args.port)
