@@ -610,6 +610,17 @@ export const testAlertConfig = (webhookUrl: string) =>
 export const saveAlertConfig = (webhookUrl: string) =>
   api.post<{ ok: boolean }>("/config/alert", { webhook_url: webhookUrl });
 
+// --- LLM API key config (never echoes the key back) ---
+export interface LlmKeyConfig {
+  env_var: string;
+  env_set: boolean;
+  db_set: boolean;
+}
+
+export const fetchLlmKeyConfig = () => api.get<LlmKeyConfig>("/config/llm-key");
+export const saveLlmKeyConfig = (apiKey: string) =>
+  api.post<{ ok: boolean }>("/config/llm-key", { api_key: apiKey });
+
 export default api;
 
 

@@ -146,6 +146,30 @@ class LLMClient(Protocol):
         ...
 
 
+def hydrate_llm_env(db) -> None:
+    """把 DB 落库的 LLM key 注入进程 env(env 已设则绝不覆盖)。
+
+    手动 `quanti serve` 形态下 key 依赖交互 shell 的 export,换进程重启
+    就丢(2026-08-18 实发:llm_full 整天「LLM 不可用」)。key 落 app_config
+    后,server/CLI 启动时注入一次,build_llm_client 及所有下游零改动。
+    按 goal.llm_provider 决定注入哪个变量;供应商切换后由配置端点重新
+    注入(见 /config/llm-key)。任何失败都退回 env-only 行为,不许炸启动。
+    """
+    import os
+    try:
+        key = db.get_llm_api_key()
+        if not key:
+            return
+        from quanti.agent.goal import load_goal
+        provider = str((load_goal(db).params or {}).get(
+            "llm_provider", "anthropic")).lower()
+        var = ("DEEPSEEK_API_KEY" if provider in ("deepseek", "openai_compat")
+               else "ANTHROPIC_API_KEY")
+        os.environ.setdefault(var, key)
+    except Exception:  # noqa: BLE001 - 注入失败退回 env-only
+        logger.warning("hydrate_llm_env failed", exc_info=True)
+
+
 def build_llm_client(params: dict) -> LLMClient:
     """Build an LLM client from goal params.
 

@@ -87,6 +87,10 @@ def create_app(
         # data/market.db. Real money never shares a file with paper.
         db = Database(f"data/{account}.db", market_db_path="data/market.db")
         db.initialize()
+    # DB 落库的 LLM key 注入 env(env 已设不覆盖)——手动 serve 重启不再
+    # 依赖交互 shell 的 export(2026-08-18 实发教训)。
+    from quanti.agent.llm_runtime import hydrate_llm_env
+    hydrate_llm_env(db)
     provider = provider or DataProvider(db)
     # Broker per account: live → QmtBroker(require_live) over qmt-bridge, else
     # PaperBroker. Production paper fill mode is "pending" — signals queue and

@@ -293,6 +293,11 @@ class Database:
             # 告警 webhook(飞书/钉钉/企微/Server酱/通用),空 = 通道关闭;
             # env QUANTI_ALERT_WEBHOOK 优先于本列。
             ("app_config", "alert_webhook_url", "TEXT DEFAULT ''"),
+            # LLM API key(DeepSeek/Anthropic,按 goal.llm_provider 使用)。
+            # env(DEEPSEEK_API_KEY/ANTHROPIC_API_KEY)优先;本列是手动
+            # serve 形态的兜底——key 只在交互 shell 里 export 的话,换进程
+            # 重启就丢(2026-08-18 实发,llm_full 整天不可用)。
+            ("app_config", "llm_api_key", "TEXT DEFAULT ''"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -572,6 +577,7 @@ class Database:
                 data_source TEXT NOT NULL DEFAULT 'tushare',
                 data_source_token TEXT DEFAULT '',
                 alert_webhook_url TEXT DEFAULT '',
+                llm_api_key TEXT DEFAULT '',
                 updated_at TEXT NOT NULL
             );
 
@@ -2014,6 +2020,28 @@ class Database:
                 updated_at=excluded.updated_at
             """,
             (data_source, token, now),
+        )
+        self.conn.commit()
+
+    def get_llm_api_key(self) -> str:
+        """LLM API key 落库值(env 优先级在 hydrate_llm_env 解析)。"""
+        row = self.conn.execute(
+            "SELECT llm_api_key FROM app_config WHERE id=1").fetchone()
+        return (row[0] or "") if row else ""
+
+    def set_llm_api_key(self, key: str) -> None:
+        """只写 LLM key 列,不动其他配置。明文存本地 SQLite——与
+        data_source_token 同一接受面(本地单用户工具),绝不经 API 回读。"""
+        from datetime import datetime
+        self.conn.execute(
+            """
+            INSERT INTO app_config (id, llm_api_key, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                llm_api_key=excluded.llm_api_key,
+                updated_at=excluded.updated_at
+            """,
+            ((key or "").strip(), datetime.now().isoformat()),
         )
         self.conn.commit()
 

@@ -891,6 +891,44 @@ async def set_alert_config(body: AlertConfigBody, request: Request):
     return {"ok": True}
 
 
+class LlmKeyBody(BaseModel):
+    api_key: str = ""
+
+
+def _llm_env_var(db) -> str:
+    from quanti.agent.goal import load_goal
+    provider = str((load_goal(db).params or {}).get(
+        "llm_provider", "anthropic")).lower()
+    return ("DEEPSEEK_API_KEY" if provider in ("deepseek", "openai_compat")
+            else "ANTHROPIC_API_KEY")
+
+
+@router.get("/config/llm-key")
+async def get_llm_key_config(request: Request):
+    """LLM key 配置状态。key 同 token 一样绝不回明文。env 优先于 DB 落库值
+    (进程启动时 hydrate_llm_env 只 setdefault,不覆盖 shell 的 export)。"""
+    import os
+    db = request.app.state.db
+    var = _llm_env_var(db)
+    return {
+        "env_var": var,
+        "env_set": bool(os.environ.get(var, "").strip()),
+        "db_set": bool(db.get_llm_api_key()),
+    }
+
+
+@router.post("/config/llm-key")
+async def set_llm_key_config(body: LlmKeyBody, request: Request):
+    """存/清 LLM key(空串 = 清除 DB 值;env 始终优先)。保存后立即注入
+    env,当前进程即刻生效,不用重启。"""
+    from quanti.agent.llm_runtime import hydrate_llm_env
+    db = request.app.state.db
+    db.set_llm_api_key(body.api_key)
+    if body.api_key.strip():
+        hydrate_llm_env(db)
+    return {"ok": True}
+
+
 class RiskControlBody(BaseModel):
     stop_loss_pct: float
     portfolio_stop_loss_pct: float
