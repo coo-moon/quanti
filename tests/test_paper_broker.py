@@ -743,3 +743,80 @@ def test_st_stock_uses_5pct_limit_down_band(setup, monkeypatch):
     assert broker.execute_signal_ex(
         Signal("000001", Direction.SELL, 1.0, "exit"), "t") == "pending"
     assert db.list_positions()[0]["quantity"] == 1000
+
+
+# ------------------------------------- llm_managed 挂单转盘中实时成交
+
+
+def test_llm_pending_buy_converts_when_session_resumes(setup, monkeypatch):
+    """午休下的单(排队时无实时报价)在下午开盘守护扫 pending 时按实时价
+    补成交:老行结转 cancelled、新 filled 行落地、建仓成功。"""
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
+    quote = {"px": 0.0}  # 0 = 午休无报价
+    broker = _mk_broker(db, provider,
+                        lambda codes: ({"000001": quote["px"]} if quote["px"] else {}))
+    broker.llm_managed = True
+    _in_session(monkeypatch, True)
+    status, _r = broker._submit_one(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="LLM 午休买入"), "llm_full")
+    assert status == "pending"  # 无报价 → 排队(问题现场)
+
+    quote["px"] = raw_close * 1.02  # 下午开盘,报价恢复
+    result = broker.try_fill_pending_orders()
+    assert result.filled == 1
+    pos = {p["code"]: p for p in db.list_positions()}
+    assert pos["000001"]["quantity"] >= 100
+    assert pos["000001"]["avg_cost"] == pytest.approx(quote["px"] * 1.001, rel=1e-4)
+    by_status = {}
+    for o in db.list_orders(limit=10):
+        by_status.setdefault(o["status"], []).append(o)
+    assert "转盘中实时成交" in by_status["cancelled"][0]["reason"]
+    assert by_status["filled"][0]["entry_strategy"] == \
+        by_status["cancelled"][0]["entry_strategy"]
+
+
+def test_non_llm_pending_buy_stays_queued(setup, monkeypatch):
+    """非 llm_managed:同样场景零行为变化,老老实实等次日开盘。"""
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": raw_close * 1.02})
+    _in_session(monkeypatch, True)
+    status, _r = broker._queue_pending_signal(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="规则买入"), "ma_cross")
+    assert status is True
+    result = broker.try_fill_pending_orders()
+    assert result.filled == 0
+    assert db.list_positions() == []
+
+
+def test_llm_pending_convert_attempts_once(setup, monkeypatch):
+    """转成交尝试真的走到 _buy_now 却失败(极端高开熔断)→ 只试一次:
+    第二轮守护不再产生新的 rejected 行,订单保持 pending 等次日开盘。"""
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
+    quote = {"px": 0.0}
+    broker = _mk_broker(db, provider,
+                        lambda codes: ({"000001": quote["px"]} if quote["px"] else {}))
+    broker.llm_managed = True
+    _in_session(monkeypatch, True)
+    broker._submit_one(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="test"), "llm_full")
+
+    quote["px"] = raw_close * 1.08  # +8%:未到 +10% 涨停,但 ≥ 熔断阈(默认 10%? 用 config)
+    broker._risk.config.extreme_gap_up_block_pct = 0.05  # 压低熔断阈,确保触发
+    broker.try_fill_pending_orders()
+    n_rejected_1 = len([o for o in db.list_orders(limit=20)
+                        if o["status"] == "rejected"])
+    broker.try_fill_pending_orders()
+    n_rejected_2 = len([o for o in db.list_orders(limit=20)
+                        if o["status"] == "rejected"])
+    assert n_rejected_1 == 1
+    assert n_rejected_2 == n_rejected_1  # 不重复刷
+    assert [o for o in db.list_orders(limit=20) if o["status"] == "pending"]
