@@ -473,6 +473,8 @@ def cmd_agent(args):
     from quanti.execution.factory import make_broker
 
     db = _open_db()
+    from quanti.agent.llm_runtime import hydrate_llm_env
+    hydrate_llm_env(db)  # DB 落库 LLM key 注入 env(env 优先),同 serve
     provider = DataProvider(db)
     # account from env QUANTI_ACCOUNT: live → QmtBroker(require_live), else paper.
     broker = make_broker(db, provider, initial_cash=args.cash, fill_mode="immediate")
@@ -524,6 +526,8 @@ def cmd_mine_factors(args):
     from quanti.data.provider import DataProvider
 
     db = _open_db()
+    from quanti.agent.llm_runtime import hydrate_llm_env
+    hydrate_llm_env(db)  # DB 落库 LLM key 注入 env(env 优先),同 serve
     provider = DataProvider(db)
     goal = load_goal(db)
     params = goal.params or {}

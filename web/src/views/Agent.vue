@@ -292,6 +292,24 @@
               v4-pro 思考更深但更慢更贵,盘中守护(每 5 分钟)用 flash 性价比更高。
               选了对侧供应商的模型 id 时 DeepSeek 会自动回落自家默认。</em>
           </label>
+          <label>
+            <span>API Key({{ llmKeyCfg.env_var }})</span>
+            <input
+              type="password"
+              v-model.trim="llmKeyInput"
+              :placeholder="llmKeyPlaceholder"
+              :disabled="llmKeyBusy"
+            />
+            <span class="adv-llm-key-actions">
+              <button class="btn-small primary" @click="saveLlmKey"
+                      :disabled="llmKeyBusy || !llmKeyInput">保存</button>
+              <button class="btn-small" @click="clearLlmKey"
+                      :disabled="llmKeyBusy || !llmKeyCfg.db_set">清除</button>
+              <span v-if="llmKeyMsg" class="muted">{{ llmKeyMsg }}</span>
+            </span>
+            <em class="muted">落库保存后重启 server 不再依赖 shell 里的
+              export;shell env 已设时始终优先。保存即刻生效,不用重启。</em>
+          </label>
         </div>
         <div class="adv-grid">
           <label class="adv-check">
@@ -796,6 +814,9 @@ import {
   fetchAgentDecisions,
   fetchAgentStatus,
   fetchGoal,
+  fetchLlmKeyConfig,
+  saveLlmKeyConfig,
+  type LlmKeyConfig,
   fetchOrders,
   fetchPendingOrders,
   fetchPortfolio,
@@ -828,6 +849,52 @@ import {
   type ScreenerInfo,
   type StrategyInfo,
 } from "../api/client";
+
+// --- LLM API key(绝不回显明文) ---
+const llmKeyCfg = ref<LlmKeyConfig>({ env_var: "", env_set: false, db_set: false });
+const llmKeyInput = ref("");
+const llmKeyBusy = ref(false);
+const llmKeyMsg = ref("");
+
+const llmKeyPlaceholder = computed(() => {
+  if (llmKeyCfg.value.env_set) return "已由 shell env 提供 ✓(此处留空即可)";
+  if (llmKeyCfg.value.db_set) return "已落库 ✓(留空则不修改)";
+  return "粘贴 API key(将落库,重启不丢)";
+});
+
+async function loadLlmKeyCfg() {
+  try {
+    llmKeyCfg.value = (await fetchLlmKeyConfig()).data;
+  } catch { /* leave defaults */ }
+}
+
+async function saveLlmKey() {
+  if (!llmKeyInput.value) return;
+  llmKeyBusy.value = true;
+  try {
+    await saveLlmKeyConfig(llmKeyInput.value);
+    llmKeyMsg.value = "已保存,即刻生效 ✓";
+    llmKeyInput.value = "";
+    await loadLlmKeyCfg();
+  } catch (e: any) {
+    llmKeyMsg.value = e?.message || "保存失败";
+  } finally {
+    llmKeyBusy.value = false;
+  }
+}
+
+async function clearLlmKey() {
+  llmKeyBusy.value = true;
+  try {
+    await saveLlmKeyConfig("");
+    llmKeyMsg.value = "已清除落库值(env 不受影响)";
+    await loadLlmKeyCfg();
+  } catch (e: any) {
+    llmKeyMsg.value = e?.message || "清除失败";
+  } finally {
+    llmKeyBusy.value = false;
+  }
+}
 
 const goalDraft = reactive<Goal>({
   target_annual_return: 0.2,
@@ -1582,6 +1649,7 @@ onMounted(() => {
   loadTuned();
   loadGenerated();
   loadMaster();
+  loadLlmKeyCfg();
   timer = window.setInterval(loadStatus, 15000);
   clockTimer = window.setInterval(() => (nowTs.value = Date.now()), 20000);
 });
