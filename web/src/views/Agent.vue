@@ -57,11 +57,11 @@
          gone from BOTH strategies/ and strategies/attic lose their strategy
          exit and only keep stop-loss / take-profit. (Attic retirement alone
          no longer degrades exits — replay falls back to the attic.) -->
-    <div class="card degraded-card" v-if="(agent?.degraded_exits?.length ?? 0) > 0">
-      <div class="card-header">
+    <details class="card degraded-card" v-if="(agent?.degraded_exits?.length ?? 0) > 0" :open="isCardOpen('degraded')" @toggle="onCardToggle('degraded', $event)">
+      <summary class="card-header">
         <h2>⚠️ 持仓策略离场降级</h2>
         <span class="stat-label">{{ agent?.degraded_exits?.length }} 个持仓</span>
-      </div>
+      </summary>
       <p class="degraded-desc">
         以下持仓的入场策略已同时不在 strategies/ 与 strategies/attic——策略离场已失效,只剩止损/止盈兜底:
       </p>
@@ -75,11 +75,11 @@
         处理:把策略文件放回 strategies/ 或 strategies/attic/,或平掉这些仓位,或确认可接受仅止损/止盈离场。
         (<code>quanti doctor</code> 会持续体检此项)
       </p>
-    </div>
+    </details>
 
     <!-- Goal editor -->
-    <div class="card">
-      <div class="card-header"><h2>目标设定</h2></div>
+    <details class="card" :open="isCardOpen('goal')" @toggle="onCardToggle('goal', $event)">
+      <summary class="card-header"><h2>目标设定</h2></summary>
       <div class="goal-grid">
         <label>
           <span>目标年化收益</span>
@@ -155,14 +155,14 @@
       <div v-if="message" class="sync-msg" :class="messageError ? 'error' : 'success'">
         {{ message }}
       </div>
-    </div>
+    </details>
 
     <!-- Agent mode + upgrades (P1-P4) -->
-    <div class="card">
-      <div class="card-header">
+    <details class="card" :open="isCardOpen('mode')" @toggle="onCardToggle('mode', $event)">
+      <summary class="card-header">
         <h2>Agent 模式</h2>
         <span class="muted">钉死策略时模式无效 — 钉选优先</span>
-      </div>
+      </summary>
       <div class="mode-presets">
         <button
           type="button"
@@ -362,13 +362,13 @@
           API key;缺 key/SDK 时这些层自动 no-op,不影响其余流程。
         </div>
       </details>
-    </div>
+    </details>
 
     <!-- Live order control: the LAST safety gate before real money.
          Only shown on a live account. A single arm/disarm switch flips
          阶段C(观察) ↔ 阶段D(下单); it gates BUYs only — exits always pass. -->
-    <div class="card live-control" v-if="liveControl && liveControl.is_live">
-      <div class="card-header">
+    <details class="card live-control" v-if="liveControl && liveControl.is_live" :open="isCardOpen('live_control')" @toggle="onCardToggle('live_control', $event)">
+      <summary class="card-header">
         <h2>
           实盘控制
           <span class="live-badge">● 实盘 · {{ liveControl.account }}</span>
@@ -379,7 +379,7 @@
             liveControl.orders_armed ? "已布防 · 放行真钱买入" : "已撤防 · 观察模式"
           }}</span>
         </div>
-      </div>
+      </summary>
 
       <!-- Bridge health (read-only): mirrors the broker→bridge→券商 chain. -->
       <div class="live-gate-row">
@@ -420,11 +420,11 @@
         （bridge <code>orders_allowed</code>）与 <code>QUANTI_LIVE_ACK</code> 同时满足——
         本开关是这几道闸里唯一能在 UI 里实时切换的一道。
       </p>
-    </div>
+    </details>
 
     <!-- Live status: intraday guard + per-holding stop price -->
-    <div class="card" v-if="liveStatus">
-      <div class="card-header">
+    <details class="card" v-if="liveStatus" :open="isCardOpen('live_status')" @toggle="onCardToggle('live_status', $event)">
+      <summary class="card-header">
         <h2>实盘状态</h2>
         <div class="muted">
           守护
@@ -448,7 +448,7 @@
           </span>
           <span v-if="!liveStatus.is_live" class="asof">· 模拟盘(paper)</span>
         </div>
-      </div>
+      </summary>
       <div class="table-wrap" v-if="liveStatus.positions.length > 0">
         <table class="data-table">
           <thead>
@@ -488,11 +488,11 @@
         </table>
       </div>
       <div v-else class="empty">暂无持仓</div>
-    </div>
+    </details>
 
     <!-- Portfolio + positions -->
-    <div class="card">
-      <div class="card-header">
+    <details class="card" :open="isCardOpen('positions')" @toggle="onCardToggle('positions', $event)">
+      <summary class="card-header">
         <h2>当前持仓</h2>
         <div class="muted">
           现金 ¥{{ formatMoney(portfolio?.cash ?? 0) }} / 市值 ¥{{
@@ -500,7 +500,7 @@
           }}
           <span v-if="portfolio?.snapshot_date" class="asof">· 净值截至 {{ portfolio.snapshot_date }}</span>
         </div>
-      </div>
+      </summary>
       <div class="table-wrap" v-if="portfolio && portfolio.positions.length > 0">
         <table class="data-table">
         <thead>
@@ -546,14 +546,14 @@
         </table>
       </div>
       <div v-else class="empty">暂无持仓</div>
-    </div>
+    </details>
 
     <!-- Pending orders detail -->
-    <div class="card" v-if="pendingOrders.length > 0">
-      <div class="card-header">
+    <details class="card" v-if="pendingOrders.length > 0" :open="isCardOpen('pending')" @toggle="onCardToggle('pending', $event)">
+      <summary class="card-header">
         <h2>待成交订单 <span class="count-badge">{{ pendingOrders.length }}</span></h2>
         <div class="muted">挂单按 T+1 规则，于预计成交日的{{ fillBasisLabel }}成交</div>
-      </div>
+      </summary>
       <div class="table-wrap">
         <table class="data-table">
         <thead>
@@ -599,14 +599,14 @@
         </tbody>
         </table>
       </div>
-    </div>
+    </details>
 
     <!-- Recent exits -->
-    <div class="card" v-if="recentExits.length > 0">
-      <div class="card-header">
+    <details class="card" v-if="recentExits.length > 0" :open="isCardOpen('exits')" @toggle="onCardToggle('exits', $event)">
+      <summary class="card-header">
         <h2>最近离场</h2>
         <div class="muted">止损 / 移动止盈 / 策略离场 触发的卖出</div>
-      </div>
+      </summary>
       <div class="table-wrap">
         <table class="data-table">
         <thead>
@@ -631,11 +631,11 @@
         </tbody>
         </table>
       </div>
-    </div>
+    </details>
 
     <!-- Manual order -->
-    <div class="card">
-      <div class="card-header"><h2>手动下单</h2></div>
+    <details class="card" :open="isCardOpen('manual')" @toggle="onCardToggle('manual', $event)">
+      <summary class="card-header"><h2>手动下单</h2></summary>
       <div class="manual-row">
         <input v-model="manualCode" placeholder="股票代码 如 600519" />
         <select v-model="manualDirection">
@@ -646,16 +646,16 @@
         <button class="btn-primary" :disabled="busy" @click="placeManual">下单</button>
       </div>
       <div class="muted">strength（0~1）：仅买入有效，作为现金的目标占比</div>
-    </div>
+    </details>
 
     <!-- Hyperopt: parameter optimize card -->
-    <div class="card">
-      <div class="card-header">
+    <details class="card" :open="isCardOpen('optimize')" @toggle="onCardToggle('optimize', $event)">
+      <summary class="card-header">
         <h2>参数优化</h2>
-        <button class="btn-secondary" :disabled="optimizing" @click="startOptimize">
+        <button class="btn-secondary" :disabled="optimizing" @click.prevent.stop="startOptimize">
           {{ optimizing ? `优化中 ${optProgress.current}/${optProgress.total} ${optProgress.strategy}` : "运行优化" }}
         </button>
-      </div>
+      </summary>
       <table v-if="tuned.length">
         <thead><tr><th>策略</th><th>默认 OOS</th><th>调优 OOS</th><th>采纳</th><th>参数</th><th>组合</th><th>时间</th></tr></thead>
         <tbody>
@@ -671,14 +671,14 @@
         </tbody>
       </table>
       <p v-else class="muted">尚未优化。点击"运行优化"在样本外验证各策略参数。</p>
-    </div>
+    </details>
 
     <!-- Last evaluation -->
-    <div class="card" v-if="agent && agent.last_evaluations.length > 0">
-      <div class="card-header">
+    <details class="card" v-if="agent && agent.last_evaluations.length > 0" :open="isCardOpen('evals')" @toggle="onCardToggle('evals', $event)">
+      <summary class="card-header">
         <h2>最近策略评估</h2>
         <div class="muted">选定:<b>{{ displayStrategy(agent.last_strategy) }}</b></div>
-      </div>
+      </summary>
       <p class="muted" style="margin-top:0">
         数字为<b>样本外</b>(walk-forward,真实可信);标
         <span class="count-badge">样本内</span>
@@ -713,19 +713,19 @@
         </tbody>
         </table>
       </div>
-    </div>
+    </details>
 
     <!-- Factor Mining (LLM) -->
-    <div class="card">
-      <div class="card-header">
+    <details class="card" :open="isCardOpen('mine')" @toggle="onCardToggle('mine', $event)">
+      <summary class="card-header">
         <h2>因子挖掘 (LLM)</h2>
-        <button class="btn-secondary" :disabled="mining" @click="startMine">
+        <button class="btn-secondary" :disabled="mining" @click.prevent.stop="startMine">
           {{ mining && !rescoring ? `挖掘中 ${mineProgress.current}/${mineProgress.total}` : "运行挖掘" }}
         </button>
-        <button class="btn-secondary" :disabled="mining" @click="startRescore" title="不调 LLM，按当前数据重算已有因子的 IC 并刷新采纳">
+        <button class="btn-secondary" :disabled="mining" @click.prevent.stop="startRescore" title="不调 LLM，按当前数据重算已有因子的 IC 并刷新采纳">
           {{ rescoring ? `重评中 ${mineProgress.current}/${mineProgress.total}` : "重评已有" }}
         </button>
-      </div>
+      </summary>
       <label class="master-toggle">
         <input type="checkbox" v-model="useGenerated" @change="toggleMaster" />
         本账户实盘启用生成因子（默认关；开启后已采纳且启用的因子参与下单排名）
@@ -755,14 +755,14 @@
         </tbody>
       </table>
       <p v-else class="muted">尚未挖掘。点击"运行挖掘"让 LLM 提因子，IC 闸门筛选后入库。</p>
-    </div>
+    </details>
 
     <!-- LLM 全权模式:tick 全流程时间线(候选→LLM→校验→执行→点位落库) -->
-    <div class="card" v-if="tickFlow.length">
-      <div class="card-header">
+    <details class="card" v-if="tickFlow.length" :open="isCardOpen('tickflow')" @toggle="onCardToggle('tickflow', $event)">
+      <summary class="card-header">
         <h2>LLM tick 流程</h2>
         <div class="muted">每日决策与盘中守护的分阶段执行流(最近 {{ tickFlow.length }} 轮)</div>
-      </div>
+      </summary>
       <div class="tick-flow">
         <div class="tick-group" v-for="g in tickFlow" :key="g.ts">
           <div class="tick-group-head">
@@ -775,14 +775,14 @@
           </div>
         </div>
       </div>
-    </div>
+    </details>
 
     <!-- Decision log -->
-    <div class="card">
-      <div class="card-header">
+    <details class="card" :open="isCardOpen('decisions')" @toggle="onCardToggle('decisions', $event)">
+      <summary class="card-header">
         <h2>决策日志</h2>
-        <button class="btn-link" @click="loadDecisions">刷新</button>
-      </div>
+        <button class="btn-link" @click.prevent.stop="loadDecisions">刷新</button>
+      </summary>
       <div class="decision-list">
         <div class="decision" v-for="d in decisions" :key="d.id" :class="kindClass(d.kind)">
           <div class="decision-meta">
@@ -800,7 +800,7 @@
           </div>
         </div>
       </div>
-    </div>
+    </details>
   </div>
 </template>
 
@@ -849,6 +849,19 @@ import {
   type ScreenerInfo,
   type StrategyInfo,
 } from "../api/client";
+
+// --- 卡片折叠状态(localStorage 持久化,默认展开) ---
+const cardOpen = reactive<Record<string, boolean>>((() => {
+  try { return JSON.parse(localStorage.getItem("agentCardsOpen") || "{}"); }
+  catch { return {}; }
+})());
+function isCardOpen(key: string): boolean {
+  return cardOpen[key] !== false;
+}
+function onCardToggle(key: string, e: Event) {
+  cardOpen[key] = (e.target as HTMLDetailsElement).open;
+  localStorage.setItem("agentCardsOpen", JSON.stringify(cardOpen));
+}
 
 // --- LLM API key(绝不回显明文) ---
 const llmKeyCfg = ref<LlmKeyConfig>({ env_var: "", env_set: false, db_set: false });
@@ -2163,6 +2176,25 @@ onUnmounted(() => {
   background: rgba(0, 0, 0, 0.02);
   border-radius: 8px;
   font-size: 13px;
+}
+details.card > summary.card-header {
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+details.card > summary.card-header::-webkit-details-marker {
+  display: none;
+}
+details.card > summary.card-header > h2::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 12px;
+  color: #94a3b8;
+  transition: transform 0.15s ease;
+}
+details.card[open] > summary.card-header > h2::before {
+  transform: rotate(90deg);
 }
 .advanced summary {
   cursor: pointer;
