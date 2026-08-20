@@ -150,10 +150,6 @@ class PaperBroker:
         # 点位+灾难地板(check_exits 分支)、加仓触发生效(check_llm_adds)、
         # 买入护栏只剩 risk caps(protections 旁路)、盘中 BUY 走实时价即时成交。
         self.llm_managed = False
-        # llm_managed 挂单转实时成交的「每单一次」尝试记录(见
-        # try_fill_pending_orders):失败(资金/熔断)回落 next-open 语义,
-        # 不许守护每 5s 重试刷 rejected 行。进程内存即可——重启多试一次无害。
-        self._rt_convert_attempted: set[str] = set()
         # Idempotent — only writes if no row exists.
         self._db.ensure_portfolio(initial_cash)
 
@@ -549,37 +545,42 @@ class PaperBroker:
         # pending BUY 拿一次实时报价,能成就按当前价转即时成交——全套
         # _buy_now 检查(风控/极端高开熔断/资金/参与率)原样走,涨停锁板
         # 跳过(之后每轮再看,解锁即成)。老 pending 行结转 cancelled 留
-        # 审计;_buy_now 真被尝试过的单只试一次(_rt_convert_attempted),
-        # 失败回落原 next-open 语义。非 llm_managed 模式零行为变化。
+        # 审计。尝试是终局的(用户拍板 2026-08-20):成 = 转即时成交;
+        # 被拒(风控 cap/熔断/资金)= 直接取消挂单——llm_full 每日 tick
+        # 会重新决策,被拒的旧意图留到次日只是僵尸挂单,在 UI 上误导人
+        # (_buy_now 已落 rejected 行 + 决策日志,取消行只是收尾)。
+        # 非 llm_managed 模式零行为变化。
         if self.llm_managed and pending:
-            buys = [o for o in pending
-                    if o["direction"] == "buy"
-                    and o["order_id"] not in self._rt_convert_attempted]
+            buys = [o for o in pending if o["direction"] == "buy"]
             marks = (self._intraday_marks([o["code"] for o in buys])
                      if buys else {})
-            converted: set[str] = set()
+            settled: set[str] = set()
             for o in buys:
                 mark = marks.get(o["code"])
                 if not mark:
-                    continue  # 盘外/无报价/停牌:不算一次尝试,下轮再看
+                    continue  # 盘外/无报价/停牌:等,不是拒
                 if self._limit_up_locked(o["code"], mark):
-                    continue  # 锁板:同样不消耗尝试次数,盘中解锁即转
-                self._rt_convert_attempted.add(o["order_id"])
+                    continue  # 锁板:等,盘中解锁即转
                 sig = Signal(stock_code=o["code"], direction=Direction.BUY,
                              strength=float(o.get("strength") or 1.0),
                              reason=o.get("reason", ""),
                              entry_strategy=o.get("entry_strategy", ""))
-                landed, _why = self._buy_now(
+                landed, why = self._buy_now(
                     sig, o.get("strategy_name", ""), mark)
                 if landed:
                     self._db.update_order_status(
                         o["order_id"], "cancelled",
                         reason="转盘中实时成交(llm_full 即时契约)")
-                    converted.add(o["order_id"])
                     out.filled += 1
-            if converted:
+                else:
+                    self._db.update_order_status(
+                        o["order_id"], "cancelled",
+                        reason=f"转单被拒后取消: {(why or '未成交')[:80]}")
+                    out.rejected += 1
+                settled.add(o["order_id"])
+            if settled:
                 pending = [o for o in pending
-                           if o["order_id"] not in converted]
+                           if o["order_id"] not in settled]
 
         for o in pending:
             created_at = o.get("created_at", "")

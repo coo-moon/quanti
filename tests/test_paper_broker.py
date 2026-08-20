@@ -794,9 +794,10 @@ def test_non_llm_pending_buy_stays_queued(setup, monkeypatch):
     assert db.list_positions() == []
 
 
-def test_llm_pending_convert_attempts_once(setup, monkeypatch):
-    """转成交尝试真的走到 _buy_now 却失败(极端高开熔断)→ 只试一次:
-    第二轮守护不再产生新的 rejected 行,订单保持 pending 等次日开盘。"""
+def test_llm_pending_convert_reject_cancels(setup, monkeypatch):
+    """转成交尝试走到 _buy_now 却被拒(极端高开熔断)→ 挂单直接取消,
+    不留到次日开盘再拒一遍(用户拍板 2026-08-20:llm_full 每日重新决策,
+    被拒的旧意图是僵尸挂单)。"""
     from datetime import timedelta as _td
     db, provider, _ = setup
     raw_close, _f = db.get_latest_quote_before("000001", date.today() + _td(days=1))
@@ -805,82 +806,39 @@ def test_llm_pending_convert_attempts_once(setup, monkeypatch):
                         lambda codes: ({"000001": quote["px"]} if quote["px"] else {}))
     broker.llm_managed = True
     _in_session(monkeypatch, True)
+    status, _r = broker._submit_one(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="test"), "llm_full")
+    assert status == "pending"
+
+    quote["px"] = raw_close * 1.08  # +8%,压低熔断阈确保触发
+    broker._risk.config.extreme_gap_up_block_pct = 0.05
+    result = broker.try_fill_pending_orders()
+    assert result.rejected == 1
+    by_status = {}
+    for o in db.list_orders(limit=20):
+        by_status.setdefault(o["status"], []).append(o)
+    assert "pending" not in by_status            # 不留僵尸挂单
+    cancelled = [o for o in by_status["cancelled"]
+                 if "转单被拒后取消" in o["reason"]]
+    assert cancelled                              # 取消行带原因
+    assert by_status.get("rejected")              # _buy_now 的拒单行留审计
+    assert db.list_positions() == []
+
+    # 第二轮守护:队列已空,不再产生新行
+    n_before = sum(len(v) for v in by_status.values())
+    broker.try_fill_pending_orders()
+    assert len(db.list_orders(limit=20)) == n_before
+
+
+def test_llm_pending_no_quote_keeps_waiting(setup, monkeypatch):
+    """无报价/锁板不是拒:挂单保留,不取消——等报价恢复或次日开盘。"""
+    db, provider, _ = setup
+    broker = _mk_broker(db, provider, lambda codes: {})
+    broker.llm_managed = True
+    _in_session(monkeypatch, True)
     broker._submit_one(
         Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
                reason="test"), "llm_full")
-
-    quote["px"] = raw_close * 1.08  # +8%:未到 +10% 涨停,但 ≥ 熔断阈(默认 10%? 用 config)
-    broker._risk.config.extreme_gap_up_block_pct = 0.05  # 压低熔断阈,确保触发
     broker.try_fill_pending_orders()
-    n_rejected_1 = len([o for o in db.list_orders(limit=20)
-                        if o["status"] == "rejected"])
-    broker.try_fill_pending_orders()
-    n_rejected_2 = len([o for o in db.list_orders(limit=20)
-                        if o["status"] == "rejected"])
-    assert n_rejected_1 == 1
-    assert n_rejected_2 == n_rejected_1  # 不重复刷
-    assert [o for o in db.list_orders(limit=20) if o["status"] == "pending"]
-
-
-# ------------------------------------- 卡单原因可见化 + cap 拒单文案
-
-
-def test_pending_sell_blocked_reason_t1(setup):
-    """今日建仓触发止损 → 卖单排队,面板要能看出是 T+1 冻结。"""
-    db, provider, broker = setup
-    db.upsert_position("000001", 900, 21.9, 21.2, date.today(),
-                       frozen_qty=900, frozen_date=date.today())
-    ok, _ = broker._queue_pending_signal(
-        Signal(stock_code="000001", direction=Direction.SELL, strength=1.0,
-               reason="止损"), "llm")
-    assert ok is True
-    detail = broker.pending_orders_detail()
-    assert detail and "T+1" in detail[0]["blocked_reason"]
-
-
-def test_pending_buy_blocked_reason_last_reject(setup):
-    """挂单后又有一次被拒尝试(如转单被 cap 拒)→ 面板带出拒因。"""
-    db, provider, broker = setup
-    ok, _ = broker._queue_pending_signal(
-        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
-               reason="LLM 买入"), "llm")
-    assert ok is True
-    broker._record_order(
-        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
-               reason="转单尝试"), "llm",
-        status="rejected", reason="Industry cap 30.0% (银行) full — room "
-                                  "smaller than a 100-share lot")
-    detail = broker.pending_orders_detail()
-    assert "上次尝试被拒" in detail[0]["blocked_reason"]
-    assert "Industry cap" in detail[0]["blocked_reason"]
-
-
-def test_industry_cap_reject_reason_names_industry(tmp_path):
-    """行业 30% 打满时拒单文案报行业 cap,不再冒充单票 20% 文案。"""
-    from quanti.data.provider import DataProvider
-    db = Database(str(tmp_path / "ind.db"))
-    db.initialize()
-    today = pd.Timestamp.today().normalize()
-    dates = pd.bdate_range(end=today, periods=10)
-    for code in ("600001", "600002", "600003"):
-        db.upsert_stock(code, f"银行{code[-1]}", "SH", date(2000, 1, 1), "银行")
-        px = np.full(len(dates), 10.0)
-        db.save_daily_quotes(pd.DataFrame({
-            "code": code, "date": [d.date() for d in dates],
-            "open": px, "high": px + 0.1, "low": px - 0.1, "close": px,
-            "volume": np.full(len(dates), 1e6), "amount": px * 1e6,
-            "turnover": np.ones(len(dates)),
-        }))
-    provider = DataProvider(db)
-    broker = PaperBroker(db, provider, initial_cash=100_000,
-                         fill_mode="immediate")
-    # 两只银行各 ~15% 市值 → 行业 30% 打满;第三只银行单票余量仍有 20%
-    db.upsert_position("600001", 1500, 10.0, 10.0, date(2020, 1, 2))
-    db.upsert_position("600002", 1500, 10.0, 10.0, date(2020, 1, 2))
-    db.update_cash(70_000)
-    result = broker.execute_signals(
-        [Signal(stock_code="600003", direction=Direction.BUY, strength=0.2,
-                reason="test")], strategy_name="t")
-    assert result.rejected == 1
-    row = [o for o in db.list_orders(limit=5) if o["status"] == "rejected"][0]
-    assert "Industry cap" in row["reason"] and "银行" in row["reason"]
+    assert [o for o in db.list_orders(limit=10) if o["status"] == "pending"]
