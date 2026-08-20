@@ -820,3 +820,67 @@ def test_llm_pending_convert_attempts_once(setup, monkeypatch):
     assert n_rejected_1 == 1
     assert n_rejected_2 == n_rejected_1  # 不重复刷
     assert [o for o in db.list_orders(limit=20) if o["status"] == "pending"]
+
+
+# ------------------------------------- 卡单原因可见化 + cap 拒单文案
+
+
+def test_pending_sell_blocked_reason_t1(setup):
+    """今日建仓触发止损 → 卖单排队,面板要能看出是 T+1 冻结。"""
+    db, provider, broker = setup
+    db.upsert_position("000001", 900, 21.9, 21.2, date.today(),
+                       frozen_qty=900, frozen_date=date.today())
+    ok, _ = broker._queue_pending_signal(
+        Signal(stock_code="000001", direction=Direction.SELL, strength=1.0,
+               reason="止损"), "llm")
+    assert ok is True
+    detail = broker.pending_orders_detail()
+    assert detail and "T+1" in detail[0]["blocked_reason"]
+
+
+def test_pending_buy_blocked_reason_last_reject(setup):
+    """挂单后又有一次被拒尝试(如转单被 cap 拒)→ 面板带出拒因。"""
+    db, provider, broker = setup
+    ok, _ = broker._queue_pending_signal(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="LLM 买入"), "llm")
+    assert ok is True
+    broker._record_order(
+        Signal(stock_code="000001", direction=Direction.BUY, strength=0.2,
+               reason="转单尝试"), "llm",
+        status="rejected", reason="Industry cap 30.0% (银行) full — room "
+                                  "smaller than a 100-share lot")
+    detail = broker.pending_orders_detail()
+    assert "上次尝试被拒" in detail[0]["blocked_reason"]
+    assert "Industry cap" in detail[0]["blocked_reason"]
+
+
+def test_industry_cap_reject_reason_names_industry(tmp_path):
+    """行业 30% 打满时拒单文案报行业 cap,不再冒充单票 20% 文案。"""
+    from quanti.data.provider import DataProvider
+    db = Database(str(tmp_path / "ind.db"))
+    db.initialize()
+    today = pd.Timestamp.today().normalize()
+    dates = pd.bdate_range(end=today, periods=10)
+    for code in ("600001", "600002", "600003"):
+        db.upsert_stock(code, f"银行{code[-1]}", "SH", date(2000, 1, 1), "银行")
+        px = np.full(len(dates), 10.0)
+        db.save_daily_quotes(pd.DataFrame({
+            "code": code, "date": [d.date() for d in dates],
+            "open": px, "high": px + 0.1, "low": px - 0.1, "close": px,
+            "volume": np.full(len(dates), 1e6), "amount": px * 1e6,
+            "turnover": np.ones(len(dates)),
+        }))
+    provider = DataProvider(db)
+    broker = PaperBroker(db, provider, initial_cash=100_000,
+                         fill_mode="immediate")
+    # 两只银行各 ~15% 市值 → 行业 30% 打满;第三只银行单票余量仍有 20%
+    db.upsert_position("600001", 1500, 10.0, 10.0, date(2020, 1, 2))
+    db.upsert_position("600002", 1500, 10.0, 10.0, date(2020, 1, 2))
+    db.update_cash(70_000)
+    result = broker.execute_signals(
+        [Signal(stock_code="600003", direction=Direction.BUY, strength=0.2,
+                reason="test")], strategy_name="t")
+    assert result.rejected == 1
+    row = [o for o in db.list_orders(limit=5) if o["status"] == "rejected"][0]
+    assert "Industry cap" in row["reason"] and "银行" in row["reason"]

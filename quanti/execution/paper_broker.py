@@ -737,6 +737,20 @@ class PaperBroker:
                 days_pending = count_trading_days_between(created_date, today)
 
             stock = self._db.get_stock(o["code"])
+            # 卡单原因可见化:T+1 冻结(卖单)/ 最近一次试成交被拒的原因
+            # (如转单被行业 cap 拒)——此前两种都只显示「等待行情」,
+            # 用户看不出为什么卡着(2026-08-20 实发)。
+            blocked_reason = ""
+            if o["direction"] == "sell":
+                pos = next((p for p in self._db.list_positions()
+                            if p["code"] == o["code"]), None)
+                if pos is not None and self._sellable_qty(pos, today) <= 0:
+                    blocked_reason = "T+1:今日买入,明日开盘才可卖出"
+            if not blocked_reason:
+                rej = self._db.latest_reject_reason(
+                    o["code"], o["direction"], created_at)
+                if rej:
+                    blocked_reason = f"上次尝试被拒: {rej}"
             out.append({
                 "order_id": o["order_id"],
                 "code": o["code"],
@@ -756,6 +770,7 @@ class PaperBroker:
                 "bar_available": bar_available,
                 "trading_days_pending": days_pending,
                 "ttl_trading_days": self._pending_ttl_days,
+                "blocked_reason": blocked_reason,
             })
         return out
 
@@ -1209,8 +1224,20 @@ class PaperBroker:
             # Distinguish risk-driven rejection (one lot already exceeds the
             # per-stock cap) from genuine cash starvation.
             if size_cap < (price * 100 + commission_est):
-                reason = (f"Position cap {max_position_pct:.1%} of portfolio "
-                          f"smaller than a 100-share lot")
+                # 报绑定的那道 cap:单票 20% 与行业 30% 打满是两种局面,
+                # 文案混报会把排查带偏(2026-08-20 实发)。
+                industry = self._stock_industry(signal.stock_code)
+                _room, cap_kind = self._risk.buy_room_detail(
+                    self._build_runtime_portfolio(), signal.stock_code,
+                    industry)
+                if cap_kind == "industry":
+                    reason = (f"Industry cap "
+                              f"{self._risk.config.max_industry_pct:.1%} "
+                              f"({industry or '未知行业'}) full — room smaller "
+                              f"than a 100-share lot")
+                else:
+                    reason = (f"Position cap {max_position_pct:.1%} of "
+                              f"portfolio smaller than a 100-share lot")
                 self._record_order(signal, strategy_name,
                                    status="rejected", reason=reason)
                 self._db.log_decision(

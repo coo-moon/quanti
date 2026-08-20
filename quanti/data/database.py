@@ -2280,6 +2280,17 @@ class Database:
             logger.warning("alert notify failed for kind=%s", kind, exc_info=True)
         return int(cur.lastrowid or 0)
 
+    def latest_reject_reason(self, code: str, direction: str,
+                             after_ts: str) -> str:
+        """同 (code, direction) 在 after_ts 之后最近一次被拒的原因(挂单卡着
+        时给 UI 解释「为什么还没成」——如转单尝试被风控拒)。无则 ''。"""
+        row = self.conn.execute(
+            "SELECT reason FROM orders WHERE code=? AND direction=? "
+            "AND status='rejected' AND created_at >= ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (code, direction, after_ts or "")).fetchone()
+        return (row[0] or "") if row else ""
+
     def prune_decisions(self, older_than_days: int = 90) -> int:
         """Delete decision log entries older than the given number of days.
 

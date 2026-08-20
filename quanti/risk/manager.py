@@ -198,9 +198,17 @@ class RiskManager:
         Pass `industry=""` to skip the industry cap (e.g. when industry data
         isn't available, as in the backtest). The total-position (80%) cap was
         removed — full deployment is bounded only by these per-name caps."""
+        return self.buy_room_detail(portfolio, code, industry)[0]
+
+    def buy_room_detail(self, portfolio: Portfolio, code: str,
+                        industry: str = "") -> tuple[float, str]:
+        """同 max_additional_buy_value,另返回绑定的是哪道 cap:"single"
+        (单票上限)或 "industry"(行业上限)。拒单文案据此区分——此前
+        行业 cap 打满也报「Position cap 20.0%」,排查时带偏(2026-08-20
+        实发:银行仓 30% 满,买交行被拒却报单票文案)。"""
         total = portfolio.total_value
         if total <= 0:
-            return 0.0
+            return 0.0, "single"
         cfg = self.config
         held = portfolio.positions.get(code)
         stock_mv = held.market_value if held else 0.0
@@ -211,7 +219,9 @@ class RiskManager:
             ind_room = total * cfg.max_industry_pct - ind_mv
         else:
             ind_room = float("inf")
-        return max(0.0, min(stock_room, ind_room))
+        if ind_room < stock_room:
+            return max(0.0, ind_room), "industry"
+        return max(0.0, stock_room), "single"
 
     def check_portfolio_stop(self, total_value: float, peak_value: float) -> bool:
         """True when equity has drawn down from its high-water mark past

@@ -589,6 +589,10 @@
               <span class="ttl-hint">
                 已等 {{ o.trading_days_pending ?? 0 }}/{{ o.ttl_trading_days }} 交易日
               </span>
+              <div v-if="o.blocked_reason" class="ttl-hint blocked-hint"
+                   :title="o.blocked_reason">
+                {{ o.blocked_reason }}
+              </div>
             </td>
             <td>{{ o.entry_strategy || "—" }}</td>
             <td :title="o.score == null ? '已掉出候选池' : ''">
@@ -1933,6 +1937,13 @@ onUnmounted(() => {
   margin-left: 6px;
   font-size: 12px;
   color: var(--color-text-secondary);
+}
+.blocked-hint {
+  display: block;
+  margin: 2px 0 0;
+  color: #d97706; /* 卡单原因:T+1 冻结 / 上次尝试被拒 */
+  max-width: 260px;
+  white-space: normal;
 }
 .reason-cell {
   /* Show the full LLM rationale: wrap to a few lines instead of clipping
