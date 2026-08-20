@@ -37,6 +37,7 @@ DEFAULT_ALERT_KINDS = frozenset({
     "llm_unavailable",       # LLM 决策层不可用,tick 空过
     "live_caps_unset",       # 实盘敞口双闸(单笔/总敞口)均未配置
     "stale_data_skip",       # 数据大面积陈旧,tick 跳过新信号生成
+    "llm_replan_fail",       # 收盘后 LLM 点位重算失败(将退避重试)
 })
 
 _MAX_QUEUE = 100

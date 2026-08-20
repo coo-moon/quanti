@@ -520,3 +520,87 @@ def test_sync_llm_mode_paper_enables(tmp_path):
     assert rt._sync_llm_mode(goal) is False
     assert broker.llm_managed is False
     db.close()
+
+
+# --------------------------------------------- run_llm_close_replan e2e
+
+def _close_block(plans=(), reasoning="ok"):
+    return _tool_block("submit_close_plans",
+                       {"plans": list(plans), "reasoning": reasoning})
+
+
+class TestRunLLMCloseReplan:
+    def test_replans_all_holdings(self, tmp_path):
+        from quanti.agent.llm_full import run_llm_close_replan
+        db, provider = _make_db(tmp_path, codes=("000001", "000002"))
+        broker = PaperBroker(db, provider, initial_cash=1_000_000,
+                             fill_mode="immediate")
+        _seed_position(db, "000001")
+        _seed_position(db, "000002")
+        client = StubLLMClient([_close_block(plans=[
+            {"code": "000001", "stop_price": 9.5, "add_price": 0,
+             "add_size_pct": 0, "reason": "收盘重校"},
+            {"code": "000002", "stop_price": 9.1, "add_price": 8.8,
+             "add_size_pct": 0.05, "reason": "回调加仓"},
+        ])])
+        result = run_llm_close_replan(
+            db=db, broker=broker, provider=provider,
+            goal=Goal(target_annual_return=0.2), llm_client=client,
+            cfg=LLMConfig())
+        assert result["ok"] is True and result["n_plans"] == 2
+        plans = {p["code"]: p for p in db.list_llm_plans()}
+        assert plans["000001"]["stop_price"] == 9.5
+        assert plans["000002"]["add_price"] == 8.8
+        assert db.list_decisions(kind="llm_close_replan")
+        db.close()
+
+    def test_partial_coverage_is_failure_but_persists(self, tmp_path):
+        """缺一只持仓的点位 → ok=False(调度层会整轮重试),已给的点位照落。"""
+        from quanti.agent.llm_full import run_llm_close_replan
+        db, provider = _make_db(tmp_path, codes=("000001", "000002"))
+        broker = PaperBroker(db, provider, initial_cash=1_000_000,
+                             fill_mode="immediate")
+        _seed_position(db, "000001")
+        _seed_position(db, "000002")
+        client = StubLLMClient([_close_block(plans=[
+            {"code": "000001", "stop_price": 9.5, "add_price": 0,
+             "add_size_pct": 0, "reason": "只给一只"},
+        ])])
+        result = run_llm_close_replan(
+            db=db, broker=broker, provider=provider,
+            goal=Goal(target_annual_return=0.2), llm_client=client,
+            cfg=LLMConfig())
+        assert result["ok"] is False
+        assert result["missing"] == ["000002"]
+        plans = {p["code"]: p for p in db.list_llm_plans()}
+        assert plans["000001"]["stop_price"] == 9.5  # 部分进展不回滚
+        db.close()
+
+    def test_llm_failure_not_ok(self, tmp_path):
+        from quanti.agent.llm_full import run_llm_close_replan
+        db, provider = _make_db(tmp_path, codes=("000001",))
+        broker = PaperBroker(db, provider, initial_cash=1_000_000,
+                             fill_mode="immediate")
+        _seed_position(db)
+
+        class Bad:
+            def create_message(self, **kw):
+                raise RuntimeError("simulated outage")
+
+        result = run_llm_close_replan(
+            db=db, broker=broker, provider=provider,
+            goal=Goal(target_annual_return=0.2), llm_client=Bad(),
+            cfg=LLMConfig())
+        assert result["ok"] is False and result.get("error")
+        db.close()
+
+    def test_empty_book_ok_skipped(self, tmp_path):
+        from quanti.agent.llm_full import run_llm_close_replan
+        db, provider = _make_db(tmp_path, codes=("000001",))
+        broker = PaperBroker(db, provider, initial_cash=1_000_000)
+        result = run_llm_close_replan(
+            db=db, broker=broker, provider=provider,
+            goal=Goal(target_annual_return=0.2),
+            llm_client=StubLLMClient([]), cfg=LLMConfig())
+        assert result["ok"] is True and result.get("skipped")
+        db.close()

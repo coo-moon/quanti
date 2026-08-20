@@ -81,6 +81,17 @@ GUARD_SYSTEM = """你是 A 股盘中风控守护(quanti LLM 全权模式)。每�
 本就该按兵不动,频繁折腾只会磨损成本。调用 submit_guard_actions 恰好一次,\
 动作附一句中文理由。约束:T+1、整手、涨跌停不可成交。"""
 
+CLOSE_REPLAN_SYSTEM = """你是 A 股收盘后风控点位复核员(quanti LLM 全权模式)。\
+当日已收盘,你看到每个持仓的最新明细(收盘价/盈亏/当前止损与加仓点位)。你的\
+唯一职权是基于当日收盘为每个持仓重算明日点位:
+* stop_price(每个持仓必给,一个都不许漏):趋势完好可上移锁盈,破位风险高\
+可收紧;必须低于收盘价——高于现价的"止损"等于卖出指令,不归你管;
+* add_price / add_size_pct(可选):回调加仓点位,加仓逻辑不再成立就别给。
+
+不买不卖——买卖是每日决策的职权,你只管点位。明日盘中本地机械守护每 5 秒\
+按你落库的点位比价执行,这是明日全天唯一的保护。调用 submit_close_plans \
+恰好一次,每条附一句中文理由。"""
+
 
 # ------------------------------------------------------------- tools
 
@@ -227,6 +238,46 @@ def _tools_guard(max_size_pct: float) -> list[dict]:
                     "reasoning": {"type": "string", "maxLength": 300},
                 },
                 "required": ["sells", "adds", "plans"],
+            },
+        },
+    ]
+
+
+def _tools_close_replan(max_size_pct: float) -> list[dict]:
+    plan_item = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string"},
+            "stop_price": {"type": "number", "minimum": 0},
+            "add_price": {"type": "number", "minimum": 0},
+            "add_size_pct": {"type": "number", "minimum": 0,
+                             "maximum": max(0.01, max_size_pct)},
+            "reason": {"type": "string", "maxLength": 80},
+        },
+        "required": ["code", "stop_price"],
+    }
+    # inspect_position 一并挂上,理由同 _tools_guard(≥2 tool 保 thinking)。
+    return [
+        {
+            "name": "inspect_position",
+            "description": "查看一只当前持仓的明细(数量/成本/盈亏/冻结)。",
+            "input_schema": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+            },
+        },
+        {
+            "name": "submit_close_plans",
+            "description": "提交收盘后重算的持仓点位,调用恰好一次;"
+                           "每个持仓都必须给出 stop_price。",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "plans": {"type": "array", "items": plan_item},
+                    "reasoning": {"type": "string", "maxLength": 300},
+                },
+                "required": ["plans"],
             },
         },
     ]
@@ -842,3 +893,78 @@ def run_llm_guard_decision(
         })
     return {"ok": True, "sells": len(sells), "adds": len(buys),
             "plans": n_plans, "filled": filled, "rejected": rejected}
+
+
+def run_llm_close_replan(
+    *,
+    db: Database,
+    broker: Broker,
+    provider,
+    goal: Goal,
+    llm_client: LLMClient,
+    cfg: LLMConfig | None = None,
+) -> dict:
+    """收盘后点位重算:LLM 基于当日收盘为每个持仓重算止损/加仓点位,只落
+    llm_position_plans,不下任何单——明日盘中由 5 秒机械守护按价执行。
+
+    返回 {"ok": bool, ...}。ok=False = 本轮没算成(LLM 调用失败/截断/有持仓
+    没拿到点位),调用方(background_sync)负责打日志、告警与退避重试直到
+    当天成功——「确保成功」的重试语义在调度层,本函数保持单轮纯粹。
+    """
+    cfg = cfg or LLMConfig()
+    risk_limits = _risk_limits(db)
+    cfg.max_size_pct = float(risk_limits["max_position_pct"])
+
+    portfolio = broker.snapshot_portfolio()
+    positions = portfolio.get("positions", []) or []
+    if not positions:
+        return {"ok": True, "skipped": "空仓,无点位可算"}
+    held = {p["code"] for p in positions}
+    # 收盘后 snapshot 的 current_price 即当日收盘(盘外无实时 overlay)。
+    closes = {p["code"]: float(p.get("current_price") or 0)
+              for p in positions}
+
+    ctx = build_guard_context(db, portfolio, closes, risk_limits, provider)
+
+    def dispatcher(name: str, inp: dict) -> str:
+        if name == "inspect_position":
+            code = str(inp.get("code", ""))
+            pos = next((p for p in positions if p.get("code") == code), None)
+            if pos is None:
+                return json.dumps({"held": False, "code": code})
+            return json.dumps({"held": True,
+                               **{k: v for k, v in pos.items()
+                                  if isinstance(v, (int, float, str))}},
+                              ensure_ascii=False)
+        return json.dumps({"error": f"unknown tool {name}"})
+
+    loop = LLMDecisionLoop(llm_client, cfg,
+                           terminal_tool="submit_close_plans",
+                           system_prompt=CLOSE_REPLAN_SYSTEM,
+                           tools=_tools_close_replan(cfg.max_size_pct))
+    terminal, reasoning, debug = loop.run(ctx, dispatcher)
+    if debug.get("error"):
+        return {"ok": False, "error": debug.get("error", "")}
+    if debug.get("stop_reason") == "max_tokens" and not terminal:
+        return {"ok": False, "error": "输出被 max_tokens 截断"}
+
+    _orders, plans, rejects = validate_decision(
+        {"orders": [], "plans": terminal.get("plans") or []},
+        held, held, cfg.max_size_pct, cfg.max_orders)
+    # 有效点位先落库(部分进展不回滚),再判完整性——缺谁重试谁的成本
+    # 由调度层整轮重试承担,灾难地板在重试成功前兜底。
+    n_plans, missing = _persist_plans(db, plans, held)
+
+    summary = f"收盘后点位重算: {n_plans}/{len(held)} 持仓已更新"
+    if missing:
+        summary += f",缺 {len(missing)} 只({'、'.join(missing[:5])})"
+    if reasoning:
+        summary += f" — {reasoning[:100]}"
+    db.log_decision("llm_close_replan", summary, details={
+        "plans": plans, "missing": missing, "rejects": rejects,
+        "reasoning": reasoning, "usage": debug.get("usage", {}),
+    })
+    if missing:
+        return {"ok": False, "n_plans": n_plans, "missing": missing,
+                "error": f"{len(missing)} 只持仓未拿到点位"}
+    return {"ok": True, "n_plans": n_plans, "missing": []}
