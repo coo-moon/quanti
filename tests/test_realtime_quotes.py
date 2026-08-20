@@ -72,46 +72,58 @@ def db(tmp_path):
     d.close()
 
 
-def test_combiner_prefers_tencent(db, monkeypatch):
-    monkeypatch.setattr(tencent_quotes, "fetch_last_prices",
-                        lambda codes: {"000001": 11.0})
-    called = {"fallback": False}
-    monkeypatch.setattr(tushare_quotes, "fetch_last_prices",
-                        lambda codes, token: called.update(fallback=True) or {})
-    fetch = realtime.make_realtime_fetcher(db)
-    assert fetch(["000001"]) == {"000001": 11.0}
-    assert called["fallback"] is False  # 主源有货,不打兜底
-
-
-def test_combiner_falls_back_when_tencent_empty(db, monkeypatch):
-    monkeypatch.setattr(tencent_quotes, "fetch_last_prices", lambda codes: {})
+def test_combiner_prefers_tushare(db, monkeypatch):
+    """用户拍板(2026-08-20):tushare 主源。有货时不打腾讯。"""
     monkeypatch.setattr(tushare_quotes, "fetch_last_prices",
                         lambda codes, token: {"000001": 11.2}
                         if token == "tok-xyz" else {})
+    called = {"tencent": False}
+    monkeypatch.setattr(tencent_quotes, "fetch_last_prices",
+                        lambda codes: called.update(tencent=True) or {})
     fetch = realtime.make_realtime_fetcher(db)
     assert fetch(["000001"]) == {"000001": 11.2}
+    assert called["tencent"] is False
 
 
-def test_combiner_falls_back_when_tencent_raises(db, monkeypatch):
+def test_combiner_falls_back_to_tencent_when_tushare_empty(db, monkeypatch):
+    monkeypatch.setattr(tushare_quotes, "fetch_last_prices",
+                        lambda codes, token: {})
+    monkeypatch.setattr(tencent_quotes, "fetch_last_prices",
+                        lambda codes: {"000001": 11.0})
+    fetch = realtime.make_realtime_fetcher(db)
+    assert fetch(["000001"]) == {"000001": 11.0}
+
+
+def test_combiner_no_token_goes_straight_to_tencent(tmp_path, monkeypatch):
+    d = Database(str(tmp_path / "nt.db"))
+    d.initialize()
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    called = {"tushare": False}
+    monkeypatch.setattr(tushare_quotes, "fetch_last_prices",
+                        lambda codes, token: called.update(tushare=True) or {})
+    monkeypatch.setattr(tencent_quotes, "fetch_last_prices",
+                        lambda codes: {"000001": 11.0})
+    fetch = realtime.make_realtime_fetcher(d)
+    assert fetch(["000001"]) == {"000001": 11.0}
+    assert called["tushare"] is False  # 无 token 不打 tushare
+    d.close()
+
+
+def test_combiner_both_empty_returns_empty(db, monkeypatch):
+    monkeypatch.setattr(tushare_quotes, "fetch_last_prices",
+                        lambda codes, token: {})
+    monkeypatch.setattr(tencent_quotes, "fetch_last_prices", lambda codes: {})
+    fetch = realtime.make_realtime_fetcher(db)
+    assert fetch(["000001"]) == {}
+
+
+def test_combiner_tencent_raise_swallowed(db, monkeypatch):
+    monkeypatch.setattr(tushare_quotes, "fetch_last_prices",
+                        lambda codes, token: {})
+
     def boom(codes):
         raise RuntimeError("qt.gtimg.cn down")
 
     monkeypatch.setattr(tencent_quotes, "fetch_last_prices", boom)
-    monkeypatch.setattr(tushare_quotes, "fetch_last_prices",
-                        lambda codes, token: {"000001": 11.2})
     fetch = realtime.make_realtime_fetcher(db)
-    assert fetch(["000001"]) == {"000001": 11.2}
-
-
-def test_combiner_no_token_stays_empty(tmp_path, monkeypatch):
-    d = Database(str(tmp_path / "nt.db"))
-    d.initialize()
-    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
-    monkeypatch.setattr(tencent_quotes, "fetch_last_prices", lambda codes: {})
-    called = {"fallback": False}
-    monkeypatch.setattr(tushare_quotes, "fetch_last_prices",
-                        lambda codes, token: called.update(fallback=True) or {})
-    fetch = realtime.make_realtime_fetcher(d)
     assert fetch(["000001"]) == {}
-    assert called["fallback"] is False
-    d.close()
