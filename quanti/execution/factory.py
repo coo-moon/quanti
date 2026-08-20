@@ -69,10 +69,11 @@ def make_broker(db, provider, *, account: str | None = None,
         from quanti.execution.qmt_broker import QmtBroker
         return QmtBroker(db, provider, initial_cash=initial_cash,
                          strategies_dir=strategies_dir, require_live=True)
-    from quanti.data.tencent_quotes import fetch_last_prices
+    from quanti.data.realtime import make_realtime_fetcher
     from quanti.execution.paper_broker import PaperBroker
-    # Paper marks ride free Tencent quotes during trading sessions so the
-    # intraday guard sees live prices; live rides xtdata via the qmt-bridge.
+    # Paper marks ride free Tencent quotes during trading sessions (tushare
+    # sina 兜底,腾讯退避时接管——见 quanti/data/realtime.py); live rides
+    # xtdata via the qmt-bridge.
     return PaperBroker(db=db, provider=provider, initial_cash=initial_cash,
                        fill_mode=fill_mode, strategies_dir=strategies_dir,
-                       realtime_quote_fn=fetch_last_prices)
+                       realtime_quote_fn=make_realtime_fetcher(db))

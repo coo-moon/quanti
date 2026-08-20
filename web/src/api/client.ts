@@ -358,6 +358,7 @@ export interface PendingOrderDetail {
   ttl_trading_days: number;
   entry_strategy?: string;
   score: number | null; // 下单时的融合候选分;null = 已掉出候选
+  blocked_reason?: string; // 卡单原因:T+1 冻结 / 上次尝试被拒(风控 cap 等)
 }
 
 export interface DecisionRecord {
