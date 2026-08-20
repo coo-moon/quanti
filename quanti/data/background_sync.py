@@ -60,6 +60,10 @@ REGIME_RUN_AT = dtime(17, 30)
 #: 检查需要当日全市场日线已落地,排在其后跑结果才有意义。
 DOCTOR_RUN_AT = dtime(17, 45)
 
+#: 收盘后 LLM 点位重算的触发时刻,排在 doctor(17:45)之后——重算要吃当日
+#: 收盘价,等收盘 sweep + 体检确认数据齐了再算,点位才有意义。
+REPLAN_RUN_AT = dtime(17, 50)
+
 
 def expected_latest_bar(now: datetime) -> date:
     """The most recent calendar date whose daily bar should exist upstream.
@@ -102,6 +106,10 @@ class BackgroundSyncConfig:
     (15:30), the previous trading day before it. 1 = refresh as soon as the
     newest expected bar is missing, i.e. one whole-universe incremental sweep
     shortly after each close, quiet the rest of the day."""
+
+    replan_retry_sec: int = 15 * 60
+    """收盘后 LLM 点位重算失败后的重试间隔。只在成功时盖当日章("确保成功"),
+    失败每 15 分钟重试直到当天结束,每次失败打日志 + llm_replan_fail 决策。"""
 
     failure_backoff_sec: int = 30 * 60
     """Base backoff after a failed (or no-new-data) sync. Hard failures double
@@ -172,6 +180,7 @@ class BackgroundQuoteSyncer:
         regime_fn=None,      # () -> Any; runs once/day AFTER REGIME_RUN_AT
         doctor_fn=None,      # () -> dict; runs once/day AFTER DOCTOR_RUN_AT
         strategy_gate_fn=None,  # () -> dict; strategy health gate, same cadence
+        llm_replan_fn=None,  # () -> dict{ok,...}; 收盘后点位重算,成功才盖章
         provider=None,  # DataProvider (optional) — invalidated after bar writes
         heavy_warmup_sec: float = 0.0,
         # ^ seconds after process boot before the HEAVY daily hooks (doctor,
@@ -198,6 +207,9 @@ class BackgroundQuoteSyncer:
         self._last_doctor_day = None  # date of the last doctor run
         self._gate_fn = strategy_gate_fn
         self._last_gate_day = None  # date of the last strategy-gate run
+        self._replan_fn = llm_replan_fn
+        self._last_replan_day = None   # 只在成功当天盖章
+        self._replan_retry_at = None   # datetime; 失败后的下次重试时刻
 
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
@@ -454,6 +466,58 @@ class BackgroundQuoteSyncer:
         except Exception as e:  # noqa: BLE001 - optional; never kills the loop
             logger.warning("bg-sync strategy gate failed: %s", e)
 
+    def _maybe_run_llm_replan(self) -> None:
+        """收盘后 LLM 点位重算:交易日 17:50 后每天一次。
+
+        与 doctor/gate 的「先盖章防重试」相反,这里**只在成功时盖当日章**
+        ——「确保成功」:失败(LLM 挂/截断/持仓没盖全)按 replan_retry_sec
+        退避重试直到当天结束,每次失败 logger.warning + llm_replan_fail
+        决策(kind 在告警白名单,配了 webhook 会推人)。非交易日直接盖章
+        跳过——持仓点位一夜未变,重算是浪费调用。"""
+        if self._replan_fn is None:
+            return
+        if not self._warmup_elapsed():
+            return
+        now = self._now()
+        if now.time() < REPLAN_RUN_AT:
+            return
+        today = now.date()
+        if self._last_replan_day == today:
+            return
+        try:
+            from quanti.utils.market import is_trading_day
+            if not is_trading_day(today, self._provider):
+                self._last_replan_day = today
+                return
+        except Exception:  # noqa: BLE001 - 日历读取失败按交易日对待,宁多算不漏算
+            pass
+        if self._replan_retry_at is not None and now < self._replan_retry_at:
+            return
+        err = ""
+        try:
+            res = self._replan_fn() or {}
+            if res.get("ok"):
+                self._last_replan_day = today
+                self._replan_retry_at = None
+                logger.info("bg-sync llm replan done: %s",
+                            res.get("skipped") or f"{res.get('n_plans', 0)} 点位")
+                return
+            err = str(res.get("error") or "not ok")
+        except Exception as e:  # noqa: BLE001 - optional; never kills the loop
+            err = str(e)
+        self._replan_retry_at = now + timedelta(
+            seconds=self._cfg.replan_retry_sec)
+        logger.warning("bg-sync llm replan failed (retry in %ds): %s",
+                       self._cfg.replan_retry_sec, err)
+        try:
+            self._db.log_decision(
+                "llm_replan_fail",
+                f"收盘后点位重算失败,{self._cfg.replan_retry_sec // 60} 分钟后"
+                f"重试: {err[:150]}",
+                details={"error": err})
+        except Exception:  # noqa: BLE001 - 决策日志失败也不许打断循环
+            logger.warning("llm_replan_fail decision log failed", exc_info=True)
+
     # ----------------- main loop -----------------
 
     def _loop(self) -> None:
@@ -484,6 +548,7 @@ class BackgroundQuoteSyncer:
             self._maybe_run_regime()
             self._maybe_run_doctor()
             self._maybe_run_strategy_gate()
+            self._maybe_run_llm_replan()
 
             # Build the source adapter per loop so a UI source/token change
             # applies without a restart. Misconfig (e.g. tushare, no token — no

@@ -226,6 +226,27 @@ def create_app(
                 details=report)
         return report
 
+    # 收盘后 LLM 点位重算(17:50,数据已由 sweep/doctor 确认落地):llm_full
+    # 模式下让 LLM 基于当日收盘为每个持仓重算止损/加仓点位,只落
+    # llm_position_plans,不下单——次日盘中由 5 秒机械守护按价执行。
+    # 「确保成功」在调度层:background_sync 只在返回 ok 时盖当日章,失败
+    # 打日志 + llm_replan_fail 决策(在告警白名单)并按 replan_retry_sec 重试。
+    def _daily_llm_replan() -> dict:
+        from quanti.agent.goal import load_goal
+        from quanti.agent.llm_full import run_llm_close_replan
+        from quanti.agent.llm_runtime import (DEFAULT_MODEL, LLMConfig,
+                                              build_llm_client)
+        goal = load_goal(db)
+        params = goal.params or {}
+        if str(params.get("agent_mode", "")).lower() != "llm_full":
+            return {"ok": True, "skipped": "非 llm_full 模式,无点位可算"}
+        llm = build_llm_client(params)  # 无 key/SDK 时抛出 → 调度层记失败重试
+        cfg = LLMConfig(model=str(params.get("llm_model") or DEFAULT_MODEL),
+                        max_tokens=int(params.get("llm_guard_max_tokens", 4096)),
+                        max_tool_iterations=4)
+        return run_llm_close_replan(db=db, broker=broker, provider=provider,
+                                    goal=goal, llm_client=llm, cfg=cfg)
+
     # Heavy daily hooks (doctor / strategy gate / factor re-score) defer for
     # QUANTI_HOOK_WARMUP_SEC (default 1800s) after boot so they never pile on
     # top of the agent's cold first-tick selector sweep (2026-08-14 rounds 8-9
@@ -240,6 +261,7 @@ def create_app(
                                     regime_fn=_daily_regime,
                                     doctor_fn=_daily_doctor,
                                     strategy_gate_fn=_daily_strategy_gate,
+                                    llm_replan_fn=_daily_llm_replan,
                                     provider=provider,
                                     heavy_warmup_sec=_warmup)
 

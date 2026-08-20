@@ -755,3 +755,81 @@ class TestHeavyWarmupGate:
         syncer.shutdown(timeout=3)
         db.close()
 
+
+
+class TestLLMReplanSchedule:
+    """收盘后 LLM 点位重算的调度语义:只在成功时盖章 + 失败退避重试 + 打日志。"""
+
+    def _mk(self, tmp_path, fn, now_holder):
+        from quanti.data.database import Database
+        db = Database(str(tmp_path / "replan.db"))
+        db.initialize()
+        syncer = BackgroundQuoteSyncer(
+            db=db, adapter_factory=lambda: StubAdapter(db),
+            config=BackgroundSyncConfig(replan_retry_sec=900),
+            now_fn=lambda: now_holder["now"],
+            llm_replan_fn=fn)
+        return db, syncer
+
+    def test_not_before_run_at(self, tmp_path):
+        from datetime import datetime as dt
+        calls = {"n": 0}
+        now = {"now": dt(2026, 8, 19, 17, 30)}  # 周三,17:50 之前
+        db, syncer = self._mk(tmp_path, lambda: calls.update(n=calls["n"] + 1)
+                              or {"ok": True}, now)
+        syncer._maybe_run_llm_replan()
+        assert calls["n"] == 0
+        db.close()
+
+    def test_failure_logs_and_retries_success_stamps(self, tmp_path):
+        from datetime import datetime as dt, timedelta as td
+        results = [{"ok": False, "error": "LLM down"}, {"ok": True, "n_plans": 2}]
+        calls = {"n": 0}
+
+        def fn():
+            calls["n"] += 1
+            return results[calls["n"] - 1]
+
+        now = {"now": dt(2026, 8, 19, 17, 55)}  # 周三(交易日),17:50 之后
+        db, syncer = self._mk(tmp_path, fn, now)
+
+        syncer._maybe_run_llm_replan()          # 第一次:失败
+        assert calls["n"] == 1
+        assert syncer._last_replan_day is None  # 失败不盖章
+        assert db.list_decisions(kind="llm_replan_fail")  # 失败落日志
+
+        syncer._maybe_run_llm_replan()          # 退避窗口内:不重试
+        assert calls["n"] == 1
+
+        now["now"] += td(seconds=901)           # 过退避窗口
+        syncer._maybe_run_llm_replan()          # 第二次:成功 → 盖章
+        assert calls["n"] == 2
+        assert syncer._last_replan_day == now["now"].date()
+
+        syncer._maybe_run_llm_replan()          # 当天不再跑
+        assert calls["n"] == 2
+        db.close()
+
+    def test_exception_counts_as_failure(self, tmp_path):
+        from datetime import datetime as dt
+        now = {"now": dt(2026, 8, 19, 18, 0)}
+
+        def boom():
+            raise RuntimeError("simulated")
+
+        db, syncer = self._mk(tmp_path, boom, now)
+        syncer._maybe_run_llm_replan()  # 不许抛
+        assert syncer._last_replan_day is None
+        assert db.list_decisions(kind="llm_replan_fail")
+        db.close()
+
+    def test_non_trading_day_stamps_without_calling(self, tmp_path):
+        from datetime import datetime as dt
+        calls = {"n": 0}
+        now = {"now": dt(2026, 8, 22, 18, 0)}  # 周六
+        db, syncer = self._mk(tmp_path, lambda: calls.update(n=calls["n"] + 1)
+                              or {"ok": True}, now)
+        syncer._maybe_run_llm_replan()
+        assert calls["n"] == 0
+        assert syncer._last_replan_day == now["now"].date()
+        db.close()
