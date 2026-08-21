@@ -205,7 +205,17 @@ class PaperBroker:
         bars = self._provider.get_daily_bars(code, start, end)
         return bars[-1] if bars else None
 
-    def _intraday_marks(self, codes: list[str]) -> dict[str, float]:
+    def context_marks(self, codes: list[str]) -> dict[str, float]:
+        """给 LLM 决策上下文用的「今日最新价」(hfq 轴):同 _intraday_marks
+        但不设交易时段门——午休拿的是上午收盘、盘后拿的是今日收盘,都是
+        「今天最新真实价」,比昨收更接近成交现实(用户拍板 2026-08-20,
+        选项 B)。新鲜度契约不变:两源都只回今天打过成交戳的票,开盘前
+        无今日打印 → 空 → 上下文自动落回昨收。只喂上下文,不喂成交——
+        成交路径仍走带时段门的 _intraday_marks。"""
+        return self._intraday_marks(codes, require_session=False)
+
+    def _intraday_marks(self, codes: list[str],
+                        require_session: bool = True) -> dict[str, float]:
         """In-session realtime last-price overlay for position marks, on the
         hfq axis (raw quote × latest adj_factor) so it's comparable with
         avg_cost / daily-close marks, which all live on that axis.
@@ -243,7 +253,8 @@ class PaperBroker:
                 or self._fill_mode != "pending"):
             return {}
         from quanti.utils.market import in_trading_session
-        if not in_trading_session(datetime.now(), self._provider):
+        if require_session and not in_trading_session(datetime.now(),
+                                                      self._provider):
             return {}
         try:
             raw = self._realtime_quote_fn(codes)

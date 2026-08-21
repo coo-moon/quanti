@@ -604,3 +604,38 @@ class TestRunLLMCloseReplan:
             llm_client=StubLLMClient([]), cfg=LLMConfig())
         assert result["ok"] is True and result.get("skipped")
         db.close()
+
+
+# --------------------------------------------- 上下文实时价 overlay(选项 B)
+
+def test_build_full_context_realtime_annotation(tmp_path):
+    from quanti.agent.llm_full import build_full_context
+    from quanti.agent.signal_pipeline import FusedCandidate
+
+    db, provider = _make_db(tmp_path, codes=("000001",))
+    cand = FusedCandidate(code="000001", strategy_score=0.5, factor_score=0.0,
+                          final_score=0.8)
+    _seed_position(db, "000002")
+    db.upsert_stock("000002", "持仓股", "SZ", date(2000, 1, 1), "行业")
+    portfolio = {
+        "total_value": 100_000.0, "cash": 90_000.0,
+        "positions": [{"code": "000002", "name": "持仓股", "industry": "行业",
+                       "quantity": 1000, "avg_cost": 10.0,
+                       "current_price": 10.0, "market_value": 10_000.0,
+                       "pnl_pct": 0.0, "buy_date": "2026-01-05"}],
+    }
+    risk = {"max_position_pct": 0.2, "max_daily_trades": 20,
+            "portfolio_stop_loss_pct": -0.3, "llm_disaster_floor_pct": -0.25}
+    goal = Goal(target_annual_return=0.2)
+
+    ctx_rt = build_full_context(db, goal, portfolio, [cand], provider, risk,
+                                realtime={"000001": 99.9, "000002": 11.5})
+    assert "今¥99.90" in ctx_rt          # 候选现价 = 今日实时
+    assert "(" in ctx_rt.split("今¥99.90")[1][:12]  # 附较昨收涨跌
+    assert "现价11.50" in ctx_rt          # 持仓现价 = 今日实时
+    assert "今日实时价" in ctx_rt          # 口径说明行
+
+    ctx_no = build_full_context(db, goal, portfolio, [cand], provider, risk)
+    assert "昨收¥" in ctx_no              # 无实时价 → 明确标昨收
+    assert "现价10.00" in ctx_no          # 持仓落回快照价
+    db.close()
