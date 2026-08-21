@@ -242,7 +242,10 @@ def create_app(
             return {"ok": True, "skipped": "非 llm_full 模式,无点位可算"}
         llm = build_llm_client(params)  # 无 key/SDK 时抛出 → 调度层记失败重试
         cfg = LLMConfig(model=str(params.get("llm_model") or DEFAULT_MODEL),
-                        max_tokens=int(params.get("llm_guard_max_tokens", 4096)),
+                        # 重算不能沿用守护的 4096:全持仓点位 + thinking 挤
+                        # 不下,首晚(2026-08-21 17:55)就截断,而截断重试是
+                        # 确定性复现 = 死循环。与每日 tick 同档 8192。
+                        max_tokens=int(params.get("llm_replan_max_tokens", 8192)),
                         max_tool_iterations=4)
         return run_llm_close_replan(db=db, broker=broker, provider=provider,
                                     goal=goal, llm_client=llm, cfg=cfg)
