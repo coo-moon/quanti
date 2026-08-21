@@ -550,6 +550,63 @@ class PaperBroker:
         out.scanned = len(pending)
         today = date.today()
 
+        # 排队卖单的盘中转单(2026-08-21 000703 实发;#185 的卖单版,与
+        # #114「盘中卖单提交即时成交」同一 live-mirror 语义):T+1 解冻/
+        # 盘外排队的卖单此前只能等次日 bar 落库按开盘价补记,而 dedup 又把
+        # check_exits 每 5 秒的新止损信号全部丢弃(同 code+direction 已有
+        # pending)——一只已可卖、止损已触发的票挂一整天没人卖。现在:盘中
+        # 有实时价 + 今日可卖 + 非跌停锁板 → 立即按实时价卖出(_sell_now:
+        # 滑点/佣金/参与率/余量重排队全套)。卖不成绝不取消——卖出意图是
+        # 离场安全,失败留在队里走次日开盘兜底(与买单「被拒即取消」刻意
+        # 不对称)。不限 llm 模式(#114 口径)。放在买单转单之前:同一轮
+        # 里卖出先释放现金,买单转单跟着就能吃到。
+        if self._fill_mode == "pending" and pending:
+            sell_rows = [o for o in pending if o["direction"] == "sell"]
+            smarks = (self._intraday_marks([o["code"] for o in sell_rows])
+                      if sell_rows else {})
+            done: set[str] = set()
+            if smarks:
+                positions = {p["code"]: p for p in self._db.list_positions()}
+                for o in sell_rows:
+                    if self._missed_fill_bar(o):
+                        continue  # 错过成交 bar 的陈留单:走 retroactive 补记
+                    mark = smarks.get(o["code"])
+                    if not mark or self._limit_down_locked(o["code"], mark):
+                        continue  # 无报价/跌停锁板:等
+                    pos = positions.get(o["code"])
+                    if pos is None:
+                        self._db.update_order_status(
+                            o["order_id"], "cancelled",
+                            reason="持仓已不存在,排队卖单作废")
+                        done.add(o["order_id"])
+                        out.rejected += 1
+                        continue
+                    if self._sellable_qty(pos, today) <= 0:
+                        continue  # T+1 冻结:等到明天
+                    sig = Signal(stock_code=o["code"],
+                                 direction=Direction.SELL,
+                                 strength=float(o.get("strength") or 1.0),
+                                 reason=o.get("reason", ""),
+                                 entry_strategy=o.get("entry_strategy", ""))
+                    landed, _why = self._sell_now(
+                        sig, o.get("strategy_name", ""), mark)
+                    if landed:
+                        # 全量离场时 _sell_now 已把同向挂单结转 superseded;
+                        # 部分卖出等场景兜底自标。
+                        still = any(r["order_id"] == o["order_id"]
+                                    for r in self._db.list_orders(
+                                        limit=1000, status="pending"))
+                        if still:
+                            self._db.update_order_status(
+                                o["order_id"], "cancelled",
+                                reason="转盘中实时成交(排队卖单补追)")
+                        done.add(o["order_id"])
+                        out.filled += 1
+                    # 未成交:留队,次日开盘兜底,绝不丢卖出意图
+            if done:
+                pending = [o for o in pending
+                           if o["order_id"] not in done]
+
         # llm_full 盘中即时成交契约的补口(2026-08-18 实发):决策落在午休/
         # 盘外时,买单排到 next-open,此后哪怕下午 13:00 开盘也不再补成交,
         # 「盘中即时」名不副实。守护每轮扫 pending 时,对 llm_managed 的
@@ -567,6 +624,8 @@ class PaperBroker:
                      if buys else {})
             settled: set[str] = set()
             for o in buys:
+                if self._missed_fill_bar(o):
+                    continue  # 错过成交 bar 的陈留单:走 retroactive 补记
                 mark = marks.get(o["code"])
                 if not mark:
                     continue  # 盘外/无报价/停牌:等,不是拒
@@ -903,6 +962,19 @@ class PaperBroker:
         band = (0.05 if stock and "ST" in (stock.name or "")
                 else board_limit_pct(code))
         return raw_now <= raw_close * (1 - band) + 1e-9
+
+    def _missed_fill_bar(self, o: dict) -> bool:
+        """排队单的 next-open 成交 bar 是否已在库(= 错过了)。错过的单必须
+        走 retroactive 补记(按那根 bar 的开盘价)——实盘它早在那天开盘成交
+        了,再按今天实时价转单反而失真;只有「成交 bar 还没出生」的当日单
+        才允许盘中转单。解析失败按未错过处理(转单路径自会再校验)。"""
+        try:
+            created = order_decision_date(
+                datetime.fromisoformat(o.get("created_at", "")),
+                self._provider)
+        except (ValueError, TypeError):
+            return False
+        return next_trading_bar(self._provider, o["code"], created) is not None
 
     def _sell_now(self, signal: Signal, strategy_name: str,
                   price: float) -> tuple[bool, str]:
