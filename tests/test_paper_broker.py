@@ -842,3 +842,14 @@ def test_llm_pending_no_quote_keeps_waiting(setup, monkeypatch):
                reason="test"), "llm_full")
     broker.try_fill_pending_orders()
     assert [o for o in db.list_orders(limit=10) if o["status"] == "pending"]
+
+
+def test_context_marks_bypass_session_gate(setup, monkeypatch):
+    """context_marks 给 LLM 上下文用:不设时段门(午休/盘后拿今日最新价),
+    _intraday_marks(成交/标记路径)仍被时段门挡住。"""
+    db, provider, _ = setup
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 12.34})
+    _in_session(monkeypatch, False)
+    assert broker._intraday_marks(["000001"]) == {}
+    marks = broker.context_marks(["000001"])
+    assert marks["000001"] == pytest.approx(12.34)  # env 的 adj_factor=1.0

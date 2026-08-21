@@ -420,16 +420,26 @@ def _account_block(portfolio: dict, risk_limits: dict) -> list[str]:
 
 def build_full_context(db: Database, goal: Goal, portfolio: dict,
                        candidates: list[FusedCandidate], provider,
-                       risk_limits: dict, max_candidates: int = 100) -> str:
+                       risk_limits: dict, max_candidates: int = 100,
+                       realtime: dict[str, float] | None = None) -> str:
+    """realtime:今日实时价 overlay(hfq 轴,broker.context_marks)。此前
+    tick 的候选/持仓「现价」全是上一交易日收盘——决策按昨收框架做、成交
+    却按今日实时价,当日大涨时 LLM 以为的回调买入实际买在高位(2026-08-20
+    000703 实发,用户拍板选 B 修)。有实时价的标的标「今」并附较昨收涨跌,
+    没有的仍标「昨收」;日线摘要(均线/N日涨幅)保持昨收口径不混轴。"""
+    realtime = realtime or {}
     lines: list[str] = []
     lines += _account_block(portfolio, risk_limits)
     lines.append("")
     lines.append("# 当前持仓 (含现行 LLM 点位)")
-    lines += _positions_block(db, portfolio)
+    lines += _positions_block(db, portfolio, realtime)
     lines.append("")
 
     lines.append(f"# 候选股 (top {min(len(candidates), max_candidates)}, "
                  "按综合分降序;PE/PB 空=缺数据)")
+    if realtime:
+        lines.append("(现价标「今」= 今日实时价,括号内为较昨收涨跌;"
+                     "5日/20日涨幅与均线仍按昨收口径)")
     for c in candidates[:max_candidates]:
         code = c.code
         stock = db.get_stock(code)
@@ -438,10 +448,17 @@ def build_full_context(db: Database, goal: Goal, portfolio: dict,
         va = _valuation(db, code)
         sent = (f" 情绪{c.sentiment_score:+.2f}"
                 if getattr(c, "sentiment_score", 0.0) else "")
-        price = bs.get("close") or float(getattr(c, "current_price", 0) or 0)
+        close = bs.get("close") or float(getattr(c, "current_price", 0) or 0)
+        rt = float(realtime.get(code) or 0)
+        if rt > 0 and close:
+            price_part = f"今¥{rt:.2f}({rt / close - 1:+.1%})"
+        elif rt > 0:
+            price_part = f"今¥{rt:.2f}"
+        else:
+            price_part = f"昨收¥{close:.2f}"
         chg5 = bs.get("chg_5d")
         chg20 = bs.get("chg_20d")
-        parts = [f"- {code} {name}", f"分{c.final_score:.2f}", f"¥{price:.2f}"]
+        parts = [f"- {code} {name}", f"分{c.final_score:.2f}", price_part]
         if chg5 is not None:
             parts.append(f"5日{chg5:+.1%}")
         if chg20 is not None:
@@ -649,9 +666,22 @@ def run_llm_full_decision(
            f"候选 {len(candidates)} 只、持仓 {len(held)} 只,进入 LLM 决策",
            n_candidates=len(candidates), n_positions=len(held))
 
+    # 今日实时价 overlay(hfq 轴):候选∪持仓一次批量拉(候选 100 只 ≈ 2
+    # 次请求,每日一次)。拉不到(开盘前/源全挂)= 空 dict,上下文自动
+    # 落回昨收——行为等同修复前,永不阻塞 tick。
+    realtime: dict[str, float] = {}
+    try:
+        marks_fn = getattr(broker, "context_marks", None)
+        if callable(marks_fn):
+            realtime = marks_fn(
+                sorted(candidate_codes | held)) or {}
+    except Exception as e:  # noqa: BLE001 - 上下文增强,失败不许打断决策
+        logger.warning("context realtime marks skipped: %s", e)
+
     ctx = build_full_context(db, goal, portfolio, candidates, provider,
                              risk_limits,
-                             max_candidates=cfg.max_candidates_in_context)
+                             max_candidates=cfg.max_candidates_in_context,
+                             realtime=realtime)
     # 市场环境(regime)块:复用既有注入通道(客观读数 + 陈旧闸)。
     try:
         from quanti.regime.prompt import regime_block
