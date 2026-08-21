@@ -853,3 +853,121 @@ def test_context_marks_bypass_session_gate(setup, monkeypatch):
     assert broker._intraday_marks(["000001"]) == {}
     marks = broker.context_marks(["000001"])
     assert marks["000001"] == pytest.approx(12.34)  # env 的 adj_factor=1.0
+
+
+# ------------------------------------- 排队卖单盘中转单(#185 的卖单版)
+
+
+def test_pending_sell_converts_intraday_when_sellable(setup, monkeypatch):
+    """T+1 解冻后的排队卖单:盘中有实时价 → 立即按实时价卖出,
+    不再等次日 bar 补记(2026-08-21 000703 实发)。"""
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    # 昨日建仓(frozen_date=昨天 → 今天已解冻可卖)
+    db.upsert_position("000001", 900, 11.9, 11.9, date.today() - _td(days=1),
+                       frozen_qty=900, frozen_date=date.today() - _td(days=1))
+    quote = {"px": 0.0}
+    broker = _mk_broker(db, provider,
+                        lambda codes: ({"000001": quote["px"]} if quote["px"] else {}))
+    _in_session(monkeypatch, True)
+    ok, _ = broker._queue_pending_signal(
+        Signal(stock_code="000001", direction=Direction.SELL, strength=1.0,
+               reason="止损"), "llm")
+    assert ok is True
+
+    quote["px"] = 10.5  # 报价恢复(带宽内)
+    result = broker.try_fill_pending_orders()
+    assert result.filled == 1
+    assert db.list_positions() == []          # 仓位当场清掉
+    assert not [o for o in db.list_orders(limit=10) if o["status"] == "pending"]
+    sells = [t for t in db.list_trades() if t["direction"] == "sell"]
+    assert sells and sells[0]["quantity"] == 900
+
+
+def test_pending_sell_frozen_today_waits(setup, monkeypatch):
+    """今日建仓 T+1 冻结:排队卖单不动,等明天。"""
+    db, provider, _ = setup
+    db.upsert_position("000001", 900, 11.9, 11.9, date.today(),
+                       frozen_qty=900, frozen_date=date.today())
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.5})
+    _in_session(monkeypatch, True)
+    broker._queue_pending_signal(
+        Signal(stock_code="000001", direction=Direction.SELL, strength=1.0,
+               reason="止损"), "llm")
+    result = broker.try_fill_pending_orders()
+    assert result.filled == 0
+    assert [o for o in db.list_orders(limit=10) if o["status"] == "pending"]
+    assert db.list_positions()  # 仓位还在
+
+
+def test_pending_sell_position_gone_voids_order(setup, monkeypatch):
+    """持仓已被别处清掉:排队卖单作废,不留僵尸。"""
+    db, provider, _ = setup
+    db.upsert_position("000001", 900, 11.9, 11.9, date(2020, 1, 2))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.5})
+    _in_session(monkeypatch, True)
+    broker._queue_pending_signal(
+        Signal(stock_code="000001", direction=Direction.SELL, strength=1.0,
+               reason="止损"), "llm")
+    db.delete_position("000001")
+    result = broker.try_fill_pending_orders()
+    assert result.rejected == 1
+    rows = [o for o in db.list_orders(limit=10) if o["status"] == "cancelled"]
+    assert rows and "持仓已不存在" in rows[0]["reason"]
+
+
+def test_sell_then_buy_conversion_same_pass(setup, monkeypatch):
+    """同一轮守护:卖单先转(释放现金)→ llm 买单转单跟着吃到钱。"""
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    db.upsert_position("000001", 900, 11.9, 11.9, date.today() - _td(days=1))
+    db.update_cash(500.0)  # 现金饿死状态:不卖就买不起
+    db.upsert_stock("000002", "标的二", "SZ", date(2000, 1, 1), "别业")
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=10)
+    px = np.full(len(dates), 10.0)
+    db.save_daily_quotes(pd.DataFrame({
+        "code": "000002", "date": [d.date() for d in dates],
+        "open": px, "high": px + 0.1, "low": px - 0.1, "close": px,
+        "volume": np.full(len(dates), 1e6), "amount": px * 1e6,
+        "turnover": np.ones(len(dates)),
+    }))
+    broker = _mk_broker(db, provider,
+                        lambda codes: {"000001": 10.8, "000002": 10.0})
+    broker.llm_managed = True
+    _in_session(monkeypatch, True)
+    broker._queue_pending_signal(
+        Signal(stock_code="000001", direction=Direction.SELL, strength=1.0,
+               reason="止损"), "llm")
+    broker._queue_pending_signal(
+        Signal(stock_code="000002", direction=Direction.BUY, strength=0.15,
+               reason="LLM 买入"), "llm")
+    result = broker.try_fill_pending_orders()
+    assert result.filled == 2                  # 卖 1 + 买 1,同一轮
+    codes = {p["code"] for p in db.list_positions()}
+    assert codes == {"000002"}
+
+
+def test_stale_pending_sell_uses_retroactive_open_not_conversion(setup, monkeypatch):
+    """跨日陈留卖单(成交 bar 已在库)不转单——按那根 bar 的开盘价补记,
+    与实盘「隔夜单开盘成交」对齐,而不是按今天实时价卖。"""
+    from datetime import datetime, timedelta
+    from datetime import timedelta as _td
+    db, provider, _ = setup
+    db.upsert_position("000001", 900, 11.9, 11.9, date.today() - _td(days=5))
+    broker = _mk_broker(db, provider, lambda codes: {"000001": 10.5})
+    _in_session(monkeypatch, True)
+    broker._queue_pending_signal(
+        Signal(stock_code="000001", direction=Direction.SELL, strength=1.0,
+               reason="止损"), "llm")
+    # 把挂单伪造成 5 天前创建 → 它的 next-open bar 早已在库(错过)
+    oid = [o for o in db.list_orders(limit=5) if o["status"] == "pending"][0]["order_id"]
+    stale_ts = (datetime.now() - timedelta(days=5)).isoformat()
+    db.conn.execute("UPDATE orders SET created_at=? WHERE order_id=?",
+                    (stale_ts, oid))
+    db.conn.commit()
+
+    result = broker.try_fill_pending_orders()
+    assert result.filled == 1
+    sells = [t for t in db.list_trades() if t["direction"] == "sell"]
+    # 成交价来自历史 bar 开盘(≈10.x 的 bar.open×(1-滑点)),绝不是实时 10.5
+    assert sells and abs(sells[0]["price"] - 10.5) > 1e-9
