@@ -104,7 +104,8 @@ def mechanical_rank(db, provider, candidates: list[str], as_of: date,
     from quanti.factors.cross_sectional import FactorConfig, compute_factor_panel
     from quanti.strategy.loader import StrategyLoader
 
-    strategies = [s for s in StrategyLoader().load_directory(strategies_dir)]
+    strategies = [s for s in StrategyLoader().load_directory(strategies_dir)
+                  if getattr(s, "selectable", True)]
     if not strategies:
         return []
     prepared = []

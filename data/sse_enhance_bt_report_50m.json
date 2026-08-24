@@ -1,0 +1,28 @@
+{
+  "period": [
+    "2021-07-01",
+    "2026-08-24"
+  ],
+  "cash": 50000000.0,
+  "codes": 2393,
+  "trades": 1857,
+  "commission_total": 18770.12,
+  "final_positions": 1857,
+  "ann_return": 0.0571,
+  "ann_benchmark": 0.016,
+  "ann_excess": 0.0405,
+  "tracking_error": 0.0436,
+  "rolling_250d": {
+    "n": 999,
+    "win_rate": 0.8208,
+    "worst": -0.0874,
+    "p5": -0.0389
+  },
+  "rolling_750d": {
+    "n": 499,
+    "win_rate": 1.0,
+    "worst": 0.0687,
+    "p5": 0.1144
+  },
+  "halted": false
+}

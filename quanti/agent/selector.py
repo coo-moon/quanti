@@ -133,7 +133,8 @@ class StrategySelector:
     # --------------------------------------------------------------- API
     def load_candidates(self) -> list[BaseStrategy]:
         loader = StrategyLoader()
-        return loader.load_directory(self._strategies_dir)
+        return [s for s in loader.load_directory(self._strategies_dir)
+                if getattr(s, "selectable", True)]
 
     def evaluate(self, goal: Goal, codes: list[str],
                  candidates: Iterable[BaseStrategy] | None = None,
