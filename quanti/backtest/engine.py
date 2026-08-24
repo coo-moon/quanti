@@ -110,6 +110,10 @@ class BacktestEngine:
         self._risk = risk_manager
         self._protections = protection_manager
         self._sizer = sizer
+        # Effective sizer for the CURRENT run: the engine's own sizer, or the
+        # strategy's `preferred_sizer` (e.g. sse_enhance needs FixedSizer(1.0)
+        # so strength == portfolio weight). Recomputed at the top of run().
+        self._run_sizer = sizer
         # ADV20 cache (per-run); populated at the top of run().
         self._adv20: dict[str, dict[date, float]] = {}
         # All bars (per-run); populated at the top of run() so the sizer can
@@ -142,6 +146,7 @@ class BacktestEngine:
         end: date,
     ) -> BacktestResult:
         """Run backtest for a strategy on given stocks."""
+        self._run_sizer = self._sizer or getattr(strategy, "preferred_sizer", None)
         portfolio = Portfolio(cash=self._initial_cash)
         trades: list[TradeRecord] = []
         equity_values: dict[date, float] = {}
@@ -485,11 +490,11 @@ class BacktestEngine:
         if self._risk is not None:
             size_cap = self._risk.max_additional_buy_value(portfolio, code, "")
         recent = (self._recent_bars_asof(code, current_date)
-                  if self._sizer is not None else None)
+                  if self._run_sizer is not None else None)
         target_value = compute_buy_target_value(
             cash=portfolio.cash, total_value=portfolio.total_value,
             strength=strength, size_cap=size_cap, code=code,
-            sizer=self._sizer, recent_bars=recent)
+            sizer=self._run_sizer, recent_bars=recent)
         commission_est = self._commission.calculate(price_est, 100, Direction.BUY)
         affordable = int(target_value / (price_est * 100 + commission_est)) * 100
 

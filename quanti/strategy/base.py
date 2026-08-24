@@ -28,6 +28,11 @@ class BaseStrategy(ABC):
     """Optional grid for walk-forward hyperopt: param name → candidate values.
     Empty = not tuned (strategy always uses init() defaults). Include the
     built-in defaults as candidates so the default config is in the grid."""
+    selectable: bool = True
+    """False = the selector's automatic pool skips this strategy (it can still
+    be pinned explicitly via Goal.strategy_name or run from scripts). For
+    strategies whose execution assumptions (e.g. portfolio-weight strength +
+    FixedSizer) don't fit the per-stock signal path the selector evaluates."""
 
     @abstractmethod
     def init(self, config: dict) -> None:

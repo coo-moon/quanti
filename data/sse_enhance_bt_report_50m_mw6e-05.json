@@ -1,0 +1,29 @@
+{
+  "period": [
+    "2021-07-01",
+    "2026-08-24"
+  ],
+  "cash": 50000000.0,
+  "min_weight": 6e-05,
+  "codes": 2393,
+  "trades": 2834,
+  "distinct_buys": 1549,
+  "commission_total": 25460.06,
+  "ann_return": 0.0555,
+  "ann_benchmark": 0.016,
+  "ann_excess": 0.0389,
+  "tracking_error": 0.0458,
+  "rolling_250d": {
+    "n": 999,
+    "win_rate": 0.8068,
+    "worst": -0.0895,
+    "p5": -0.0442
+  },
+  "rolling_750d": {
+    "n": 499,
+    "win_rate": 1.0,
+    "worst": 0.061,
+    "p5": 0.1061
+  },
+  "halted": false
+}
