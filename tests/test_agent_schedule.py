@@ -6,6 +6,8 @@ that clock time each day instead of ticking on the fixed interval.
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date, datetime
 
 from quanti.agent.goal import load_goal, save_goal
@@ -127,3 +129,45 @@ def test_restart_when_not_running_behaves_like_start(tmp_path):
         assert rt.status().running is True
     finally:
         rt.stop()
+
+
+class TestWaitUntilDueSleepDrift:
+    """睡眠漂移免疫等待(2026-08-24 实发:跨周末合盖,周一 12:30 tick 丢失)。"""
+
+    def _agent(self, tmp_path):
+        from quanti.data.database import Database
+        from quanti.data.provider import DataProvider
+        from quanti.execution.paper_broker import PaperBroker
+        db = Database(str(tmp_path / "w.db"))
+        db.initialize()
+        provider = DataProvider(db)
+        return AgentRuntime(db, provider, PaperBroker(db, provider),
+                            strategies_dir="strategies",
+                            screeners_dir="screeners"), db
+
+    def test_due_or_overslept_returns_immediately(self, tmp_path):
+        agent, db = self._agent(tmp_path)
+        agent._next_wait_seconds = lambda: 0.0  # 已到点/睡过头
+        t0 = time.monotonic()
+        assert agent._wait_until_due() is False  # False = 该跑了
+        assert time.monotonic() - t0 < 0.5
+        db.close()
+
+    def test_slices_and_fires_on_wall_clock(self, tmp_path):
+        agent, db = self._agent(tmp_path)
+        agent._WAIT_SLICE_SEC = 0.05
+        agent._next_wait_seconds = lambda: 0.2
+        t0 = time.monotonic()
+        assert agent._wait_until_due() is False
+        assert 0.1 < time.monotonic() - t0 < 2.0  # 多片后按墙钟到点
+        db.close()
+
+    def test_stop_flag_interrupts_wait(self, tmp_path):
+        agent, db = self._agent(tmp_path)
+        agent._WAIT_SLICE_SEC = 0.05
+        agent._next_wait_seconds = lambda: 30.0
+        threading.Timer(0.1, agent._stop_flag.set).start()
+        t0 = time.monotonic()
+        assert agent._wait_until_due() is True  # True = 退出循环
+        assert time.monotonic() - t0 < 5.0
+        db.close()

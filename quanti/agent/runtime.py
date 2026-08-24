@@ -502,7 +502,7 @@ class AgentRuntime:
         if self._daily_run_time() is None:
             self._safe_cycle()
         while not self._stop_flag.is_set():
-            if self._stop_flag.wait(self._next_wait_seconds()):
+            if self._wait_until_due():
                 break
             if self._stop_flag.is_set():
                 break
@@ -514,6 +514,26 @@ class AgentRuntime:
                             date.today().isoformat())
                 continue
             self._safe_cycle()
+
+    #: 长等切片长度。Event.wait 走 monotonic 时钟,macOS 合盖睡眠时不前进
+    #: ——一整段「等到明天 12:30」的 wait 会被每次睡眠拉长,定点无限漂移
+    #: (2026-08-24 实发:周五晚重启后跨周末,周一 12:30 tick 没触发,
+    #: last_tick_at 一直是 null)。切成小片、每片醒来按墙钟重算截止时刻,
+    #: 睡醒后一个切片内自愈;错过定点(醒来时已过)立即视为到点补跑。
+    _WAIT_SLICE_SEC = 60.0
+
+    def _wait_until_due(self) -> bool:
+        """睡眠漂移免疫的等待:等到下一次 tick 应触发的墙钟时刻。
+        返回 True = stop_flag 置位(调用方退出循环)。"""
+        deadline = datetime.now() + timedelta(
+            seconds=self._next_wait_seconds())
+        while not self._stop_flag.is_set():
+            remain = (deadline - datetime.now()).total_seconds()
+            if remain <= 0:
+                return False  # 到点(或睡过头醒来发现已过)→ 立即跑
+            if self._stop_flag.wait(min(remain, self._WAIT_SLICE_SEC)):
+                return True
+        return True
 
     def _daily_runs_today(self) -> bool:
         """In daily-schedule mode, whether today should run. Gated to trading
