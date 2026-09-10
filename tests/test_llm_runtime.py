@@ -472,7 +472,7 @@ def _seed_regime_snapshot(db, when=None):
                     "eq20": -9.2, "amt_chg": -20.8, "n_stocks": 5000},
         "sectors": {"top20": [{"industry": "黄金", "ret": 12.0, "n": 10}]},
         "llm": {"action": "观望", "sectors_favored": ["黄金"]},
-        "report_md": "正文", "news": {}, "model": "deepseek-v4-pro",
+        "report_md": "正文", "news": {}, "model": "deepseek-flash",
         "created_at": f"{d}T17:35:00",
     })
 

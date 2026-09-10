@@ -30,6 +30,13 @@ ONE_TOOL = [{
                      "required": ["scores"]},
 }]
 
+TWO_TOOLS = ONE_TOOL + [{
+    "name": "inspect_position",
+    "description": "look",
+    "input_schema": {"type": "object", "properties": {"code": {"type": "string"}},
+                     "required": ["code"]},
+}]
+
 
 def _oai_tool_resp(name, args, finish="tool_calls"):
     return {
@@ -127,19 +134,19 @@ class TestCreateMessage:
         client, cap = _client_capturing(
             _oai_tool_resp("submit_sentiment", {"scores": [{"code": "600519", "score": 0.5}]}))
         resp = client.create_message(
-            model="claude-sonnet-4-5",  # should remap to the v4 default
+            model="claude-sonnet-4-5",  # should remap to the DeepSeek default
             system=[{"type": "text", "text": "SYS", "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": "score it"}],
             tools=ONE_TOOL, max_tokens=256, temperature=0.0)
 
         p = cap["payload"]
-        assert p["model"] == "deepseek-v4-flash"      # claude id remapped
+        assert p["model"] == "deepseek-flash"      # claude id remapped
         assert p["messages"][0] == {"role": "system", "content": "SYS"}
         assert p["messages"][1] == {"role": "user", "content": "score it"}
         assert p["tools"][0]["function"]["name"] == "submit_sentiment"
         # single tool → forced
         assert p["tool_choice"]["function"]["name"] == "submit_sentiment"
-        # v4 thinking mode rejects a forced tool_choice → must be disabled
+        # The thinking tier rejects a forced tool_choice → must be disabled
         # for this request (and only this kind of request).
         assert p["thinking"] == {"type": "disabled"}
         assert cap["url"].endswith("/v1/chat/completions")
@@ -158,6 +165,46 @@ class TestCreateMessage:
         p = cap["payload"]
         assert p["tool_choice"]["function"]["name"] == "submit_sentiment"
         assert "thinking" not in p
+        assert "reasoning_effort" not in p
+
+    def test_forced_tool_on_flash_disables_thinking(self):
+        """`deepseek-flash` is itself a thinking-tier model (verified live
+        2026-09-11): a forced tool_choice without `thinking: disabled` is
+        rejected with HTTP 400 "Thinking mode does not support this
+        tool_choice"."""
+        client, cap = _client_capturing(
+            _oai_tool_resp("submit_sentiment", {"scores": []}))
+        client.create_message(
+            model="deepseek-flash", system="S",
+            messages=[{"role": "user", "content": "x"}],
+            tools=ONE_TOOL, max_tokens=64, temperature=0.0)
+        assert cap["payload"]["thinking"] == {"type": "disabled"}
+        # 结构化输出这一路思考已关,再发 reasoning_effort 没有意义。
+        assert "reasoning_effort" not in cap["payload"]
+
+    def test_multi_tool_call_keeps_thinking_at_max_effort(self):
+        """judgment loop 挂多个 tool → 不强制 tool_choice,thinking 保留,
+        思考强度顶到默认最高档。"""
+        client, cap = _client_capturing(_oai_text_resp("看多"))
+        client.create_message(
+            model="deepseek-flash", system="S",
+            messages=[{"role": "user", "content": "decide"}],
+            tools=TWO_TOOLS, max_tokens=256, temperature=0.2)
+        p = cap["payload"]
+        assert "tool_choice" not in p
+        assert "thinking" not in p
+        assert p["reasoning_effort"] == "max"
+
+    def test_thinking_tier_covers_default_and_legacy_aliases(self):
+        from quanti.agent.openai_compat import (
+            DEEPSEEK_DEFAULT_MODEL,
+            _thinking_on_by_default,
+        )
+
+        assert _thinking_on_by_default(DEEPSEEK_DEFAULT_MODEL) is True
+        assert _thinking_on_by_default("deepseek-v4-pro") is True
+        assert _thinking_on_by_default("deepseek-v4-flash") is True  # old alias
+        assert _thinking_on_by_default("deepseek-chat") is False     # non-thinking
 
     def test_no_tools_means_no_tool_choice(self):
         client, cap = _client_capturing(_oai_text_resp("看多"))
@@ -169,27 +216,38 @@ class TestCreateMessage:
         assert "tool_choice" not in cap["payload"]
         assert resp["content"][0]["text"] == "看多"
 
-    def test_free_text_on_v4_keeps_thinking(self):
-        """Debates / risk personas are free-text calls — v4's thinking mode
-        must stay ON there (that's the point of running v4-pro)."""
+    def test_free_text_on_thinking_tier_keeps_thinking(self):
+        """Debates / risk personas are free-text calls — the thinking tier's
+        mode must stay ON there (that's the point of running flash/pro), at
+        the highest effort level the API accepts."""
         client, cap = _client_capturing(_oai_text_resp("看多"))
         client.create_message(
-            model="deepseek-v4-pro", system="S",
+            model="deepseek-flash", system="S",
             messages=[{"role": "user", "content": "argue"}],
             tools=[], max_tokens=128, temperature=0.3)
         assert "thinking" not in cap["payload"]
+        assert cap["payload"]["reasoning_effort"] == "max"
+
+    def test_nonthinking_alias_does_not_get_reasoning_effort(self):
+        """`deepseek-chat` 是非思考别名——不能被默认的 max 档拽进 thinking。"""
+        client, cap = _client_capturing(_oai_text_resp("看多"))
+        client.create_message(
+            model="deepseek-chat", system="S",
+            messages=[{"role": "user", "content": "argue"}],
+            tools=[], max_tokens=128, temperature=0.3)
+        assert "reasoning_effort" not in cap["payload"]
 
     def test_model_passthrough_for_non_claude(self):
         client, cap = _client_capturing(_oai_text_resp("ok"))
-        client.create_message(model="deepseek-v4-flash", system=None,
+        client.create_message(model="deepseek-flash", system=None,
                               messages=[{"role": "user", "content": "x"}],
                               tools=None, max_tokens=10, temperature=0.0)
-        assert cap["payload"]["model"] == "deepseek-v4-flash"
+        assert cap["payload"]["model"] == "deepseek-flash"
 
     def test_resolved_model_is_public(self):
         client, _ = _client_capturing(_oai_text_resp("ok"))
-        assert client.resolved_model("claude-sonnet-4-5") == "deepseek-v4-flash"
-        assert client.resolved_model(None) == "deepseek-v4-flash"
+        assert client.resolved_model("claude-sonnet-4-5") == "deepseek-flash"
+        assert client.resolved_model(None) == "deepseek-flash"
         assert client.resolved_model("deepseek-chat") == "deepseek-chat"
 
     def test_reasoning_content_is_ignored(self):

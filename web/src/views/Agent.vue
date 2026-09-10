@@ -270,13 +270,13 @@
             <span>供应商 llm_provider</span>
             <select v-model="advParams.llm_provider" @change="onProviderChange">
               <option value="anthropic">Anthropic claude(需 ANTHROPIC_API_KEY + pip install .[llm]）</option>
-              <option value="deepseek">DeepSeek deepseek-v4-flash(需 DEEPSEEK_API_KEY，无需额外安装）</option>
+              <option value="deepseek">DeepSeek deepseek-flash(需 DEEPSEEK_API_KEY，无需额外安装）</option>
             </select>
           </label>
           <label>
             <span>模型 llm_model</span>
             <select v-model="advParams.llm_model">
-              <option value="">默认({{ advParams.llm_provider === "deepseek" ? "deepseek-v4-flash" : "claude-sonnet-4-6" }})</option>
+              <option value="">默认({{ advParams.llm_provider === "deepseek" ? "deepseek-flash" : "claude-sonnet-4-6" }})</option>
               <option v-for="m in llmModelOptions" :key="m.id" :value="m.id">
                 {{ m.id }} — {{ m.desc }}
               </option>
@@ -286,10 +286,10 @@
               v-if="llmModelCustom"
               type="text"
               v-model.trim="advParams.llm_model_custom"
-              placeholder="输入模型 id,如 deepseek-v4-pro"
+              placeholder="输入模型 id,如 deepseek-flash"
             />
             <em class="muted">决策/守护/情绪打分共用此模型。留默认最稳;DeepSeek 侧
-              v4-pro 思考更深但更慢更贵,盘中守护(每 5 分钟)用 flash 性价比更高。
+              flash 已默认思考,pro 更深但更慢更贵,盘中守护(每 5 分钟)用 flash 性价比更高。
               选了对侧供应商的模型 id 时 DeepSeek 会自动回落自家默认。</em>
           </label>
           <label>
@@ -939,9 +939,8 @@ const LLM_MODEL_PRESETS: Record<
   { id: string; desc: string }[]
 > = {
   deepseek: [
-    { id: "deepseek-v4-flash", desc: "默认 · 快,function-calling 全支持" },
+    { id: "deepseek-flash", desc: "默认 · 快,function-calling 全支持" },
     { id: "deepseek-v4-pro", desc: "思考最深 · 慢且贵,适合每日决策" },
-    { id: "deepseek-chat", desc: "legacy 别名(当前由 v4-flash 服务)" },
   ],
   anthropic: [
     { id: "claude-sonnet-4-6", desc: "后端默认 · 均衡" },

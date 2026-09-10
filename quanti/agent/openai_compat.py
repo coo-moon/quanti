@@ -30,16 +30,27 @@ import httpx
 logger = logging.getLogger(__name__)
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"  # full function-calling support
+DEEPSEEK_DEFAULT_MODEL = "deepseek-flash"  # full function-calling support
+#: 思考强度拉满。API 校验的枚举是 none/minimal/low/medium/high/xhigh/max
+#: (非法值 400),`max` 即最高档(实测 2026-09-11);`thinking.level` 则是
+#: 被静默忽略的伪参数,别用。
+DEEPSEEK_DEFAULT_REASONING_EFFORT = "max"
 
 
 def _thinking_on_by_default(model: str) -> bool:
-    """DeepSeek's explicit v4 ids (deepseek-v4-pro / deepseek-v4-flash) run
-    in "thinking" mode unless told otherwise; the legacy `deepseek-chat`
-    alias (currently served by v4-flash) does not. Verified live 2026-06-11:
-    thinking mode rejects a *forced* tool_choice with HTTP 400, while both
-    tool_choice="auto" and thinking={"type": "disabled"} work fine."""
-    return model.startswith("deepseek-v4")
+    """DeepSeek's thinking tier runs in "thinking" mode unless told otherwise;
+    legacy aliases such as `deepseek-chat` do not. Verified live 2026-09-11
+    against /v1/models + /chat/completions:
+
+    * `deepseek-flash` (the default) and `deepseek-v4-pro` are the thinking
+      tier -- a *forced* tool_choice 400s with "Thinking mode does not
+      support this tool_choice" unless thinking is disabled, while both
+      tool_choice="auto" and thinking={"type": "disabled"} work fine.
+    * `deepseek-v4-flash` is an old alias still served by `deepseek-flash`
+      (same behaviour); `deepseek-chat` is the non-thinking legacy alias.
+    """
+    m = str(model)
+    return m == "deepseek-flash" or m.startswith("deepseek-v4")
 
 _FINISH_TO_STOP = {
     "tool_calls": "tool_use",
@@ -193,13 +204,16 @@ class OpenAICompatLLMClient:
     """
 
     def __init__(self, *, api_key: str, base_url: str, default_model: str,
-                 timeout: float = 60.0, transport=None) -> None:
+                 timeout: float = 60.0, transport=None,
+                 reasoning_effort: str | None = None) -> None:
         if not api_key:
             raise ValueError("api_key is required")
         self._url = base_url.rstrip("/") + "/chat/completions"
         self._headers = {"Authorization": f"Bearer {api_key}",
                          "Content-Type": "application/json"}
         self._default_model = default_model
+        # None → 不主动发 reasoning_effort,沿用供应商默认档。
+        self._reasoning_effort = reasoning_effort
         self._client = httpx.Client(timeout=timeout, transport=transport)
 
     def _resolve_model(self, model: str | None) -> str:
@@ -222,29 +236,36 @@ class OpenAICompatLLMClient:
 
     def create_message(self, *, model, system, messages, tools,
                         max_tokens, temperature) -> dict:
+        resolved = self._resolve_model(model)
         payload: dict = {
-            "model": self._resolve_model(model),
+            "model": resolved,
             "messages": to_openai_messages(system, messages),
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
         oai_tools = to_openai_tools(tools)
+        # 单工具强制调用与 thinking 模式互斥(HTTP 400);其余调用保留
+        # thinking,并把思考强度顶到默认档(见 _thinking_on_by_default)。
+        forced_single_tool = bool(oai_tools) and len(oai_tools) == 1
+        thinking = _thinking_on_by_default(resolved)
         if oai_tools:
             payload["tools"] = oai_tools
             # Exactly one tool → force it, so structured-output flows
             # (sentiment, risk review) reliably return the call. With several
             # tools (the judgment loop) leave it to the model.
-            if len(oai_tools) == 1:
+            if forced_single_tool:
                 payload["tool_choice"] = {
                     "type": "function",
                     "function": {"name": oai_tools[0]["function"]["name"]},
                 }
-                # v4 thinking mode 400s on a forced tool_choice, and pure
-                # structured-output calls gain nothing from CoT — turn it
-                # off for this request only. Free-text and multi-tool calls
-                # keep thinking (that's what the v4 thinking tier is for).
-                if _thinking_on_by_default(payload["model"]):
-                    payload["thinking"] = {"type": "disabled"}
+        if thinking:
+            if forced_single_tool:
+                # thinking 模式在强制 tool_choice 下直接 400,而纯结构化输出
+                # 也用不上 CoT——只对这一路关掉思考。自由文本与多工具调用
+                # 保留 thinking(那正是 thinking tier 的用途)。
+                payload["thinking"] = {"type": "disabled"}
+            elif self._reasoning_effort:
+                payload["reasoning_effort"] = self._reasoning_effort
         import time as _time
         last_exc: Exception | None = None
         for attempt in range(self._RETRIES + 1):
@@ -276,11 +297,12 @@ class DeepSeekLLMClient(OpenAICompatLLMClient):
 
     def __init__(self, api_key: str | None = None, *, base_url: str | None = None,
                  default_model: str = DEEPSEEK_DEFAULT_MODEL,
-                 timeout: float = 60.0, transport=None) -> None:
+                 timeout: float = 60.0, transport=None,
+                 reasoning_effort: str | None = DEEPSEEK_DEFAULT_REASONING_EFFORT) -> None:
         key = api_key or os.environ.get("DEEPSEEK_API_KEY")
         if not key:
             raise ValueError(
                 "DEEPSEEK_API_KEY not set (export it or pass api_key=...)")
         super().__init__(api_key=key, base_url=base_url or DEEPSEEK_BASE_URL,
                          default_model=default_model, timeout=timeout,
-                         transport=transport)
+                         transport=transport, reasoning_effort=reasoning_effort)

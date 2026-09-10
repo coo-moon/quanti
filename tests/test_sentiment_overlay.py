@@ -124,18 +124,18 @@ class TestScoreCandidates:
 
     def test_records_resolved_model_not_alias(self, db):
         """The cache's `model` must be what actually served the call. A client
-        exposing resolved_model() (DeepSeek remaps claude-* → deepseek-v4-flash)
+        exposing resolved_model() (DeepSeek remaps claude-* → deepseek-flash)
         → that resolved name is stored; no-news rows record an empty model."""
         class RemappingStub(StubLLMClient):
             def resolved_model(self, model: str) -> str:
-                return "deepseek-v4-flash" if str(model).startswith("claude") else model
+                return "deepseek-flash" if str(model).startswith("claude") else model
 
         client = RemappingStub([
             _sentiment_block([{"code": "000001", "score": 0.3, "reason": "x"}])])
         score_candidates(db, ["000001", "000002"], client,
                          as_of=date(2026, 6, 5), news_fetcher=_fake_news({"000001"}),
                          cfg=SentimentConfig(model="claude-sonnet-4-5"))
-        assert db.get_news_sentiment("000001", "2026-06-05")["model"] == "deepseek-v4-flash"
+        assert db.get_news_sentiment("000001", "2026-06-05")["model"] == "deepseek-flash"
         # No-news code: empty model (nothing scored it).
         assert db.get_news_sentiment("000002", "2026-06-05")["model"] == ""
 
@@ -207,7 +207,7 @@ class TestScoreCandidates:
         """Rows already in market.db (score=0.0, reason='', real model) are
         treated as unscored so they can self-heal."""
         db.upsert_news_sentiment("000001", "2026-06-08", 0.0, reason="",
-                                 n_news=8, model="deepseek-v4-pro")
+                                 n_news=8, model="deepseek-flash")
         client = StubLLMClient([
             _sentiment_block([{"code": "000001", "score": 0.7, "reason": "利好"}])])
         scores = score_candidates(db, ["000001"], client,
@@ -221,7 +221,7 @@ class TestScoreCandidates:
         are valid cache hits — the retry rule must not re-score them."""
         db.upsert_news_sentiment("000001", "2026-06-09", 0.0,
                                  reason="仅有资金流向类中性新闻", n_news=5,
-                                 model="deepseek-v4-pro")
+                                 model="deepseek-flash")
         db.upsert_news_sentiment("000002", "2026-06-09", 0.0,
                                  reason="无近期新闻", n_news=0, model="")
         tripwire = StubLLMClient([])  # raises if called
