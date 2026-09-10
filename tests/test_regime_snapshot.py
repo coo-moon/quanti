@@ -126,7 +126,7 @@ class TestThinkingModePreserved:
         llm = ScriptedLLM(GOOD)
         R.run_llm("prompt", llm=llm)
         assert llm.calls[0]["tools"] is None
-        assert llm.calls[0]["model"] == "deepseek-v4-flash"
+        assert llm.calls[0]["model"] == "deepseek-flash"
 
     def test_empty_response_is_an_error_not_a_blank_report(self):
         class Empty:
@@ -347,7 +347,7 @@ def snap_db(db):
         "metrics": R._metrics_payload(monkey), "sectors": R._sectors_payload(monkey),
         "llm": {"regime": "震荡", "action": "观望",
                 "sectors_favored": ["黄金"], "sectors_avoid": ["半导体"]},
-        "report_md": "正文", "news": {}, "model": "deepseek-v4-pro",
+        "report_md": "正文", "news": {}, "model": "deepseek-flash",
         "created_at": "2026-07-28T17:35:00",
     })
     return db

@@ -182,7 +182,8 @@ def create_app(
 
     # Once/day after 17:30 (market closed, bars topped up), snapshot the market
     # regime: full-market breadth + sector rotation + news, run through
-    # DeepSeek v4-flash in thinking mode, persisted to market.regime_snapshots.
+    # DeepSeek deepseek-flash in thinking mode (reasoning_effort=max), persisted
+    # to market.regime_snapshots.
     # Observe-only — it never emits a trade signal. Without DEEPSEEK_API_KEY the
     # data layer still lands and only the narrative is skipped.
     # 返回值不能丢:数据面不可用时 bg_sync 靠 snap["usable"] 决定当天要不要

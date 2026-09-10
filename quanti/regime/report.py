@@ -4,16 +4,17 @@
 
     breadth.build()      全A股宽度/轮动/资金指标(纯 SQL+pandas,规则判定)
     news.fetch_news()    新闻联播 + 财经快讯(尽力而为)
-    → LLM(deepseek-v4-flash, thinking 全开) → 结构化 JSON + markdown 正文
+    → LLM(deepseek-flash, thinking 全开) → 结构化 JSON + markdown 正文
     → market.regime_snapshots(每日一行,可回溯)
 
 **为什么不用 tool/function calling 拿结构化输出**:v4 thinking 模式在
 *强制* tool_choice 下直接 400(见 openai_compat 的注释),现有 client 遇到
 单 tool 会自动 `thinking: disabled` —— 那正好废掉用户要的「最高思考级别」。
 所以这里走自由文本,让模型先吐一个 ```json 块再写正文,解析失败也只是丢
-结构化字段、正文照存。实测 2026-07-29(当时用 v4-pro):v4 系默认就在
-thinking 模式(返回 reasoning_content),`reasoning_effort` / `thinking.effort`
-这类分级参数接受但无可观测差异——即默认档就是最高档,无需额外参数。
+结构化字段、正文照存。思考强度实测 2026-09-11:`reasoning_effort` 是 API
+唯一校验生效的档位(枚举 none/minimal/low/medium/high/xhigh/max,`max`
+最高),而 `thinking.level` / `thinking.effort` 会被静默忽略。客户端已默认
+按 `max` 下发,这里不必再传。
 
 判定分两层且**都存**:规则层(breadth 的多因子投票)是可复现的锚,LLM 层
 是解释与建议。两者背离本身就是有用信号,所以 UI 同时展示,而不是让 LLM
@@ -32,7 +33,7 @@ from quanti.utils.jsonsafe import json_safe
 
 logger = logging.getLogger(__name__)
 
-MODEL = "deepseek-v4-flash"
+MODEL = "deepseek-flash"
 MAX_TOKENS = 8000
 LLM_TIMEOUT = 300.0
 
