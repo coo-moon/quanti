@@ -21,6 +21,9 @@ def db(tmp_path):
 class FakePro:
     """Stand-in for tushare's pro_api object (provides stock_basic)."""
 
+    def __init__(self):
+        self.dividend_calls: list[dict] = []
+
     def stock_basic(self, list_status, fields):
         if list_status == "L":
             return pd.DataFrame([
@@ -65,6 +68,42 @@ class FakePro:
         return pd.DataFrame([
             {"ts_code": "000001.SZ", "turnover_rate": 1.2},
             {"ts_code": "600001.SH", "turnover_rate": 0.8},
+        ])
+
+    # `dividend` (doc_id=103):按 ann_date 或 ex_date 拉**一天的全市场**。
+    # 一行 = 一家公司的一次分红公告阶段,实施行带 ex_date + 税前 cash_div_tax。
+    def dividend(self, ann_date=None, ex_date=None):
+        self.dividend_calls.append({"ann_date": ann_date, "ex_date": ex_date})
+        if (ann_date or ex_date) == "20240620":
+            return pd.DataFrame([{
+                "ts_code": "600519.SH", "end_date": "20231231",
+                "ann_date": "20240521", "div_proc": "实施", "stk_div": 0.0,
+                "stk_bo_rate": None, "stk_co_rate": None, "cash_div": 30.876,
+                "cash_div_tax": 30.876, "record_date": "20240619",
+                "ex_date": "20240620", "pay_date": "20240620",
+                "div_listdate": None, "imp_ann_date": "20240614",
+            }])
+        return pd.DataFrame(columns=[
+            "ts_code", "end_date", "ann_date", "div_proc", "stk_div",
+            "stk_bo_rate", "stk_co_rate", "cash_div", "cash_div_tax",
+            "record_date", "ex_date", "pay_date", "div_listdate",
+            "imp_ann_date"])
+
+    def index_weight(self, index_code, start_date, end_date):
+        return pd.DataFrame([
+            {"index_code": index_code, "con_code": "601919.SH",
+             "trade_date": "20240628", "weight": 2.58},
+            {"index_code": index_code, "con_code": "000937.SZ",
+             "trade_date": "20240628", "weight": 1.84},
+        ])
+
+    def namechange(self, start_date, end_date):
+        return pd.DataFrame([
+            {"ts_code": "600001.SH", "name": "ST邯郸", "start_date": "20240501",
+             "end_date": None, "ann_date": "20240428", "change_reason": "ST"},
+            {"ts_code": "000002.SZ", "name": "撤销示例", "start_date": "20240701",
+             "end_date": "20240801", "ann_date": "20240628",
+             "change_reason": "撤销ST"},
         ])
 
 
@@ -138,6 +177,66 @@ def test_sync_daily_quotes_lands_with_zero_turnover(db):
     assert len(out) == 2
     assert (out["close"] > 0).all()
     assert (out["turnover"] == 0).all()  # the per-code path has no daily_basic
+
+
+def test_sync_dividends_by_ann_date_lands_ex_date(db):
+    """按公告日批量拉全市场分红:ex_date 一并落库(入池按 ex_date,公告日是
+    PIT 可见性键),ts_code 映射回 6 位 code,来源可追溯。"""
+    adapter = TushareAdapter(db, pro=FakePro())
+    n = adapter.sync_dividends_by_date(date(2024, 6, 20))
+    assert n == 1
+    df = db.get_dividend_events(date(2024, 6, 1), date(2024, 6, 30))
+    assert list(df["code"]) == ["600519"]
+    assert df["ex_date"].iloc[0] == "2024-06-20"
+    assert df["cash_div_tax"].iloc[0] == pytest.approx(30.876)
+
+
+def test_dividend_events_dedupe_same_payout(db):
+    """同一笔分红在 tushare 里有多行(预案/股东大会/实施、ann_date 不同),
+    按 (code, end_date, ex_date) 去重 —— 否则分红再投会重复计数。"""
+    rows = [
+        {"code": "600519", "ann_date": "2024-04-17", "end_date": "2023-12-31",
+         "div_proc": "预案", "cash_div_tax": 30.876},
+        {"code": "600519", "ann_date": "2024-05-21", "end_date": "2023-12-31",
+         "div_proc": "实施", "cash_div_tax": 30.876, "ex_date": "2024-06-20"},
+        {"code": "600519", "ann_date": "2024-06-14", "end_date": "2023-12-31",
+         "div_proc": "实施", "cash_div_tax": 30.876, "ex_date": "2024-06-20"},
+    ]
+    db.save_dividends(pd.DataFrame(rows))
+    df = db.get_dividend_events(date(2024, 1, 1), date(2024, 12, 31))
+    assert len(df) == 1
+    assert df["ann_date"].iloc[0] == "2024-05-21"  # 最早的实施公告
+
+
+def test_sync_dividends_range_skips_weekends(db):
+    """ex_date 扫描跳过周末(除息必为交易日),按 calls_per_min 限速但不真等。"""
+    pro = FakePro()
+    adapter = TushareAdapter(db, pro=pro)
+    adapter.sync_dividends(date(2024, 6, 20), date(2024, 6, 23),
+                           by="ex_date", calls_per_min=0)
+    assert [c["ex_date"] for c in pro.dividend_calls] == ["20240620", "20240621"]
+    adapter.sync_dividends(date(2024, 6, 19), date(2024, 6, 19),
+                           by="ann_date", calls_per_min=0)
+    assert pro.dividend_calls[-1] == {"ann_date": "20240619", "ex_date": None}
+
+
+def test_sync_index_weights_and_name_history(db):
+    """指数成分快照(PIT)与曾用名史(判 ST 用)各按年分片落库。"""
+    adapter = TushareAdapter(db, pro=FakePro())
+    n = adapter.sync_index_weights("000922.CSI", date(2024, 1, 1),
+                                   date(2024, 12, 31))
+    assert n == 2
+    members = db.get_index_members("000922.CSI", date(2024, 6, 30))
+    assert members == {"601919": 2.58, "000937": 1.84}
+    # 快照发布前(5 月)查不到 6 月末的成分 —— PIT,不引入未来成分
+    assert db.get_index_members("000922.CSI", date(2024, 5, 31)) == {}
+
+    n = adapter.sync_name_history(date(2024, 1, 1), date(2024, 12, 31))
+    assert n == 2
+    names = db.get_names_asof(date(2024, 6, 1))
+    assert names == {"600001": "ST邯郸"}      # 000002 的改名 7-01 才生效
+    assert db.get_names_asof(date(2024, 7, 15))["000002"] == "撤销示例"
+    assert "000002" not in db.get_names_asof(date(2024, 8, 2))  # 改名再次失效
 
 
 def test_reconstruct_adj_factor_from_preclose():

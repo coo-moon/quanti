@@ -48,13 +48,15 @@ def _load():
 def test_loader_discovers_classics_with_unique_names():
     instances = StrategyLoader().load_directory(STRAT_DIR)
     names = [s.name for s in instances]
-    # 精简后的经典六件套 + sse_enhance(selectable=False,不进自动选拔池);
+    # 精简后的经典六件套 + 两个结构性复制策略(sse_enhance /
+    # dividend_tr_enhance,都 selectable=False,不进自动选拔池);
     # attic 里的不参与生产加载。
     for name in ("ma_cross", "macd_cross", "bollinger_band", "rsi_ob_os",
-                 "kdj_cross", "turtle_breakout", "sse_enhance"):
+                 "kdj_cross", "turtle_breakout", "sse_enhance",
+                 "dividend_tr_enhance"):
         assert name in names, f"{name} not discovered by loader"
     assert len(names) == len(set(names)), f"duplicate strategy name: {names}"
-    assert len(names) == 7, f"unexpected strategies in production dir: {names}"
+    assert len(names) == 8, f"unexpected strategies in production dir: {names}"
     selectable = {s.name for s in instances if getattr(s, "selectable", True)}
     assert selectable == {"ma_cross", "macd_cross", "bollinger_band",
                           "rsi_ob_os", "kdj_cross", "turtle_breakout"}

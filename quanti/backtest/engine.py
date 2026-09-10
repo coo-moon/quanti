@@ -14,10 +14,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from typing import Callable, Mapping
 
 import pandas as pd
 
-from quanti.backtest.commission import AShareCommission
+from quanti.backtest.commission import AShareCommission, DividendTaxLedger
 from quanti.backtest.metrics import compute_metrics
 from quanti.backtest.slippage import FlatSlippage, SlippageModel, coerce
 from quanti.data.provider import DataProvider
@@ -50,6 +51,9 @@ class TradeRecord:
     commission: float
     strategy: str
     reason: str = ""  # signal reason — for exits: 止损 / 移动止盈 / 策略离场
+    dividend_tax: float = 0.0
+    """该笔卖出补缴的红利税(仅当引擎启用 dividend_lookup;见 commission.py)。
+    已从现金中扣除——commission 字段只含交易费用,两者分开便于归因。"""
 
 
 @dataclass
@@ -70,6 +74,11 @@ class BacktestResult:
     halt as if the strategy were still active."""
     halted_at: date | None = None
     halted_reason: str = ""
+    dividend_tax_total: float = 0.0
+    """全回测累计补缴的红利税(元);未接线时恒为 0。"""
+    dividend_cash_total: float = 0.0
+    """全回测累计除息入账的税前现金分红(元)。注意:分红的**再投资**已经
+    内含在后复权(hfq)价格里(见 DataProvider),这里只记账不再加现金。"""
 
 
 class BacktestEngine:
@@ -84,6 +93,8 @@ class BacktestEngine:
         risk_manager: RiskManager | None = None,
         protection_manager: ProtectionManager | None = None,
         sizer: Sizer | None = None,
+        dividend_lookup: (Callable[[date], Mapping[str, float]]
+                          | Mapping[date, Mapping[str, float]] | None) = None,
     ):
         """Args:
             slippage: A `SlippageModel` (FlatSlippage / VolumeImpactSlippage),
@@ -99,6 +110,15 @@ class BacktestEngine:
                 and live agree. With no sizer (the production default), a buy
                 deploys ``cash*0.95*clamp(signal.strength, 0.1, 1.0)`` capped
                 by the per-stock cap — matching PaperBroker's no-sizer path.
+            dividend_lookup: Optional ``ex_date -> {code: 每股税前现金分红}``
+                lookup for the dividend-tax model. Bar prices are back-adjusted
+                (hfq, i.e. dividends already reinvested), so the dividend tax is
+                the ONE cash flow the price series cannot show: on each ex-date
+                the ledger accrues the per-share dividend onto the held lots and
+                the tax is withheld from cash at SELL time, by each FIFO lot's
+                holding period (see commission.DividendTaxLedger). Omit it (the
+                default) and the engine behaves exactly as before — no legacy
+                backtest number moves.
         """
         self._provider = provider
         self._initial_cash = initial_cash
@@ -110,6 +130,14 @@ class BacktestEngine:
         self._risk = risk_manager
         self._protections = protection_manager
         self._sizer = sizer
+        # Accept either a callable ex_date -> {code: 每股税前分红} or a plain
+        # mapping (script/tests usually have the whole table in hand).
+        if dividend_lookup is not None and not callable(dividend_lookup):
+            table = dict(dividend_lookup)
+            dividend_lookup = lambda d: table.get(d, {})  # noqa: E731
+        self._dividend_lookup = dividend_lookup
+        # Per-run FIFO dividend-tax ledger (created in run() when wired).
+        self._div_ledger: DividendTaxLedger | None = None
         # Effective sizer for the CURRENT run: the engine's own sizer, or the
         # strategy's `preferred_sizer` (e.g. sse_enhance needs FixedSizer(1.0)
         # so strength == portfolio weight). Recomputed at the top of run().
@@ -136,6 +164,7 @@ class BacktestEngine:
             protection_manager=(ProtectionManager(self._protections.config)
                                  if self._protections else None),
             sizer=self._sizer,
+            dividend_lookup=self._dividend_lookup,
         )
 
     def run(
@@ -150,6 +179,11 @@ class BacktestEngine:
         portfolio = Portfolio(cash=self._initial_cash)
         trades: list[TradeRecord] = []
         equity_values: dict[date, float] = {}
+        # 红利税账本(仅在接线 dividend_lookup 时启用,否则全链路零变化)。
+        self._div_ledger = (DividendTaxLedger()
+                            if self._dividend_lookup is not None else None)
+        self._dividend_tax_paid = 0.0
+        self._dividend_cash = 0.0
         # Post-entry peak (highest high since entry) per held code, for the
         # trailing take-profit in RiskManager.check_exits.
         peaks: dict[str, float] = {}
@@ -243,6 +277,19 @@ class BacktestEngine:
             for code in list(peaks):
                 if code not in portfolio.positions:
                     peaks.pop(code, None)
+
+            # 2b) 除息日:把每股税前现金分红累计进持有批次的红利税账本。
+            #     分红的再投资已内含在 hfq 价格里(见 DataProvider._apply_adjust),
+            #     所以这里**不加现金**;税是价格序列唯一表达不出来的现金流,
+            #     递延到卖出时按 FIFO 批次的持股期限补缴(commission.py)。
+            #     除息日当天买入的批次不含权(股权登记日在前一天)。
+            if self._div_ledger is not None:
+                for dcode, dps in (
+                        self._dividend_lookup(current_date) or {}).items():
+                    if dcode in portfolio.positions:
+                        entitled = self._div_ledger.accrue(
+                            dcode, float(dps), ex_date=current_date)
+                        self._dividend_cash += float(dps) * entitled
 
             # Per-day protection lock (global; only blocks new BUYs). Same pure
             # ProtectionManager as live, fed from in-memory facts bounded to the
@@ -376,6 +423,8 @@ class BacktestEngine:
             halted=halted_at is not None,
             halted_at=halted_at,
             halted_reason=halted_reason,
+            dividend_tax_total=self._dividend_tax_paid,
+            dividend_cash_total=self._dividend_cash,
         )
 
     def _fill_pending(
@@ -549,6 +598,9 @@ class BacktestEngine:
                 buy_date=current_date,
             )
 
+        if self._div_ledger is not None:  # 建批次:红利税按批次期限分档
+            self._div_ledger.add(code, current_date, quantity)
+
         trades.append(
             TradeRecord(
                 date=current_date,
@@ -603,7 +655,13 @@ class BacktestEngine:
         revenue = price * quantity
         commission = self._commission.calculate(price, quantity, Direction.SELL,
                                                 trade_date=current_date)
-        net_revenue = revenue - commission
+        # 红利税:卖出时按 FIFO 批次的持股期限补缴(<1 月 20% / <1 年 10% /
+        # >1 年免)。未接线 dividend_lookup 时恒为 0。
+        div_tax = 0.0
+        if self._div_ledger is not None:
+            div_tax = self._div_ledger.sell(code, current_date, quantity).total
+            self._dividend_tax_paid += div_tax
+        net_revenue = revenue - commission - div_tax
 
         portfolio.cash += net_revenue
         if quantity >= pos.quantity:
@@ -621,6 +679,7 @@ class BacktestEngine:
                 commission=commission,
                 strategy=strategy_name,
                 reason=reason,
+                dividend_tax=div_tax,
             )
         )
         return True

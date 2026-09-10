@@ -460,6 +460,51 @@ class Database:
                 ON daily_quotes(date);
             CREATE INDEX IF NOT EXISTS {m}idx_financials_ann
                 ON financials(code, ann_date);
+
+            -- 分红(除权除息)明细 —— tushare `dividend` 按公告日(ann_date)全市场
+            -- 批量拉取。两个日期各有分工,别混:
+            --   ann_date : PIT 可见性键(公告日之前这件事不可知);
+            --   ex_date  : 入池/入账条件(除息发生才算"实施过")。
+            -- cash_div_tax 是**每股税前**现金分红(元) —— 红利税由回测引擎按
+            -- 持股期限另算(见 quanti/backtest/commission.py),这里存税前值。
+            -- 主键含 ann_date:同一笔分红在预案/股东大会/实施各阶段各有一行。
+            CREATE TABLE IF NOT EXISTS {m}dividends (
+                code TEXT NOT NULL,
+                ann_date TEXT NOT NULL DEFAULT '',
+                end_date TEXT NOT NULL DEFAULT '',
+                div_proc TEXT NOT NULL DEFAULT '',
+                stk_div REAL,
+                cash_div_tax REAL,
+                ex_date TEXT,
+                pay_date TEXT,
+                imp_ann_date TEXT,
+                source TEXT DEFAULT '',
+                PRIMARY KEY (code, ann_date, end_date, div_proc)
+            );
+
+            -- 指数成分权重快照(tushare `index_weight`,按月末 trade_date)。
+            -- 策略用"截止 as-of 的最近一期"做 PIT 成分,不引入未来成分。
+            CREATE TABLE IF NOT EXISTS {m}index_weights (
+                index_code TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                weight REAL,
+                PRIMARY KEY (index_code, trade_date, code)
+            );
+
+            -- 证券曾用名(名称变更)历史(tushare `namechange`)。存下来是为了
+            -- PIT 判定 ST/*ST:用**今天的名字**回判历史是前视(见 sse_enhance
+            -- 研究记录),而 namechange 带 start_date/end_date,可以还原
+            -- "该时点叫什么名字"。
+            CREATE TABLE IF NOT EXISTS {m}name_history (
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                start_date TEXT NOT NULL,
+                end_date TEXT,
+                ann_date TEXT,
+                change_reason TEXT DEFAULT '',
+                PRIMARY KEY (code, start_date)
+            );
             """
         )
         # Trading state → always the main (account) DB.
@@ -1093,6 +1138,136 @@ class Database:
             "WHERE free_date > ? AND free_date <= ? AND float_pct IS NOT NULL "
             "GROUP BY code", (as_of.isoformat(), end)).fetchall()
         return {r[0]: float(r[1]) for r in rows if r[1] is not None}
+
+    # --- 分红 / 指数成分权重 / 曾用名(market 数据) ---
+
+    @staticmethod
+    def _opt_iso_date(v) -> str | None:
+        """None/NaN/''/NaT → None,其余归一成 ISO 'YYYY-MM-DD'。"""
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "nat", "none"):
+            return None
+        return Database._iso_date(v)
+
+    def save_dividends(self, df: pd.DataFrame) -> int:
+        """Upsert 分红明细行(tushare `dividend`)。必需列:code, ann_date,
+        div_proc;其余(stk_div/cash_div_tax/ex_date/pay_date/imp_ann_date/
+        end_date/source)可缺。cash_div_tax = 每股**税前**现金分红(元)。"""
+        recs = []
+        for _, r in df.iterrows():
+            code = str(r.get("code", "") or "").strip()
+            if not code:
+                continue
+            recs.append((
+                code,
+                self._opt_iso_date(r.get("ann_date")) or "",
+                self._opt_iso_date(r.get("end_date")) or "",
+                str(r.get("div_proc", "") or ""),
+                _nan_to_none(r.get("stk_div")),
+                _nan_to_none(r.get("cash_div_tax")),
+                self._opt_iso_date(r.get("ex_date")),
+                self._opt_iso_date(r.get("pay_date")),
+                self._opt_iso_date(r.get("imp_ann_date")),
+                str(r.get("source", "") or ""),
+            ))
+        if not recs:
+            return 0
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO dividends (code, ann_date, end_date,"
+            " div_proc, stk_div, cash_div_tax, ex_date, pay_date, imp_ann_date,"
+            " source) VALUES (?,?,?,?,?,?,?,?,?,?)", recs)
+        self.conn.commit()
+        return len(recs)
+
+    def save_index_weights(self, rows) -> int:
+        """Upsert 指数成分权重快照: iterable of dicts with keys
+        `index_code`, `trade_date`, `code`, `weight`(单位跟随数据源,策略只
+        用它做归一,不做绝对解读)。"""
+        recs = []
+        for r in rows:
+            ic = str(r.get("index_code", "") or "").strip()
+            td = self._opt_iso_date(r.get("trade_date"))
+            code = str(r.get("code", "") or "").strip()
+            if not ic or not td or not code:
+                continue
+            recs.append((ic, td, code, _nan_to_none(r.get("weight"))))
+        if not recs:
+            return 0
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO index_weights (index_code, trade_date,"
+            " code, weight) VALUES (?,?,?,?)", recs)
+        self.conn.commit()
+        return len(recs)
+
+    def save_name_history(self, rows) -> int:
+        """Upsert 证券曾用名历史: iterable of dicts with keys `code`, `name`,
+        `start_date`, `end_date`(可空=至今), `ann_date`, `change_reason`。"""
+        recs = []
+        for r in rows:
+            code = str(r.get("code", "") or "").strip()
+            st = self._opt_iso_date(r.get("start_date"))
+            if not code or not st:
+                continue
+            recs.append((
+                code, str(r.get("name", "") or ""), st,
+                self._opt_iso_date(r.get("end_date")),
+                self._opt_iso_date(r.get("ann_date")),
+                str(r.get("change_reason", "") or "")))
+        if not recs:
+            return 0
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO name_history (code, name, start_date,"
+            " end_date, ann_date, change_reason) VALUES (?,?,?,?,?,?)", recs)
+        self.conn.commit()
+        return len(recs)
+
+    def get_dividend_events(self, start: date, end: date) -> pd.DataFrame:
+        """除息日落在 [start, end] 的**实施中**现金分红事件。
+
+        去重口径:tushare 同一笔分红在预案/股东大会/实施各阶段会有多行
+        (ann_date 不同、数值相同),按 (code, end_date, ex_date) 取
+        max(cash_div_tax);同一 ex_date 的**不同报告期**(中期+年度同日除息)
+        保留成多行,由调用方求和。返回列:code/ex_date/end_date/ann_date/
+        cash_div_tax。"""
+        with self._db_lock:
+            df = pd.read_sql_query(
+                "SELECT code, ex_date, end_date, MIN(ann_date) AS ann_date,"
+                " MAX(cash_div_tax) AS cash_div_tax FROM dividends"
+                " WHERE div_proc='实施' AND ex_date IS NOT NULL AND ex_date!=''"
+                "   AND ex_date >= ? AND ex_date <= ? AND cash_div_tax > 0"
+                " GROUP BY code, ex_date, end_date"
+                " ORDER BY ex_date, code",
+                self._raw_conn,
+                params=(start.isoformat(), end.isoformat()))
+        return df
+
+    def get_index_members(self, index_code: str, as_of: date) -> dict[str, float]:
+        """截止 `as_of` 的最近一期指数成分 {code: weight} —— PIT:只回看已
+        发布的快照,不引入未来成分。无该指数数据时返回 {}。"""
+        row = self.conn.execute(
+            "SELECT MAX(trade_date) FROM index_weights "
+            "WHERE index_code=? AND trade_date<=?",
+            (index_code, as_of.isoformat())).fetchone()
+        if not row or not row[0]:
+            return {}
+        return {r[0]: float(r[1] or 0.0) for r in self.conn.execute(
+            "SELECT code, weight FROM index_weights "
+            "WHERE index_code=? AND trade_date=?",
+            (index_code, row[0])).fetchall()}
+
+    def get_names_asof(self, as_of: date) -> dict[str, str]:
+        """截止 `as_of` 生效的证券名称 {code: name}(name_history PIT 视图)。
+
+        只覆盖**变更过名字**的股票;没出现在结果里的股票 = 未变更(用申购
+        时的原始名,不影响 ST 判定)。"""
+        rows = self.conn.execute(
+            "SELECT code, name FROM name_history "
+            "WHERE start_date <= ? AND (end_date IS NULL OR end_date='' "
+            "OR end_date > ?)",
+            (as_of.isoformat(), as_of.isoformat())).fetchall()
+        return {r[0]: r[1] for r in rows}
 
     def has_fundamentals(self) -> bool:
         """True if any daily_basic or financials rows exist — lets the factor
