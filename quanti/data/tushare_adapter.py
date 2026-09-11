@@ -1,10 +1,14 @@
-"""Tushare data adapter — A-share roster (incl. delisted) + RAW daily bars.
+"""Tushare data adapter — A-share roster (incl. delisted) + RAW daily bars + 分红.
 
 Closes survivorship bias for backtests: Tushare's free/low-tier `stock_basic`
 returns delisted names with their delist_date, and `daily` returns the full RAW
 price history of a ts_code up to its delisting day. Both land through the SAME
 db.upsert_stock / db.save_daily_quotes exits as AkShare/xtdata, so the rest of
 the system reads SQLite unchanged.
+
+分红(`dividend`,doc_id=103)按**公告日全市场批量**拉取:逐票拉在低积分 token
+下是 6000+ 次调用/年,按日只需 1 次/天。`ann_date` 是 PIT 可见性键,`ex_date`
+是"是否已实施"的判定键(见 db.save_dividends / get_dividend_events)。
 
 Back-adjustment (hfq) is reconstructed from `daily`'s pre_close (see
 `reconstruct_adj_factor`) so we NEVER call the `adj_factor`/`pro_bar` endpoints,
@@ -28,7 +32,7 @@ import logging
 import math
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
@@ -387,6 +391,144 @@ class TushareAdapter:
                 "source": "tushare",
             })
         return self._db.save_daily_quotes(pd.DataFrame(rows))
+
+    # --- 分红 / 指数成分权重 / 曾用名(除权除息与 PIT 参考数据) ---
+
+    def sync_dividends_by_date(self, day: date, by: str = "ann_date",
+                               patient: bool = False) -> int:
+        """拉**一天**的全市场分红明细 —— 逐票拉(6000+ 次)在低积分 token 下
+        不可行,按日批量只要 1 次调用。返回入库行数。
+
+        `by="ann_date"`(默认):公告日。公告是分红进入 PIT 世界的时点,增量
+        同步用这个键;`by="ex_date"`:除息日,只返回**已实施**行,回填历史时
+        调用数基本减半(没有除息的日子不可能有实施分红)。
+
+        行内同时落 ann_date 与 ex_date —— 除息日实际发生后才算"实施过",
+        公告日只决定"当时是否可见"。
+        """
+        if by not in ("ann_date", "ex_date"):
+            raise ValueError(f"by must be ann_date|ex_date, got {by!r}")
+        pro = self._ensure_pro()
+        df = self._retry(pro.dividend, _patient=patient,
+                         **{by: day.strftime("%Y%m%d")})
+        if df is None or df.empty:
+            return 0
+        rows = []
+        for _, r in df.iterrows():
+            ts_code = str(r.get("ts_code", "") or "")
+            if not ts_code:
+                continue
+            code, _exch = self._ts_code_to_code(ts_code)
+            rows.append({
+                "code": code,
+                "ann_date": r.get("ann_date"),
+                "end_date": r.get("end_date"),
+                "div_proc": r.get("div_proc"),
+                "stk_div": r.get("stk_div"),
+                "cash_div_tax": r.get("cash_div_tax"),
+                "ex_date": r.get("ex_date"),
+                "pay_date": r.get("pay_date"),
+                "imp_ann_date": r.get("imp_ann_date"),
+                "source": "tushare",
+            })
+        if not rows:
+            return 0
+        saved = self._db.save_dividends(pd.DataFrame(rows))
+        logger.info("dividends %s(%s): %d rows via tushare", day.isoformat(),
+                    by, saved)
+        return saved
+
+    def sync_dividends(self, start: date, end: date, *, by: str = "ann_date",
+                       calls_per_min: int = 45, patient: bool = True,
+                       sleep_fn=time.sleep, on_progress=None) -> int:
+        """回填 [start, end] 全市场分红(逐日批量,见 sync_dividends_by_date)。
+
+        `calls_per_min` 按 token 的分红接口限额设(默认 45,保守);`patient`
+        让每分钟超限的调用等窗口重试而不是丢天。返回累计入库行数。
+        """
+        total = 0
+        d = start
+        while d <= end:
+            if by == "ex_date" and d.weekday() >= 5:
+                d += timedelta(days=1)  # 除息日必为交易日,周末必空 → 省调用
+                continue
+            t0 = time.monotonic()
+            total += self.sync_dividends_by_date(d, by=by, patient=patient)
+            if on_progress is not None:
+                on_progress(d, total)
+            if calls_per_min > 0:
+                wait = 60.0 / calls_per_min - (time.monotonic() - t0)
+                if wait > 0:
+                    sleep_fn(wait)
+            d += timedelta(days=1)
+        return total
+
+    def sync_index_weights(self, index_code: str, start: date, end: date,
+                           patient: bool = False) -> int:
+        """按月拉指数成分权重快照(tushare `index_weight`,月末 trade_date)。
+
+        按**年**分片调用,避免单次返回撞上行数上限后静默截断——截断的成分
+        名单会静默改变股票池(过拟合/幸存者偏差的来源),所以宁可多几次调用。
+        """
+        pro = self._ensure_pro()
+        total = 0
+        y = start.year
+        while y <= end.year:
+            sd = max(start, date(y, 1, 1)).strftime("%Y%m%d")
+            ed = min(end, date(y, 12, 31)).strftime("%Y%m%d")
+            df = self._retry(pro.index_weight, index_code=index_code,
+                             start_date=sd, end_date=ed, _patient=patient)
+            if df is not None and not df.empty:
+                rows = []
+                for _, r in df.iterrows():
+                    code, _exch = self._ts_code_to_code(str(r["con_code"]))
+                    rows.append({
+                        "index_code": str(r["index_code"]),
+                        "trade_date": r["trade_date"],
+                        "code": code,
+                        "weight": r.get("weight"),
+                    })
+                total += self._db.save_index_weights(rows)
+                logger.info("index_weight %s %d: %d rows via tushare",
+                            index_code, y, len(rows))
+            y += 1
+        return total
+
+    def sync_name_history(self, start: date, end: date,
+                          patient: bool = False) -> int:
+        """曾用名/名称变更历史(tushare `namechange`),用于**PIT** 判定
+        ST/*ST:今天的名字回判历史是前视,而 namechange 的
+        start_date/end_date 能还原"该时点叫什么名字"。
+
+        按**年**分片(全市场一年约 800 行),避免单次上限截断。返回入库行数。
+        """
+        pro = self._ensure_pro()
+        total = 0
+        y = start.year
+        while y <= end.year:
+            sd = max(start, date(y, 1, 1)).strftime("%Y%m%d")
+            ed = min(end, date(y, 12, 31)).strftime("%Y%m%d")
+            df = self._retry(pro.namechange, start_date=sd, end_date=ed,
+                             _patient=patient)
+            if df is not None and not df.empty:
+                rows = []
+                for _, r in df.iterrows():
+                    ts_code = str(r.get("ts_code", "") or "")
+                    if not ts_code:
+                        continue
+                    code, _exch = self._ts_code_to_code(ts_code)
+                    rows.append({
+                        "code": code,
+                        "name": r.get("name"),
+                        "start_date": r.get("start_date"),
+                        "end_date": r.get("end_date"),
+                        "ann_date": r.get("ann_date"),
+                        "change_reason": r.get("change_reason"),
+                    })
+                total += self._db.save_name_history(rows)
+                logger.info("namechange %d: %d rows via tushare", y, len(rows))
+            y += 1
+        return total
 
     def _save_daily_basic_frame(self, basic, trade_date: date) -> int:
         """Map a tushare daily_basic frame → daily_basic table (P4 valuation)."""
