@@ -7,7 +7,7 @@ import contextlib
 import uuid
 from datetime import date, timedelta
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from quanti.agent.goal import load_goal, update_goal
@@ -76,6 +76,7 @@ class SyncResult(BaseModel):
 
 class StockPoolStats(BaseModel):
     total: int
+    matched: int = 0  # rows matching the search `q` (== total when no q)
     with_quotes: int  # stocks that have quote data
     exchange_sh: int
     exchange_sz: int
@@ -403,14 +404,20 @@ async def sync_stock_list(request: Request):
 
 
 @router.get("/stocks/stats")
-async def stock_pool_stats(request: Request):
-    """Get stock pool statistics."""
+async def stock_pool_stats(request: Request, q: str | None = None):
+    """Get stock pool statistics.
+
+    `q` (same substring filter as /stocks) only narrows `matched` — the count
+    the list's pager needs. total/with_quotes/exchange_*/latest_quote_date stay
+    market-wide so the dashboard cards keep their meaning while you search.
+    """
     db = request.app.state.db
     all_stocks = db.list_stocks()
     with_quotes = request.app.state.provider.get_all_codes()
     latest = db.get_global_latest_quote_date()
     return StockPoolStats(
         total=len(all_stocks),
+        matched=db.count_stocks(q) if q else len(all_stocks),
         with_quotes=len(with_quotes),
         exchange_sh=sum(1 for s in all_stocks if s.exchange.upper() in ("SH", "SHANGHAI")),
         exchange_sz=sum(1 for s in all_stocks if s.exchange.upper() in ("SZ", "SHENZHEN")),
@@ -604,9 +611,22 @@ async def get_sync_status(name: str, job_id: str, request: Request):
 
 
 @router.get("/stocks")
-async def list_stocks(request: Request):
+async def list_stocks(
+    request: Request,
+    q: str | None = None,
+    limit: int | None = Query(None, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+):
+    """Stock roster, searchable by code/name and pageable.
+
+    The dashboard asks for one page (limit=100) instead of the whole ~5,900-row
+    roster: fetching and rendering every row built a 65k-node DOM and ~1.1s of
+    main-thread layout per visit (measured), which is what made the page — and
+    the mouse — sluggish. Omitting `limit` still returns everything, so other
+    callers are unaffected.
+    """
     db = request.app.state.db
-    stocks = db.list_stocks()
+    stocks = db.list_stocks(q=q, limit=limit, offset=offset)
     return [
         {
             "code": s.code,
