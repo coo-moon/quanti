@@ -22,6 +22,11 @@ def _nan_to_none(x):
     return None if x is None or (isinstance(x, float) and math.isnan(x)) else float(x)
 
 
+def _like_literal(s: str) -> str:
+    """Escape LIKE wildcards so a search for `60%` or `a_b` matches literally."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class _Result:
     """Materialized result of one ``execute()``.
 
@@ -865,11 +870,28 @@ class Database:
             delist_date=self._safe_delist_date(row[5]),
         )
 
-    def list_stocks(self) -> list[StockInfo]:
-        rows = self.conn.execute(
-            "SELECT code, name, exchange, list_date, industry, delist_date "
-            "FROM stocks ORDER BY code"
-        ).fetchall()
+    def list_stocks(self, q: str | None = None, limit: int | None = None,
+                    offset: int = 0) -> list[StockInfo]:
+        """Stocks, optionally searched by code/name and paged.
+
+        `q` is a substring match on code or name (LIKE with `%`/`_` escaped, so
+        typing them searches literally). Why paging lives down here: the A-share
+        roster is ~5,900 rows, and a dashboard that rendered all of them at once
+        built a 65k-node DOM (~1.1s of main-thread layout, measured) — the page
+        only ever shows a screenful. No args = the whole list, as before.
+        """
+        sql = ("SELECT code, name, exchange, list_date, industry, delist_date "
+               "FROM stocks")
+        params: list[object] = []
+        if q:
+            sql += " WHERE (code LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')"
+            like = f"%{_like_literal(q)}%"
+            params += [like, like]
+        sql += " ORDER BY code"
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params += [limit, offset]
+        rows = self.conn.execute(sql, tuple(params)).fetchall()
         return [
             StockInfo(
                 code=r[0],
@@ -881,6 +903,21 @@ class Database:
             )
             for r in rows
         ]
+
+    def count_stocks(self, q: str | None = None) -> int:
+        """How many stocks `list_stocks(q=...)` would return in total.
+
+        The dashboard's pager needs the size of the filtered set, not the size
+        of the page it just fetched.
+        """
+        sql = "SELECT COUNT(*) FROM stocks"
+        params: tuple[object, ...] = ()
+        if q:
+            sql += " WHERE (code LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')"
+            like = f"%{_like_literal(q)}%"
+            params = (like, like)
+        row = self.conn.execute(sql, params).fetchone()
+        return int(row[0]) if row else 0
 
     def point_in_time_universe(self, start: date, end: date) -> list[str]:
         """Codes that were alive at some point within [start, end] — the

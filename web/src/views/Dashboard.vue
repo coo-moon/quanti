@@ -192,7 +192,7 @@
           {{ syncing ? "同步中..." : "添加并同步" }}
         </button>
         <button
-          v-if="stocks.length > 0"
+          v-if="(poolStats?.total ?? 0) > 0"
           class="btn-secondary"
           @click="syncAll"
           :disabled="syncing"
@@ -226,11 +226,29 @@
     <div class="card">
       <div class="card-header">
         <h2>股票列表</h2>
-        <span class="card-header-hint" v-if="stocks.length">共 {{ stocks.length }} 只</span>
+        <!-- Paged on purpose: 5,900+ rows rendered at once cost ~65k DOM nodes
+             and ~1.1s of main-thread layout, which made the whole page (and the
+             mouse) lag. One page + a search box covers the real use. -->
+        <span class="card-header-hint" v-if="poolStats">
+          共 {{ poolStats.total }} 只
+          <template v-if="search.trim()">· 匹配 <strong>{{ matched }}</strong> 只</template>
+        </span>
+        <div class="list-tools">
+          <input
+            v-model="search"
+            class="search-input"
+            type="search"
+            placeholder="搜索代码 / 名称"
+            @input="onSearchInput"
+            @keyup.esc="clearSearch"
+          />
+        </div>
       </div>
       <div v-if="stocks.length === 0" class="empty-state">
-        <p>暂无股票数据</p>
-        <p class="empty-hint">在上方输入股票代码添加</p>
+        <p>{{ search.trim() ? "没有匹配的股票" : "暂无股票数据" }}</p>
+        <p class="empty-hint">
+          {{ search.trim() ? "换个代码或名称试试" : "在上方输入股票代码添加" }}
+        </p>
       </div>
       <div v-else class="table-wrap">
         <table>
@@ -265,6 +283,13 @@
             </tr>
           </tbody>
         </table>
+      </div>
+      <div class="pager" v-if="pageCount > 1">
+        <button class="btn-small" :disabled="page <= 1" @click="gotoPage(page - 1)">上一页</button>
+        <span class="pager-info">
+          第 {{ page }} / {{ pageCount }} 页 · 每页 {{ PAGE_SIZE }} 只
+        </span>
+        <button class="btn-small" :disabled="page >= pageCount" @click="gotoPage(page + 1)">下一页</button>
       </div>
     </div>
   </div>
@@ -303,6 +328,18 @@ const addInput = ref("");
 const syncing = ref(false);
 const syncingAll = ref(false);
 const syncingPool = ref(false);
+
+// 股票列表只取一页:全 A 股 5,900+ 行一次性渲染会造出 6.5 万个 DOM 节点、
+// 每次进页面 ~1.1s 主线程布局(实测),整页连同鼠标都会卡。搜索 + 翻页覆盖
+// 真实用法,顺带把 759 KB 的响应压到十几 KB。
+const PAGE_SIZE = 100;
+const search = ref("");
+const page = ref(1);
+const matched = ref(0);
+let searchTimer: ReturnType<typeof setTimeout> | null = null;
+
+const pageCount = computed(() =>
+  Math.max(1, Math.ceil((matched.value || stocks.value.length) / PAGE_SIZE)));
 
 // 同步设置 (persisted in localStorage). Applied to 添加并同步 / 下载K线.
 const _ss = JSON.parse(localStorage.getItem("quanti.syncSettings") || "{}");
@@ -535,13 +572,49 @@ onUnmounted(() => {
     clearInterval(bgSyncTimer);
     bgSyncTimer = null;
   }
+  if (searchTimer) {
+    clearTimeout(searchTimer);
+    searchTimer = null;
+  }
 });
+
+function onSearchInput() {
+  // Debounced:每敲一个字都发请求会把 5,900 行的表反复整表重渲染。
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    searchTimer = null;
+    page.value = 1;      // 新搜索从第一页开始
+    loadStocks();
+  }, 300);
+}
+
+function clearSearch() {
+  search.value = "";
+  onSearchInput();
+}
+
+function gotoPage(next: number) {
+  const target = Math.min(Math.max(1, next), pageCount.value);
+  if (target === page.value) return;
+  page.value = target;
+  loadStocks();
+}
 
 async function loadStocks() {
   try {
-    const [stocksRes, statsRes] = await Promise.all([fetchStocks(), fetchStockStats()]);
+    const q = search.value.trim() || undefined;
+    const [stocksRes, statsRes] = await Promise.all([
+      fetchStocks({ q, limit: PAGE_SIZE, offset: (page.value - 1) * PAGE_SIZE }),
+      fetchStockStats(q),
+    ]);
     stocks.value = stocksRes.data;
     poolStats.value = statsRes.data;
+    matched.value = statsRes.data.matched ?? statsRes.data.total;
+    // 删到最后一页空了(比如在末页搜索)→ 退回最后一页再取一次
+    if (page.value > pageCount.value) {
+      page.value = pageCount.value;
+      await loadStocks();
+    }
   } catch (e) {
     console.error("Failed to fetch stocks:", e);
   }
@@ -644,7 +717,8 @@ function stopPolling() {
 }
 
 async function syncAll() {
-  if (stocks.value.length === 0) return;
+  // 下载K线是整库任务(后端不传 codes 就同步全部),跟当前页/搜索结果无关。
+  if ((poolStats.value?.total ?? 0) === 0) return;
   syncingAll.value = true;
   syncing.value = true;
   syncMsg.value = "";
@@ -1068,6 +1142,39 @@ async function syncAll() {
   color: var(--color-text-secondary);
 }
 
+/* 列表工具条(搜索)+ 翻页 */
+.list-tools {
+  margin-left: auto;
+}
+.search-input {
+  height: 32px;
+  width: 200px;
+  padding: 0 12px;
+  font-size: 13px;
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+  background: var(--color-surface);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 16px;
+  outline: none;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+.search-input:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.15);
+}
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 12px 24px;
+}
+.pager-info {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
 .empty-hint {
   font-size: 13px;
   color: var(--color-text-tertiary);
@@ -1102,10 +1209,8 @@ td {
   border-bottom: 0.5px solid var(--color-border);
 }
 
-tbody tr {
-  transition: background var(--transition);
-}
-
+/* 行上不要 transition:hover 时每一行都要走主线程 style recalc + 重绘,
+   5,900 行的表上这笔开销正是鼠标发滞的一部分。 */
 tbody tr:hover {
   background: rgba(0, 0, 0, 0.02);
 }

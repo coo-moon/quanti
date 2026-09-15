@@ -61,17 +61,27 @@ export interface ServerMeta {
 }
 export const fetchMeta = () => api.get<ServerMeta>("/meta");
 
-export const fetchStocks = () => api.get<StockInfo[]>("/stocks");
+export interface StockListParams {
+  q?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export const fetchStocks = (params: StockListParams = {}) =>
+  api.get<StockInfo[]>("/stocks", { params });
 
 export interface StockPoolStats {
   total: number;
+  /** rows matching the same `q` the list was queried with (== total if none) */
+  matched: number;
   with_quotes: number;
   exchange_sh: number;
   exchange_sz: number;
   latest_quote_date: string | null;
 }
 
-export const fetchStockStats = () => api.get<StockPoolStats>("/stocks/stats");
+export const fetchStockStats = (q?: string) =>
+  api.get<StockPoolStats>("/stocks/stats", { params: q ? { q } : {} });
 
 export const fetchQuotes = (code: string, start: string, end: string) =>
   api.get<QuoteData[]>(`/stocks/${code}/quotes`, { params: { start, end } });

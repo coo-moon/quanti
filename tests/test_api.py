@@ -119,6 +119,51 @@ class TestStockEndpoints:
         assert data[0]["code"] == "000001"
 
     @pytest.mark.asyncio
+    async def test_list_stocks_paged_and_searchable(self, client, db):
+        """分页 + 搜索:列表接口不再一次性吐全表。
+
+        仪表盘曾一次渲染 5,900+ 行(6.5 万 DOM 节点、~1.1s 主线程布局),
+        整页因此发滞。这里钉住:不带参数仍返回全量(向后兼容),带 limit/
+        offset 才分页,q 匹配代码或名称。
+        """
+        for code, name, ex in [("000002", "万科A", "SZ"),
+                               ("600000", "浦发银行", "SH"),
+                               ("600519", "贵州茅台", "SH")]:
+            db.upsert_stock(code, name, ex, date(2000, 1, 1), "测试")
+
+        assert len((await client.get("/api/stocks")).json()) == 4  # 全量兜底
+
+        page1 = (await client.get("/api/stocks", params={"limit": 2})).json()
+        page2 = (await client.get("/api/stocks",
+                                  params={"limit": 2, "offset": 2})).json()
+        assert [s["code"] for s in page1] == ["000001", "000002"]
+        assert [s["code"] for s in page2] == ["600000", "600519"]
+
+        by_code = (await client.get("/api/stocks", params={"q": "600"})).json()
+        assert [s["code"] for s in by_code] == ["600000", "600519"]
+        by_name = (await client.get("/api/stocks", params={"q": "银行"})).json()
+        assert [s["code"] for s in by_name] == ["000001", "600000"]
+
+        # stats:matched 是筛选后的行数(翻页要用),total 仍是全量
+        stats = (await client.get("/api/stocks/stats", params={"q": "600"})).json()
+        assert stats["matched"] == 2 and stats["total"] == 4
+        assert (await client.get("/api/stocks/stats")).json()["matched"] == 4
+
+    @pytest.mark.asyncio
+    async def test_list_stocks_search_wildcards_are_literal(self, client, db):
+        """`%` / `_` 当普通字符搜,不当 SQL 通配符(否则搜 `%` 会命中全表)。"""
+        db.upsert_stock("000002", "万科A", "SZ", date(2000, 1, 1), "测试")
+        assert (await client.get("/api/stocks", params={"q": "%"})).json() == []
+        assert (await client.get("/api/stocks", params={"q": "_"})).json() == []
+        stats = (await client.get("/api/stocks/stats", params={"q": "%"})).json()
+        assert stats["matched"] == 0
+
+    @pytest.mark.asyncio
+    async def test_list_stocks_rejects_bad_paging(self, client):
+        assert (await client.get("/api/stocks", params={"limit": 0})).status_code == 422
+        assert (await client.get("/api/stocks", params={"offset": -1})).status_code == 422
+
+    @pytest.mark.asyncio
     async def test_get_stock_quotes(self, client):
         response = await client.get(
             "/api/stocks/000001/quotes",
