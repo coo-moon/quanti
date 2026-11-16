@@ -20,7 +20,11 @@ def setup(tmp_path):
     db = Database(str(tmp_path / "test.db"))
     db.initialize()
     db.upsert_stock("000001", "平安银行", "SZ", date(1991, 4, 3), "银行")
-    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=15)
+    # 最后一个 bar 必须在「决策日」之前:盘前(09:25 前)创建的挂单决策日=上一交易日
+    # (order_decision_date),fixture 若含今日 bar,next_trading_bar 立刻找到成交 bar,
+    # 「非 llm 老老实实等次日开盘」类断言在凌晨跑必挂(2026-11-17 起 CI 全红的原因)。
+    last_bar_day = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
+    dates = pd.bdate_range(end=last_bar_day, periods=15)
     np.random.seed(7)
     prices = 10 + np.cumsum(np.random.randn(len(dates)) * 0.05)
     df = pd.DataFrame({
