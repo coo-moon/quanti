@@ -4,7 +4,7 @@
 海外冲击、行业消息才是解释盘面的那一层,所以 LLM 报告要同时吃到:
 
 * 新闻联播文字稿 (``ak.news_cctv``) — 政治/政策面的官方口径,最权威
-* 东财全球财经快讯 (``ak.stock_info_global_em``) — 市场面即时消息
+* 东财全球财经快讯 (``ak.stock_news_global_em``,旧名 stock_info_global_em) — 市场面即时消息
 
 两者都走 akshare(项目已依赖,零新增),且都是**尽力而为**:抓不到就返回
 空列表,报告降级成纯数据面,而不是让整个快照失败。新闻是锦上添花,不是
@@ -87,11 +87,34 @@ def fetch_cctv(as_of: date) -> list[dict]:
     return []
 
 
+_FLASH_FN_NAMES = ("stock_news_global_em", "stock_info_global_em")
+
+
+def _flash_fn():
+    """东财快讯接口的可调用对象(跨 akshare 版本解析)。
+
+    akshare 1.20.41 把 ``stock_info_global_em`` 更名为 ``stock_news_global_em``,
+    并在旧名字上抛 AttributeError。CI 装的是最新的 akshare(pyproject 只写了
+    ``>=1.12``,没钉版本),于是本地老版本全绿、CI 上全红。这里按「新名优先,
+    旧名兜底」解析,两代 akshare 都能跑;都不存在就返回 None,调用方降级成
+    空列表——快讯本来就是尽力而为。
+    """
+    import akshare as ak  # noqa: PLC0415
+    for name in _FLASH_FN_NAMES:
+        fn = getattr(ak, name, None)
+        if callable(fn):
+            return fn
+    logger.warning("akshare 无东财快讯接口(%s 均缺失),快讯源跳过",
+                   "/".join(_FLASH_FN_NAMES))
+    return None
+
+
 def fetch_flash() -> list[dict]:
     """东财全球财经快讯(最新 N 条)。"""
-    import akshare as ak  # noqa: PLC0415
-
-    df = _with_timeout(ak.stock_info_global_em)
+    fn = _flash_fn()
+    if fn is None:
+        return []
+    df = _with_timeout(fn)
     if df is None or getattr(df, "empty", True):
         return []
     cols = list(df.columns)
