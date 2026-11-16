@@ -49,6 +49,10 @@ class SSEIndexEnhanceStrategy(BaseStrategy):
     description = "复制上证综指成分(总市值加权,剔新股),分红再投吃股息垫,结构性跑赢价格指数"
     param_space: dict[str, list] = {}  # 复制规则非优化产物——无可调参
     selectable = False  # selector 自动选拔跳过;仅显式钉选/回测脚本使用
+    bench_code = "000001.SH"
+    """前向模拟盘(scripts/paper_forward.py)的基准锚:策略自己声明对标谁。
+    上证综指是**价格指数**,本策略吃的正是它的分红垫;runner 按此算超额,
+    账户 app_config 里的 bench_code 可覆盖(多挂一个基准时无需改代码)。"""
 
     def init(self, config: dict) -> None:
         # strength 承载组合目标权重;引擎 run() 认 preferred_sizer 直通

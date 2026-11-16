@@ -303,6 +303,11 @@ class Database:
             # serve 形态的兜底——key 只在交互 shell 里 export 的话,换进程
             # 重启就丢(2026-08-18 实发,llm_full 整天不可用)。
             ("app_config", "llm_api_key", "TEXT DEFAULT ''"),
+            # 前向模拟盘(scripts/paper_forward.py)账户登记簿:strategy +
+            # initial_cash(+ 可选 bench_code / 策略参数 / 起算日)。旧库补列
+            # 后为 '{}' = 未登记,tick/report 据此 fail-loud。app_config 既有
+            # 列(数据源 / token / webhook / LLM key)语义不变。
+            ("app_config", "forward_config", "TEXT DEFAULT '{}'"),
         ]
         for table, col, decl in adds:
             cols = [r[1] for r in self.conn.execute(
@@ -628,6 +633,9 @@ class Database:
                 data_source_token TEXT DEFAULT '',
                 alert_webhook_url TEXT DEFAULT '',
                 llm_api_key TEXT DEFAULT '',
+                -- 前向模拟盘登记簿(JSON):strategy / initial_cash / bench_code
+                -- / strategy_config / started_at。新库建列,旧库由 _migrate 补。
+                forward_config TEXT DEFAULT '{}',
                 updated_at TEXT NOT NULL
             );
 
@@ -2277,6 +2285,49 @@ class Database:
             ((url or "").strip(), datetime.now().isoformat()),
         )
         self.conn.commit()
+
+    # --- Forward paper-trading runner (scripts/paper_forward.py) ---
+
+    def get_forward_config(self) -> dict:
+        """前向模拟盘账户登记簿。未登记(无行 / 空 JSON)→ {}。
+
+        存 app_config.forward_config 单列 JSON,键:
+          strategy / initial_cash / started_at / bench_code? / strategy_config?
+        """
+        import json
+        row = self.conn.execute(
+            "SELECT forward_config FROM app_config WHERE id=1").fetchone()
+        if row is None or not (row[0] or "").strip():
+            return {}
+        try:
+            data = json.loads(row[0])
+        except ValueError:
+            logger.warning("app_config.forward_config 非法 JSON — 按未登记处理")
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def set_forward_config(self, **kv) -> dict:
+        """合并写入前向登记簿(只覆盖传入的键),返回写后的完整配置。
+
+        只碰 forward_config 列;app_config 既有列(数据源 / token / webhook /
+        LLM key)一律不动 —— 前向账户与交互 paper 账户共用同一套撮合口径。
+        """
+        import json
+        from datetime import datetime
+        cfg = self.get_forward_config()
+        cfg.update({k: v for k, v in kv.items() if v is not None})
+        self.conn.execute(
+            """
+            INSERT INTO app_config (id, forward_config, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                forward_config=excluded.forward_config,
+                updated_at=excluded.updated_at
+            """,
+            (json.dumps(cfg, ensure_ascii=False), datetime.now().isoformat()),
+        )
+        self.conn.commit()
+        return cfg
 
     # --- Runtime risk-control config (P0-3) ---
 

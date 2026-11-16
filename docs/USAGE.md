@@ -22,6 +22,7 @@
 12. [风控配置](#12-风控配置)
 13. [运维与排错](#13-运维与排错)
 14. [系统架构](#14-系统架构)
+15. [前向模拟盘(新策略挂账跟踪)](#15-前向模拟盘新策略挂账跟踪)
 
 ---
 
@@ -1259,6 +1260,79 @@ sqlite3 data/quanti.db 'SELECT ts, kind, summary FROM agent_decisions ORDER BY i
 | Agent 用 threading 而非 asyncio | 因为策略代码可能阻塞，线程隔离更稳 |
 | MCP 走 stdio 而非 HTTP | 标准 MCP 协议，OpenClaw / Claude Desktop 都用这个；安全模型简单 |
 | DB 是事实记录，broker 持仓也写 DB | 万一进程崩溃，下次启动可恢复 |
+
+---
+
+## 15. 前向模拟盘(新策略挂账跟踪)
+
+回测过闸 ≠ 前瞻有效。每个过闸策略都要在一张**独立**纸面账户里跑一段真实时间,
+用只往前写的净值序列去证实或证伪回测结论。runner 是 `scripts/paper_forward.py`,
+三条命令:
+
+| 命令 | 作用 |
+|------|------|
+| `init` | 建账户库 + 把「策略名 / 初始资金」登记进该账户 `app_config`,并立刻跑一次 tick 建仓 |
+| `tick` | 幂等推进:先让昨日挂单按次日开盘成交,再按策略目标权重 diff 出新挂单。**可日内多次调用**,同一信号日只挂一批 |
+| `report` | 账户现状 JSON(净值 / 超额 / 回撤 / 换手 / 挂单 / 告警) |
+
+```bash
+cd /opt/data/quanti            # 仓库根
+.venv/bin/python scripts/paper_forward.py init   --account fwd_sse --strategy sse_enhance --cash 500000
+.venv/bin/python scripts/paper_forward.py tick   --account fwd_sse
+.venv/bin/python scripts/paper_forward.py report --account fwd_sse
+```
+
+口径与纪律(与 `strategies/sse_index_enhance.py` 的 docstring 一字对齐):
+
+- **独立账户**:账户库 `data/<account>.db`,行情库 `data/market.db` 共享;
+  账户名撞上 `paper` / `live` 直接 fail-loud。登记项是 `app_config` 里新增的
+  `forward_config` 一个 JSON 列(`strategy` / `initial_cash` / `bench_code` /
+  `strategy_config` / `started_at`),既有列语义不变。
+- **只吃组合权重类策略**:`signal.strength` = 目标组合权重、自带
+  `FixedSizer(max_pct=1.0)`、`param_space == {}`、`selectable = False`
+  (`sse_enhance` 那一类)。不满足判据(如 `ma_cross`)拒绝挂账 —— 逐股技术策略
+  该走 Agent 链路,不该被当成一篮子权重。
+- **撮合全复用 PaperBroker**:挂单 T+1 次日开盘成交、涨跌停/一字板闸门、整手、
+  A股费用与红利税。runner 不改 engine/paper_broker 任何语义,只做「组合权重 →
+  买卖挂单」这一层适配。
+- **不带任何逐股 overlay**:tick 从不调 `check_exits`(止损/移动止盈/策略离场),
+  并显式关闭 protections(它们在最开始就拒单,同样破坏复制);单票/行业上限与
+  日单数上限为复制盘放开(一篮子建仓几百只,默认 20 单/日会静默砍单)。
+  组合级 -30% 熔断**不自动清仓**,改由 report 的 `alerts` 通知人。
+- **节奏归策略**:信号日 = 行情库最新全市交易日,目标权重 = 策略自身 `on_bar`
+  结果,脚本不做第二次择时。月中重跑不加单;跨月首个信号日按**上月末快照**重建
+  (卖移出样本、买新入样本、已持有的权重漂移一律不调)。
+- **时段外/断供安全**:数据滞后时 tick 照跑,并把日期标在 `as_of` /
+  `data_asof` 上,滞后本身进 `alerts`。
+- **基准**:默认取策略声明的 `bench_code`(`sse_enhance` → `000001.SH`
+  价格指数),`init --bench-code` 可覆盖;基准日线沿用项目既有的
+  `data/idx_<code>.csv` 缓存,`report --refresh-bench` 才打 tushare。
+- **小资金退化会被如实记下来**:整手买不起的成分被跳过并计入 `alerts`(而不是
+  悄悄改权重);要让策略自己截断重归一,用
+  `init --strategy-config '{"min_weight": 6e-05}'`。
+- 前向账户**不要**写 `risk_config` 行:那行会在推进挂单时整体覆盖复制盘所需的
+  宽松风控(runner 检测到即 fail-loud)。风控调参属于交互 paper 账户的事。
+
+### 15.1 新策略上线 checklist
+
+1. **过闸**:walk-forward + 对抗式验证(资金规模、成本、滚动窗口胜率都过),
+   结论写进 `docs/`。过不了的直接证否归档,不占前向账。
+2. **init 新账户**:账户名约定 `fwd_<短标识>`(如 `fwd_sse`),资金用真要跟踪的
+   那一档;`init` 会当场建仓,输出挂单数与金额分布。**必查**:`target_n` 是否
+   等于策略应给的全样本只数、`skipped_unaffordable`/`dropped_weight` 是否为该
+   资金规模的合理退化。
+3. **调度器加 tick**:每个交易日收盘后一次(cron/launchd 皆可,幂等所以可补跑):
+   ```cron
+   30 15 * * 1-5 cd /opt/data/quanti && QUANTI_ACCOUNT=fwd_sse \
+       .venv/bin/python scripts/paper_forward.py tick >> data/fwd_sse.tick.log 2>&1
+   ```
+   行情同步必须排在 tick 之前(`quanti sync` → tick),否则 tick 只会在旧数据上
+   记账(不会出错,但 `data_asof` 会告警)。
+4. **周报订阅 report**:`report --json-out data/fwd_sse.week.json` 落盘,把 JSON
+   贴进周报或推给现有 IM 渠道(`quanti/notify.py` 那套 webhook 由决策日志关键
+   事件触发,前向盘的常规净值播报走你自己的调度器)。周报看四个数:
+   `nav` / `excess` / `max_drawdown` / `turnover_last_month`,以及 `alerts` 是否
+   变长。跟踪 ≥1 年后与回测对照,超额的符号与量级对不上就是证否信号。
 
 ---
 

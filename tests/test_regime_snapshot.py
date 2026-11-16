@@ -310,6 +310,32 @@ class TestNews:
         out = N.render_news({"cctv": [], "flash": []})
         assert out.count("未取到") == 2
 
+    def test_flash_fn_prefers_new_name_then_falls_back(self, monkeypatch):
+        """akshare 1.20.41 把快讯接口更名;两代名字都必须能解析到。"""
+        import sys
+        import types
+
+        from quanti.regime import news as N
+
+        def _stub(**attrs):
+            mod = types.SimpleNamespace(**attrs)
+            monkeypatch.setitem(sys.modules, "akshare", mod)
+            return mod
+
+        def _new():  # pragma: no cover - 只做身份比对
+            return None
+
+        def _old():  # pragma: no cover
+            return None
+
+        _stub(stock_news_global_em=_new, stock_info_global_em=_old)
+        assert N._flash_fn() is _new          # 新名优先
+        _stub(stock_info_global_em=_old)
+        assert N._flash_fn() is _old          # 只有旧名 → 兜底
+        _stub()
+        assert N._flash_fn() is None          # 都没有 → 降级
+        assert N.fetch_flash() == []
+
     def test_fetch_failure_degrades_to_empty(self, monkeypatch):
         from quanti.regime import news as N
         monkeypatch.setattr(N, "_with_timeout", lambda fn, timeout=0: None)
