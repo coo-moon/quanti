@@ -36,6 +36,7 @@ quanti <子命令> [参数]
 | `TUSHARE_TOKEN` | (未设) | Tushare token;也可由 Web「数据源」面板存入 DB。tushare 选中但无 token → **报错不静默回退**,须显式 `--source akshare` |
 | `DEEPSEEK_API_KEY` | (未设) | LLM 增强层 / 因子挖掘用 DeepSeek(默认供应商,零额外依赖) |
 | `ANTHROPIC_API_KEY` | (未设) | LLM 供应商选 `anthropic` 时用(需 `pip install -e ".[llm]"`) |
+| `QUANTI_DATA_DIR` | `<仓库>/data` | **仅 `scripts/paper_forward.py`**:前向模拟盘的账户库目录(`QUANTI_MARKET_DB` 同理,指共享行情库)。部署机数据目录不在仓库内时用 |
 
 > **数据分库**:交易状态按账户独立(`paper.db`/`live.db`),行情/基本面/财报在共享 `market.db`,同步一次全账户可用。
 
